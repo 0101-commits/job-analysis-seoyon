@@ -225,6 +225,8 @@ function SurveyPage() {
 
   const hydratedRef = useRef(false);
   const stepRef = useRef(1);
+  const pendingRef = useRef(false);
+  const flushPendingRef = useRef<() => void>(() => undefined);
 
   const responseId = data?.response.id ?? null;
   const status = data?.response.status ?? "draft";
@@ -289,6 +291,7 @@ function SurveyPage() {
 
   async function flush(target: number) {
     if (!responseId || readOnly) return;
+    pendingRef.current = false;
     setSaveState("saving");
     try {
       await persist(target);
@@ -303,6 +306,7 @@ function SurveyPage() {
   useEffect(() => {
     if (!hydratedRef.current || readOnly) return;
     setSaveState("unsaved");
+    pendingRef.current = true;
     const timer = setTimeout(() => {
       void flush(stepRef.current);
     }, 2000);
@@ -310,16 +314,64 @@ function SurveyPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [form, tasks, skills, req, readOnly]);
 
+  // debounce 가 아직 안 터진 마지막 입력을 이탈 시점에 저장한다.
+  // ponytail: beforeunload 는 요청 완료를 보장하지 않는다 — 확실히 하려면 sendBeacon 전용 엔드포인트 필요.
+  flushPendingRef.current = () => {
+    if (pendingRef.current) void flush(stepRef.current);
+  };
+  useEffect(() => {
+    const onLeave = () => flushPendingRef.current();
+    window.addEventListener("beforeunload", onLeave);
+    return () => {
+      window.removeEventListener("beforeunload", onLeave);
+      onLeave();
+    };
+  }, []);
+
   const taskCheck = useMemo(() => validateTasks(tasks), [tasks]);
   const skillCheck = useMemo(() => validateSkills(skills), [skills]);
-  const activeCheck = step === 4 ? taskCheck : step === 5 ? skillCheck : null;
+  const defCheck = useMemo(() => {
+    const errors: string[] = [];
+    if (form.definition.trim() === "") errors.push("직무 정의를 입력하세요");
+    if (form.mission.trim() === "") errors.push("직무 목적(미션)을 입력하세요");
+    return { ok: errors.length === 0, errors, warnings: [] };
+  }, [form.definition, form.mission]);
+
+  /** 해당 단계의 필수 조건. 없으면 null(자유 이동 가능 단계) */
+  const checkStep = (n: number) =>
+    n === 3 ? defCheck : n === 4 ? taskCheck : n === 5 ? skillCheck : null;
+
+  const activeCheck = checkStep(step);
+
+  /** target 단계로 가기 전에 통과해야 할 선행 단계 중 처음 실패하는 단계 번호 */
+  function firstBlockingStep(target: number): number | null {
+    for (let n = 1; n < target; n += 1) {
+      const check = checkStep(n);
+      if (check && !check.ok) return n;
+    }
+    return null;
+  }
+
+  /** 실패 단계로 되돌리고 에러를 펼친다. */
+  async function blockAt(n: number) {
+    setGateTried(true);
+    toast.error(`${n}단계 「${STEPS[n - 1]?.label}」 작성이 완료되지 않았습니다.`);
+    if (n !== step) {
+      await flush(step);
+      setStep(n);
+      stepRef.current = n;
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
 
   async function goTo(next: number) {
     if (next < 1 || next > STEPS.length) return;
-    if (next > step && !readOnly && activeCheck && !activeCheck.ok) {
-      setGateTried(true);
-      toast.error("작성이 완료되지 않은 항목이 있습니다.");
-      return;
+    if (next > step && !readOnly) {
+      const blocked = firstBlockingStep(next);
+      if (blocked !== null) {
+        await blockAt(blocked);
+        return;
+      }
     }
     setGateTried(false);
     await flush(step);
@@ -332,9 +384,24 @@ function SurveyPage() {
   }
 
   async function handleSubmit() {
-    if (!responseId) return;
+    if (!responseId || readOnly) return;
+
+    // 단계 게이트를 우회해 들어왔을 수 있으니 제출 직전에 전부 재검증한다.
+    const blocked = firstBlockingStep(STEPS.length);
+    if (blocked !== null) {
+      setConfirmOpen(false);
+      await blockAt(blocked);
+      return;
+    }
+    if (!form.coverage) {
+      setConfirmOpen(false);
+      toast.error("커버리지 자기평가를 선택해야 제출할 수 있습니다.");
+      return;
+    }
+
     setSending(true);
     try {
+      await persist(3);
       await persist(4);
       await persist(5);
       await submit(responseId, {

@@ -2,6 +2,33 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
+/**
+ * Supabase Auth 최소 비밀번호 길이(6자) 미만이면 계정 생성이 통째로 실패한다.
+ * 사번·생년월일이 비어 규칙 결과가 짧아진 경우에만 난수로 채운다(초기PW 는 저장·안내되므로 확인 가능).
+ */
+function ensureMinLength(password: string) {
+  if (password.length >= 6) return password;
+  const pad = String(Math.floor(1000 + Math.random() * 9000));
+  return (password + pad).slice(0, Math.max(8, password.length + 4));
+}
+
+/** listUsers 는 페이지당 최대치가 있어 1페이지만 보면 기존 계정을 놓친다. 전 페이지를 훑어 이메일로 찾는다. */
+async function findAuthUserByEmail(
+  auth: { listUsers: (p: { page: number; perPage: number }) => Promise<{ data: { users: { id: string; email?: string | undefined }[] } | null }> },
+  email: string,
+) {
+  const target = email.toLowerCase();
+  const perPage = 1000;
+  for (let page = 1; page <= 100; page += 1) {
+    const { data } = await auth.listUsers({ page, perPage });
+    const users = data?.users ?? [];
+    const hit = users.find((u) => (u.email ?? "").toLowerCase() === target);
+    if (hit) return hit;
+    if (users.length < perPage) return null;
+  }
+  return null;
+}
+
 export const provisionAccounts = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
@@ -33,7 +60,7 @@ export const provisionAccounts = createServerFn({ method: "POST" })
         failures.push({ name: p.name, reason: "이메일 없음" });
         continue;
       }
-      const password = renderPasswordRule(rule, p);
+      const password = ensureMinLength(renderPasswordRule(rule, p));
       try {
         let userId = p.user_id as string | null;
         if (userId) {
@@ -47,10 +74,7 @@ export const provisionAccounts = createServerFn({ method: "POST" })
             email_confirm: true,
           });
           if (error || !createdUser.user) {
-            const { data: list } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
-            const existing = list?.users.find(
-              (u) => (u.email ?? "").toLowerCase() === (p.email as string).toLowerCase(),
-            );
+            const existing = await findAuthUserByEmail(supabaseAdmin.auth.admin, p.email);
             if (!existing) throw new Error(error?.message ?? "계정 생성 실패");
             await supabaseAdmin.auth.admin.updateUserById(existing.id, { password });
             userId = existing.id;
@@ -66,6 +90,8 @@ export const provisionAccounts = createServerFn({ method: "POST" })
           { onConflict: "user_id,role", ignoreDuplicates: true },
         );
 
+        // initial_password 는 초대 메일 {초기PW} 안내에 필요해 평문으로 남긴다.
+        // 최초 로그인(must_change_password 소진) 이후 비우는 정리 작업은 이번 범위 밖.
         await supabaseAdmin
           .from("participants")
           .update({
@@ -116,7 +142,9 @@ export const resetParticipantPassword = createServerFn({ method: "POST" })
     if (!p) throw new Error("참여자를 찾을 수 없습니다.");
     if (!p.user_id) throw new Error("아직 계정이 생성되지 않았습니다.");
 
-    const password = renderPasswordRule(settings?.password_rule ?? "{birth6}{empno_last4}", p);
+    const password = ensureMinLength(
+      renderPasswordRule(settings?.password_rule ?? "{birth6}{empno_last4}", p),
+    );
     const { error } = await supabaseAdmin.auth.admin.updateUserById(p.user_id, { password });
     if (error) throw new Error(error.message);
 
@@ -194,13 +222,17 @@ export const sendMailBatch = createServerFn({ method: "POST" })
 
 export const resendMailLog = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => z.object({ logId: z.string().uuid() }).parse(input))
+  .inputValidator((input: unknown) =>
+    z
+      .object({ logId: z.string().uuid(), origin: z.string().url().optional() })
+      .parse(input),
+  )
   .handler(async ({ data, context }) => {
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { resendLog } = await import("@/lib/mailer.server");
-    return resendLog(supabaseAdmin, data.logId);
+    return resendLog(supabaseAdmin, data.logId, data.origin ?? null);
   });
 
 export const triggerReminders = createServerFn({ method: "POST" })

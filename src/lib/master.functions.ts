@@ -338,17 +338,29 @@ export const uploadJobCatalog = createServerFn({ method: "POST" })
       return { ok: issues.length === 0, total: data.rows.length, valid, issues, applied: 0 };
     }
 
-    // 직무 카탈로그는 계열사 공통 테이블이라 전체를 교체한다.
-    const { data: snapshot } = await supabaseAdmin.from("job_catalog").select("*");
-    const { error: delError } = await supabaseAdmin
-      .from("job_catalog")
-      .delete()
-      .not("id", "is", null);
+    // 업로드 파일에 적용회사가 있으면 그 계열사에 걸린 행만 교체한다(타 계열사 카탈로그 보존).
+    // 적용회사가 하나도 없으면 계열사 공통 카탈로그를 올린 것으로 보고 전체를 교체한다.
+    const companyIds = [...new Set(ready.flatMap((p) => p.row.company_ids))];
+    const scoped = companyIds.length > 0;
+
+    const snapshotQuery = supabaseAdmin.from("job_catalog").select("*");
+    const { data: snapshot } = scoped
+      ? await snapshotQuery.overlaps("company_ids", companyIds)
+      : await snapshotQuery;
+
+    const deleteQuery = supabaseAdmin.from("job_catalog").delete();
+    const { error: delError } = scoped
+      ? await deleteQuery.overlaps("company_ids", companyIds)
+      : await deleteQuery.not("id", "is", null);
     if (delError) throw new Error(delError.message);
 
+    // (job_group, job_series, job_name) 이 UNIQUE 라, 타 계열사 행과 이름이 겹치면 insert 가 깨진다.
     const { data: inserted, error } = await supabaseAdmin
       .from("job_catalog")
-      .insert(ready.map((p) => p.row))
+      .upsert(
+        ready.map((p) => p.row),
+        { onConflict: "job_group,job_series,job_name" },
+      )
       .select("id");
     if (error) throw new Error(error.message);
     const applied = inserted?.length ?? ready.length;
@@ -357,7 +369,7 @@ export const uploadJobCatalog = createServerFn({ method: "POST" })
       actor_id: context.userId,
       action: "직무 카탈로그 업로드",
       target_type: "job_catalog",
-      detail: { applied, snapshot: snapshot ?? [] },
+      detail: { applied, scope: scoped ? companyIds : "all", snapshot: snapshot ?? [] },
     });
 
     return { ok: true, total: data.rows.length, valid, issues: [], applied };

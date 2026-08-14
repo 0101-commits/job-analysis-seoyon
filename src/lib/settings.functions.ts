@@ -9,9 +9,12 @@ export const REMINDER_TARGETS = ["미접속", "미제출"] as const;
 // 자동 생성 파일인 types.ts 에 아직 반영되어 있지 않다. 재생성 전까지 이 파일에서만 캐스팅한다.
 type SystemSettingsLoose = { password_rule?: string; role_levels?: string[] | null };
 
-function maskName(name: string) {
-  return name.length <= 1 ? name : `${name.slice(0, 1)}${"*".repeat(name.length - 1)}`;
-}
+// 미리보기는 실제 참여자 대신 더미로만 만든다(생년월일·사번이 화면에 노출되지 않게).
+const PREVIEW_SAMPLES = [
+  { id: "sample-1", name: "홍*동", emp_no: "20150908", birth_date: "1990-03-12" },
+  { id: "sample-2", name: "김**", emp_no: "20210114", birth_date: "1985-11-02" },
+  { id: "sample-3", name: "이*", emp_no: "9902", birth_date: null },
+];
 
 const roleLevelsSchema = z.array(z.string().trim().min(1).max(20)).min(1).max(12);
 
@@ -140,22 +143,15 @@ export const previewPasswordRule = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { renderPasswordRule, validatePasswordRule } = await import("@/lib/password-rule");
 
     const invalid = validatePasswordRule(data.rule);
     if (invalid) throw new Error(invalid);
 
-    const { data: samples } = await supabaseAdmin
-      .from("participants")
-      .select("id, name, emp_no, birth_date")
-      .order("emp_no")
-      .limit(3);
-
     return {
-      samples: (samples ?? []).map((p) => ({
+      samples: PREVIEW_SAMPLES.map((p) => ({
         id: p.id,
-        name: maskName(p.name),
+        name: p.name,
         empNo: p.emp_no,
         password: renderPasswordRule(data.rule, p),
       })),

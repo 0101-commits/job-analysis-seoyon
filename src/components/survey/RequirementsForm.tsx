@@ -32,7 +32,11 @@ const EDUCATIONS: { value: Education; label: string }[] = [
   { value: "기준없음", label: "회사에 별도 기준 없음" },
 ];
 
-const CUSTOM = "직접 입력";
+/**
+ * Select 의 "직접 입력" 표식. 실제 값이 아니라 UI 상태이므로 저장 직전에 빈 값으로 걸러낸다
+ * (survey.data.ts saveRequirements 에서 제거).
+ */
+export const CUSTOM = "직접 입력";
 const LANGUAGE_LEVELS = ["기초 회화", "업무 문서", "협상 가능"];
 const PROFICIENCIES = [
   "6개월 미만",

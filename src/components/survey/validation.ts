@@ -82,6 +82,14 @@ export function validateTasks(tasks: TaskItem[]): TaskValidation {
     if (task.activities.length === 0) {
       errors.push(`${name} 과업에 세부 활동을 1개 이상 추가하세요`);
     }
+    task.activities.forEach((act, ai) => {
+      if (act.name.trim() === "") {
+        errors.push(`${name} 과업의 ${ai + 1}번째 세부 활동 이름을 입력하세요`);
+      }
+    });
+    if (task.activities.length === 1) {
+      warnings.push(`${name} 과업의 세부 활동이 1개입니다 — 2~8개로 나누는 것을 권장`);
+    }
     if (task.importance === null) {
       errors.push(`${name} 과업의 중요도를 선택하세요`);
     }
@@ -115,12 +123,15 @@ export function validateSkills(skills: SkillItem[]): TaskValidation {
     errors.push("스킬을 3개 이상 작성해야 제출할 수 있습니다");
   }
   skills.forEach((skill, index) => {
+    const name = skill.name.trim() === "" ? `${index + 1}번째 스킬` : `'${skill.name.trim()}'`;
     if (skill.name.trim() === "") {
       errors.push(`${index + 1}번째 스킬의 이름을 입력하세요`);
     }
     if (skill.ksao === null) {
-      const name = skill.name.trim() === "" ? `${index + 1}번째 스킬` : `'${skill.name.trim()}'`;
       errors.push(`${name}의 구분(지식/기술/능력)을 선택하세요`);
+    }
+    if (skill.description.trim() === "") {
+      errors.push(`${name}의 한 줄 설명을 입력하세요`);
     }
   });
 

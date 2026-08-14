@@ -509,6 +509,7 @@ export const requestReview = createServerFn({ method: "POST" })
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
+    // 응답자 검토는 route B(자동채움·부실보완) 전용이다. route A(오탈자) 건은 관리자가 직접 반영한다.
     const { data: rows, error } = await supabaseAdmin
       .from("ai_suggestions")
       .update({ status: "요청중" })
@@ -518,12 +519,54 @@ export const requestReview = createServerFn({ method: "POST" })
       .select("id");
     if (error) throw new Error(error.message);
 
+    const requested = rows?.length ?? 0;
+    const skipped = data.suggestionIds.length - requested;
+
     await writeAudit(supabaseAdmin, {
       actor_id: context.userId,
       action: "AI 제안 응답자 검토 요청",
-      detail: { count: rows?.length ?? 0 },
+      detail: { count: requested, skipped },
     });
-    return { requested: rows?.length ?? 0 };
+    return { requested, skipped };
+  });
+
+/** 응답에 남은 AI 초안 표시를 관리자가 일괄 확정한다(승인 게이트 해제용). */
+export const confirmAiDrafts = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ responseId: uuid }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: skills, error: skillError } = await supabaseAdmin
+      .from("response_skills")
+      .update({ ai_draft: false })
+      .eq("response_id", data.responseId)
+      .eq("ai_draft", true)
+      .select("id");
+    if (skillError) throw new Error(skillError.message);
+
+    const { data: reqs, error: reqError } = await supabaseAdmin
+      .from("response_requirements")
+      .update({ ai_draft: false })
+      .eq("response_id", data.responseId)
+      .eq("ai_draft", true)
+      .select("id");
+    if (reqError) throw new Error(reqError.message);
+
+    const confirmed = (skills?.length ?? 0) + (reqs?.length ?? 0);
+    if (confirmed === 0) return { confirmed: 0 };
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "AI 초안 일괄 확정",
+      target_type: "response",
+      target_id: data.responseId,
+      detail: { skills: skills?.length ?? 0, requirements: reqs?.length ?? 0 },
+    });
+
+    return { confirmed };
   });
 
 export const applySuggestion = createServerFn({ method: "POST" })
@@ -555,29 +598,33 @@ export const applySuggestion = createServerFn({ method: "POST" })
         hard_soft: string | null;
         description: string | null;
       };
+      // 관리자(또는 응답자 검토)를 거쳐 반영된 값이므로 초안 표시를 달지 않는다 —
+      // ai_draft 가 남으면 approveResponse 승인 게이트가 계속 막힌다.
       const { error } = await supabaseAdmin.from("response_skills").insert({
         response_id: s.response_id,
         name: draft.name,
         ksao: draft.ksao,
         hard_soft: draft.hard_soft,
         description: draft.description,
-        ai_draft: true,
+        ai_draft: false,
       });
       if (error) throw new Error(error.message);
     } else if (!id || !field || !APPLY_FIELDS[table]?.includes(field)) {
       throw new Error(`반영이 허용되지 않은 필드입니다: ${s.target}`);
     } else if (table === "response_requirements") {
       // 1:1 테이블이므로 id 자리에 들어온 response_id 로 upsert 한다.
-      const row = { response_id: id, [field]: s.suggested_value, ai_draft: true };
+      const row = { response_id: id, [field]: s.suggested_value, ai_draft: false };
       const { error } = await supabaseAdmin
         .from("response_requirements")
         .upsert(row as never, { onConflict: "response_id" });
       if (error) throw new Error(error.message);
     } else {
       // 필드명이 런타임 값이라 제네릭 추론이 안 된다. 화이트리스트로 이미 검증했다.
+      const patch: Record<string, unknown> = { [field]: s.suggested_value };
+      if (table === "response_skills") patch["ai_draft"] = false;
       const { error } = await supabaseAdmin
         .from(table as "responses")
-        .update({ [field]: s.suggested_value } as never)
+        .update(patch as never)
         .eq("id", id);
       if (error) throw new Error(error.message);
     }

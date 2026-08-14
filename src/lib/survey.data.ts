@@ -1,6 +1,7 @@
 // 조사 마법사 데이터 계층 — respondent 본인 데이터는 RLS 로 보호되므로 클라이언트에서 직접 CRUD 한다.
 import { supabase } from "@/integrations/supabase/client";
 import type { Database, Json } from "@/integrations/supabase/types";
+import { CUSTOM } from "@/components/survey/RequirementsForm";
 import type {
   Authority,
   Education,
@@ -101,7 +102,9 @@ export async function loadFull(responseId: string): Promise<FullResponse> {
       .select("*, response_activities(id, name, seq)")
       .eq("response_id", responseId)
       .order("seq", { ascending: true }),
-    supabase.from("response_skills").select("*").eq("response_id", responseId),
+    // ponytail: response_skills 에 seq 컬럼이 없다 — id 정렬로 조회 순서만 고정한다.
+    //           작성 순서를 그대로 살리려면 seq 컬럼 추가가 정공법.
+    supabase.from("response_skills").select("*").eq("response_id", responseId).order("id"),
     supabase.from("response_requirements").select("*").eq("response_id", responseId).maybeSingle(),
   ]);
   if (taskRes.error) throw taskRes.error;
@@ -214,6 +217,15 @@ export async function saveSkills(responseId: string, skills: SkillItem[]) {
   if (delError) throw delError;
 
   if (!skills.length) return;
+
+  // 삭제된 과업을 가리키는 고아 참조 제거 — 저장 시점의 실제 과업 id 만 남긴다.
+  const { data: taskRows, error: taskError } = await supabase
+    .from("response_tasks")
+    .select("id")
+    .eq("response_id", responseId);
+  if (taskError) throw taskError;
+  const liveTaskIds = new Set((taskRows ?? []).map((t) => t.id));
+
   const { error } = await supabase.from("response_skills").upsert(
     skills.map((s) => ({
       id: s.id,
@@ -222,13 +234,17 @@ export async function saveSkills(responseId: string, skills: SkillItem[]) {
       ksao: s.ksao,
       hard_soft: s.hardSoft,
       description: s.description || null,
-      related_task_ids: s.relatedTaskIds,
+      related_task_ids: s.relatedTaskIds.filter((id) => liveTaskIds.has(id)),
     })),
   );
   if (error) throw error;
 }
 
 export async function saveRequirements(responseId: string, value: RequirementsValue) {
+  // "직접 입력"은 Select 표식일 뿐 실제 값이 아니다 — 옆 칸을 안 채웠으면 빈 값으로 저장한다.
+  const dropMarker = (raw: string) => (raw.trim() === CUSTOM ? "" : raw.trim());
+  const languages = value.languages.map((l) => ({ ...l, level: dropMarker(l.level) }));
+
   const { error } = await supabase.from("response_requirements").upsert(
     {
       response_id: responseId,
@@ -236,9 +252,9 @@ export async function saveRequirements(responseId: string, value: RequirementsVa
       majors_required: value.majorsRequired || null,
       majors_preferred: value.majorsPreferred || null,
       licenses: value.licenses as unknown as Json,
-      languages: value.languages as unknown as Json,
+      languages: languages as unknown as Json,
       trainings: value.trainings || null,
-      proficiency: value.proficiency || null,
+      proficiency: dropMarker(value.proficiency) || null,
     },
     { onConflict: "response_id" },
   );

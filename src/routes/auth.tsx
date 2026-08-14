@@ -3,7 +3,7 @@ import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { fetchMyRole } from "@/lib/auth";
-import { checkLockStatus, recordLoginAttempt } from "@/lib/auth.functions";
+import { signInWithLock } from "@/lib/auth.functions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -27,7 +27,6 @@ export const Route = createFileRoute("/auth")({
 
 function AuthPage() {
   const navigate = useNavigate();
-  const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -38,41 +37,26 @@ function AuthPage() {
     e.preventDefault();
     setLoading(true);
     try {
-      if (mode === "signup") {
-        const { error } = await supabase.auth.signUp({
-          email,
-          password,
-          options: { emailRedirectTo: window.location.origin },
-        });
-        if (error) throw error;
-      } else {
-        const { locked } = await checkLockStatus({ data: { email } });
-        if (locked) {
-          toast.error(LOCK_MESSAGE);
-          return;
-        }
-      }
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) {
-        const attempt = await recordLoginAttempt({ data: { email, success: false } });
-        toast.error(
-          attempt.locked
-            ? LOCK_MESSAGE
-            : `로그인에 실패했습니다. 아이디와 비밀번호를 확인해 주세요.${
-                attempt.remaining ? ` (${attempt.remaining}회 실패 시 계정이 잠깁니다)` : ""
-              }`,
-        );
+      // 인증·잠금 판정은 전부 서버에서. 클라이언트는 결과 세션만 받는다.
+      const result = await signInWithLock({ data: { email, password } });
+      if (result.status === "locked") {
+        toast.error(LOCK_MESSAGE);
         return;
       }
-      await recordLoginAttempt({ data: { email, success: true } });
+      if (result.status !== "ok") {
+        toast.error("로그인에 실패했습니다. 아이디와 비밀번호를 확인해 주세요.");
+        return;
+      }
+
+      const { error } = await supabase.auth.setSession(result.session);
+      if (error) throw error;
+
       const role = await fetchMyRole();
       toast.success("로그인되었습니다.");
       navigate({ to: role === "admin" ? "/admin" : "/home", replace: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
-      toast.error(
-        mode === "signup" ? `계정 생성에 실패했습니다: ${message}` : `로그인에 실패했습니다: ${message}`,
-      );
+      toast.error(`로그인에 실패했습니다: ${message}`);
     } finally {
       setLoading(false);
     }
@@ -90,9 +74,7 @@ function AuthPage() {
         </div>
 
         <div className="rounded-xl border bg-card p-6 shadow-sm sm:p-8">
-          <h2 className="text-lg font-semibold">
-            {mode === "signin" ? "로그인" : "계정 만들기"}
-          </h2>
+          <h2 className="text-lg font-semibold">로그인</h2>
           <form onSubmit={handleSubmit} className="mt-6 space-y-5">
             <div className="space-y-2">
               <Label htmlFor="email">아이디 (이메일)</Label>
@@ -111,7 +93,7 @@ function AuthPage() {
               <Input
                 id="password"
                 type="password"
-                autoComplete={mode === "signin" ? "current-password" : "new-password"}
+                autoComplete="current-password"
                 required
                 minLength={8}
                 value={password}
@@ -120,19 +102,13 @@ function AuthPage() {
               />
             </div>
             <Button type="submit" className="h-11 w-full text-base" disabled={loading}>
-              {loading ? "처리 중..." : mode === "signin" ? "로그인" : "계정 만들고 로그인"}
+              {loading ? "처리 중..." : "로그인"}
             </Button>
           </form>
 
-          <button
-            type="button"
-            onClick={() => setMode(mode === "signin" ? "signup" : "signin")}
-            className="mt-5 w-full text-center text-sm text-muted-foreground underline-offset-4 hover:text-primary hover:underline"
-          >
-            {mode === "signin"
-              ? "초대받았지만 계정이 없으신가요? 계정 만들기"
-              : "이미 계정이 있으신가요? 로그인"}
-          </button>
+          <p className="mt-5 text-center text-sm text-muted-foreground">
+            계정은 관리자가 발급합니다. 계정 문의는 관리자에게 연락해 주세요.
+          </p>
         </div>
 
         <p className="mt-6 text-center text-xs text-muted-foreground">

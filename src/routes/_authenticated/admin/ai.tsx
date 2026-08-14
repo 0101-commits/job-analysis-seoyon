@@ -236,17 +236,8 @@ function TypoTab({
     onError: (err) => toast.error(errorMessage(err)),
   });
 
-  const reviewMutation = useMutation({
-    mutationFn: (ids: string[]) => requestReview({ data: { suggestionIds: ids } }),
-    onSuccess: (res) => {
-      toast.success(`${res.requested}건을 응답자 검토로 넘겼습니다.`);
-      setSelected(new Set());
-      void invalidate();
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-
-  const busy = scanMutation.isPending || applyMutation.isPending || reviewMutation.isPending;
+  // 오타 검수는 경로 A(관리자 직접 반영) 전용 — 응답자 검토 요청(경로 B)은 제공하지 않는다.
+  const busy = scanMutation.isPending || applyMutation.isPending;
   const selectedIds = [...selected];
 
   function toggle(id: string) {
@@ -294,17 +285,12 @@ function TypoTab({
                 )}
                 직접 반영 (A)
               </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={busy || selectedIds.length === 0}
-                onClick={() => reviewMutation.mutate(selectedIds)}
-              >
-                <Send className="size-4" />
-                응답자 검토 요청 (B)
-              </Button>
             </div>
           </div>
+          <p className="text-xs text-muted-foreground">
+            오타 검수는 관리자가 직접 반영하는 경로 A 전용입니다. 응답자 검토가 필요하면 자동 채움
+            탭을 사용하세요.
+          </p>
 
           <ul className="space-y-3">
             {pending.map((s) => (
@@ -333,14 +319,6 @@ function TypoTab({
                         onClick={() => applyMutation.mutate([s.id])}
                       >
                         직접 반영
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        disabled={busy}
-                        onClick={() => reviewMutation.mutate([s.id])}
-                      >
-                        검토 요청
                       </Button>
                     </div>
                   </div>

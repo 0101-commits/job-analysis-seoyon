@@ -16,6 +16,7 @@ export default defineConfig({
   // createCsrfMiddleware가 순환 참조로 undefined가 되어 SSR 500이 발생한다.
   // 단일 번들로 강제해 모듈 로드 순서 문제를 제거한다.
   nitro: {
+    // @ts-expect-error 래퍼 타입에 rollupConfig가 노출되지 않지만 런타임에서 nitro가 인식한다.
     rollupConfig: {
       output: {
         inlineDynamicImports: true,

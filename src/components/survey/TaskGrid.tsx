@@ -39,6 +39,18 @@ import { duplicateTaskIds } from "./validation";
 
 const MAX_KEY_TASKS = 5;
 
+/**
+ * 신규 행 id. crypto.randomUUID 는 보안 컨텍스트(https/localhost)에서만 존재하므로
+ * 사내 http 배포를 대비해 uuid v4 모양의 폴백을 둔다(DB 컬럼이 uuid 라 모양을 지켜야 한다).
+ * SkillGrid 도 같은 헬퍼를 쓴다.
+ */
+export const uid = (): string =>
+  globalThis.crypto?.randomUUID?.() ??
+  "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+
 const IMPORTANCE_HINTS: Record<number, string> = {
   1: "보조적 — 없어도 직무 성과에 큰 영향이 없음",
   2: "낮음 — 가끔 필요한 보완적 과업",
@@ -157,7 +169,7 @@ export function TaskGrid({ value, onChange, examples, disabled = false }: TaskGr
     onChange([
       ...value,
       {
-        id: crypto.randomUUID(),
+        id: uid(),
         name: "",
         importance: null,
         authority: null,
@@ -483,7 +495,7 @@ function ActivityList({
         variant="ghost"
         size="sm"
         disabled={disabled}
-        onClick={() => onChange([...task.activities, { id: crypto.randomUUID(), name: "" }])}
+        onClick={() => onChange([...task.activities, { id: uid(), name: "" }])}
       >
         <Plus className="mr-1 size-4" />
         활동 추가

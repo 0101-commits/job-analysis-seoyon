@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { Database } from "@/integrations/supabase/types";
+import { fetchAll } from "./paginate";
 
 /** 직무별 응답 수 집계에 포함되는 상태 (초안·반려는 제외) */
 const COUNTED_STATUSES = ["submitted", "approved"];
@@ -37,11 +38,18 @@ async function jobCounts(
   admin: SupabaseClient<Database>,
   companyId: string | null,
 ): Promise<Record<string, number>> {
-  let q = admin.from("responses").select("job_name").in("status", COUNTED_STATUSES);
-  if (companyId) q = q.eq("company_id", companyId);
-  const { data } = await q;
+  // 1인 응답 직무 판정(승인 게이트)에 쓰이므로 1000행 상한에 잘리면 안 된다. 전량 조회한다.
+  const rows = await fetchAll<{ job_name: string | null }>((from, to) => {
+    let q = admin
+      .from("responses")
+      .select("job_name")
+      .in("status", COUNTED_STATUSES)
+      .range(from, to);
+    if (companyId) q = q.eq("company_id", companyId);
+    return q;
+  });
   const counts: Record<string, number> = {};
-  for (const row of data ?? []) {
+  for (const row of rows) {
     if (row.job_name) counts[row.job_name] = (counts[row.job_name] ?? 0) + 1;
   }
   return counts;
@@ -352,10 +360,13 @@ export const correctField = createServerFn({ method: "POST" })
     });
     if (logError) throw new Error(logError.message);
 
-    const { error } = await db
-      .from(table)
-      .update({ [data.field]: data.value })
-      .eq("id", data.id);
+    // 관리자가 손본 값은 더 이상 AI 초안이 아니다(승인 게이트 통과 조건).
+    const patch: Record<string, unknown> = { [data.field]: data.value };
+    if (table === "response_skills" || table === "response_requirements") {
+      patch["ai_draft"] = false;
+    }
+
+    const { error } = await db.from(table).update(patch).eq("id", data.id);
     if (error) throw new Error(error.message);
 
     await writeAudit(supabaseAdmin, {

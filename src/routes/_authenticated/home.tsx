@@ -1,9 +1,15 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CalendarClock, CheckCircle2, FileText, LogOut } from "lucide-react";
+import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/StatusBadge";
+import {
+  AiSuggestionCards,
+  type AiSuggestionItem,
+  type SuggestionDecision,
+} from "@/components/survey/AiSuggestionCards";
 
 export const Route = createFileRoute("/_authenticated/home")({
   head: () => ({
@@ -35,7 +41,9 @@ function RespondentHome() {
       if (!uid) return null;
       const { data, error } = await supabase
         .from("participants")
-        .select("name, emp_no, org_text, grade, account_status, companies(name, survey_settings(deadline))")
+        .select(
+          "name, emp_no, org_text, grade, account_status, companies(name, survey_settings(deadline))",
+        )
         .eq("user_id", uid)
         .maybeSingle();
       if (error) throw error;
@@ -56,6 +64,48 @@ function RespondentHome() {
       return data;
     },
   });
+
+  // RLS 상 본인 응답의 '요청중' 제안만 조회된다.
+  const { data: suggestions } = useQuery({
+    queryKey: ["my-ai-suggestions"],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("ai_suggestions")
+        .select("id, target, original_value, suggested_value, kind, status")
+        .eq("status", "요청중")
+        .order("created_at");
+      if (error) throw error;
+      return (data ?? []) as AiSuggestionItem[];
+    },
+  });
+
+  const pendingSuggestions = suggestions ?? [];
+
+  async function handleDecide(
+    id: string,
+    decision: SuggestionDecision,
+    note?: string,
+    editedValue?: string,
+  ) {
+    // 응답자 직접 UPDATE 정책이 제거돼 SECURITY DEFINER RPC 로만 결정할 수 있다.
+    // types.ts 가 security_hardening 마이그레이션 이후 재생성되지 않아 캐스팅한다.
+    const rpc = supabase.rpc as unknown as (
+      fn: string,
+      args: Record<string, unknown>,
+    ) => Promise<{ error: { message: string } | null }>;
+    const { error } = await rpc("decide_suggestion", {
+      _id: id,
+      _decision: decision,
+      _note: note ?? null,
+      _edited: editedValue ?? null,
+    });
+    if (error) {
+      toast.error(error.message);
+      return;
+    }
+    toast.success(`${decision} 처리했습니다.`);
+    await queryClient.invalidateQueries({ queryKey: ["my-ai-suggestions"] });
+  }
 
   const deadline = data?.companies?.survey_settings?.deadline ?? null;
   const dday = deadline ? daysUntil(deadline) : null;
@@ -90,7 +140,8 @@ function RespondentHome() {
       default:
         return {
           surveyLabel: "조사 시작하기",
-          surveyMessage: "담당 직무의 과업과 필요 역량을 6단계로 작성합니다. 예상 소요 시간은 약 20분입니다.",
+          surveyMessage:
+            "담당 직무의 과업과 필요 역량을 6단계로 작성합니다. 예상 소요 시간은 약 20분입니다.",
           surveyAction: "/onboarding",
         };
     }
@@ -150,7 +201,11 @@ function RespondentHome() {
                   </>
                 ) : (
                   <>
-                    <span className={dday < 0 ? "text-muted-foreground" : dday <= 3 ? "text-destructive" : ""}>
+                    <span
+                      className={
+                        dday < 0 ? "text-muted-foreground" : dday <= 3 ? "text-destructive" : ""
+                      }
+                    >
                       {dday < 0 ? "마감됨" : dday === 0 ? "D-Day" : `마감까지 D-${dday}`}
                     </span>
                     <span className="text-sm font-normal text-muted-foreground">({deadline})</span>
@@ -183,6 +238,20 @@ function RespondentHome() {
             {surveyLabel}
           </Button>
         </section>
+
+        {pendingSuggestions.length > 0 && (
+          <section className="space-y-4">
+            <div>
+              <h3 className="text-base font-semibold">
+                내게 온 검토 요청 {pendingSuggestions.length}건
+              </h3>
+              <p className="mt-1 text-sm text-muted-foreground">
+                AI가 제안한 내용입니다. 수락·수정·거절 중 하나를 선택해 주세요.
+              </p>
+            </div>
+            <AiSuggestionCards suggestions={pendingSuggestions} onDecide={handleDecide} />
+          </section>
+        )}
       </main>
     </div>
   );

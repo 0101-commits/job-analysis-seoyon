@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-import { ExamplesPanel, Hint } from "./TaskGrid";
+import { ExamplesPanel, Hint, uid } from "./TaskGrid";
 import type { HardSoft, Ksao, SkillGridProps, SkillItem } from "./types";
 
 const KSAO_OPTIONS: { value: Ksao; label: string; hint: string }[] = [
@@ -28,7 +28,7 @@ export function SkillGrid({ value, onChange, tasks, examples, disabled = false }
     onChange([
       ...value,
       {
-        id: crypto.randomUUID(),
+        id: uid(),
         name: "",
         ksao: null,
         hardSoft: null,
