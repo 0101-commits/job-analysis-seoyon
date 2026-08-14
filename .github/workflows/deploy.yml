@@ -1,0 +1,63 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      # VITE_* 는 빌드 시점에 클라이언트 번들로 인라인된다.
+      - name: Build
+        run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+
+      # 산출물 wrangler.json 은 매 빌드 초기화되므로 서버 런타임 vars 와 cron 트리거를 주입한다.
+      - name: Inject server vars & cron trigger
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = ".output/server/wrangler.json";
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            j.vars = {
+              SUPABASE_URL: process.env.SUPABASE_URL,
+              SUPABASE_PUBLISHABLE_KEY: process.env.SUPABASE_PUBLISHABLE_KEY,
+              APP_URL: process.env.APP_URL,
+            };
+            if (process.env.SUPABASE_SERVICE_ROLE_KEY) j.vars.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+            if (process.env.RESEND_API_KEY) j.vars.RESEND_API_KEY = process.env.RESEND_API_KEY;
+            if (process.env.RESEND_FROM) j.vars.RESEND_FROM = process.env.RESEND_FROM;
+            // 자동 백업/리마인더/예약 발송용 cron (UTC 21:00·09:00 = KST 06:00·18:00)
+            j.triggers = { crons: ["0 21,9 * * *"] };
+            fs.writeFileSync(p, JSON.stringify(j, null, 2));
+            console.log("injected vars:", Object.keys(j.vars).join(", "));
+          '
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+          APP_URL: ${{ secrets.APP_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+
+      - name: Deploy to Cloudflare Workers
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
