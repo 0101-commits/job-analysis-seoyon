@@ -12,6 +12,10 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # GitHub Deployments(repo → Environments)에 배포 기록·URL을 남긴다.
+    environment:
+      name: production
+      url: https://0101-commits-job-analysis-seoyon.baldr0001.workers.dev
     steps:
       - uses: actions/checkout@v4
 
