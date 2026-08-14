@@ -12,4 +12,14 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  // nitro CF preset이 서버를 여러 mjs로 분할하면 @tanstack/react-start 배럴의
+  // createCsrfMiddleware가 순환 참조로 undefined가 되어 SSR 500이 발생한다.
+  // 단일 번들로 강제해 모듈 로드 순서 문제를 제거한다.
+  nitro: {
+    rollupConfig: {
+      output: {
+        inlineDynamicImports: true,
+      },
+    },
+  },
 });
