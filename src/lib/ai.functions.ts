@@ -592,12 +592,21 @@ export const applySuggestion = createServerFn({ method: "POST" })
     if (!table) throw new Error(`알 수 없는 반영 대상입니다: ${s.target}`);
 
     if (table === "response_skills" && id === "new") {
-      const draft = JSON.parse(s.suggested_value) as {
+      // 신규 스킬 제안의 suggested_value 는 구조화 JSON 이다. 응답자 '수정'이 사람이 읽는
+      // 문자열로 덮어쓰면 파싱이 깨지므로, 실패 시 크래시 대신 명확한 사유를 던진다.
+      let draft: {
         name: string;
         ksao: string | null;
         hard_soft: string | null;
         description: string | null;
       };
+      try {
+        draft = JSON.parse(s.suggested_value);
+      } catch {
+        throw new Error(
+          "이 스킬 제안은 자유 편집으로 수정할 수 없습니다. 수락 또는 거절만 선택하거나, 관리자가 직접 스킬을 추가하세요.",
+        );
+      }
       // 관리자(또는 응답자 검토)를 거쳐 반영된 값이므로 초안 표시를 달지 않는다 —
       // ai_draft 가 남으면 approveResponse 승인 게이트가 계속 막힌다.
       const { error } = await supabaseAdmin.from("response_skills").insert({

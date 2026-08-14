@@ -44,36 +44,23 @@ function isH3SwallowedErrorBody(body: string): boolean {
   }
 }
 
-// 예약 배치 발송 + 자동 리마인더. cron 두 번 울려도 리마인더가 겹치지 않도록
-// 같은 날짜 리마인더 배치가 이미 있으면 건너뛴다.
+// 예약 배치 발송 + 자동 리마인더.
+// - runScheduledBatches: '예약'→'대기' 조건부 선점으로 cron 동시/중복 실행 시 이중 발송 차단.
+// - runReminders: 무force 자동 경로(reminder_auto + D-N 판정 + 회사별 하루 1회 가드 내장).
+//   회사별 중복방지가 함수 내부에 있으므로 여기서 전역 name 가드를 두면 안 된다
+//   (A사 리마인더 1건이 그날 B·C사 리마인더를 통째로 막던 버그).
 async function runScheduledJobs() {
   const { supabaseAdmin } = await import("./integrations/supabase/client.server");
-  const { processBatch, runReminders } = await import("./lib/mailer.server");
+  const { runScheduledBatches, runReminders } = await import("./lib/mailer.server");
 
-  const { data: due } = await supabaseAdmin
-    .from("mail_batches")
-    .select("id")
-    .eq("status", "예약")
-    .lte("scheduled_at", new Date().toISOString());
-
-  for (const batch of due ?? []) {
-    try {
-      await processBatch(supabaseAdmin, batch.id);
-    } catch (error) {
-      console.error(`예약 배치 ${batch.id} 발송 실패`, error);
-    }
+  try {
+    await runScheduledBatches(supabaseAdmin, null);
+  } catch (error) {
+    console.error("예약 배치 발송 실패", error);
   }
 
   try {
-    const todayName = `리마인더 ${new Date().toISOString().slice(0, 10)}`;
-    const { data: already } = await supabaseAdmin
-      .from("mail_batches")
-      .select("id")
-      .eq("name", todayName)
-      .limit(1);
-    if (!already?.length) {
-      await runReminders(supabaseAdmin, { companyId: null, origin: null });
-    }
+    await runReminders(supabaseAdmin, { origin: null });
   } catch (error) {
     console.error("자동 리마인더 실패", error);
   }
