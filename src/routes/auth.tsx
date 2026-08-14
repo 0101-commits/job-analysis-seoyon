@@ -3,6 +3,7 @@ import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { fetchMyRole } from "@/lib/auth";
+import { checkLockStatus, recordLoginAttempt } from "@/lib/auth.functions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -31,6 +32,8 @@ function AuthPage() {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
 
+  const LOCK_MESSAGE = "계정이 잠겼습니다. 30분 후 다시 시도하거나 관리자에게 문의하세요.";
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
@@ -42,9 +45,26 @@ function AuthPage() {
           options: { emailRedirectTo: window.location.origin },
         });
         if (error) throw error;
+      } else {
+        const { locked } = await checkLockStatus({ data: { email } });
+        if (locked) {
+          toast.error(LOCK_MESSAGE);
+          return;
+        }
       }
       const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) throw error;
+      if (error) {
+        const attempt = await recordLoginAttempt({ data: { email, success: false } });
+        toast.error(
+          attempt.locked
+            ? LOCK_MESSAGE
+            : `로그인에 실패했습니다. 아이디와 비밀번호를 확인해 주세요.${
+                attempt.remaining ? ` (${attempt.remaining}회 실패 시 계정이 잠깁니다)` : ""
+              }`,
+        );
+        return;
+      }
+      await recordLoginAttempt({ data: { email, success: true } });
       const role = await fetchMyRole();
       toast.success("로그인되었습니다.");
       navigate({ to: role === "admin" ? "/admin" : "/home", replace: true });

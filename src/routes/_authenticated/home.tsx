@@ -17,6 +17,12 @@ export const Route = createFileRoute("/_authenticated/home")({
   component: RespondentHome,
 });
 
+function daysUntil(deadline: string) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.round((new Date(`${deadline}T00:00:00`).getTime() - today.getTime()) / 86_400_000);
+}
+
 function RespondentHome() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -29,13 +35,16 @@ function RespondentHome() {
       if (!uid) return null;
       const { data, error } = await supabase
         .from("participants")
-        .select("name, emp_no, org_text, grade, account_status, companies(name)")
+        .select("name, emp_no, org_text, grade, account_status, companies(name, survey_settings(deadline))")
         .eq("user_id", uid)
         .maybeSingle();
       if (error) throw error;
       return data;
     },
   });
+
+  const deadline = data?.companies?.survey_settings?.deadline ?? null;
+  const dday = deadline ? daysUntil(deadline) : null;
 
   async function handleSignOut() {
     await queryClient.cancelQueries();
@@ -82,10 +91,21 @@ function RespondentHome() {
             </div>
             <div className="rounded-lg border bg-background p-4">
               <p className="text-xs font-medium text-muted-foreground">제출 마감</p>
-              <p className="mt-2 flex items-center gap-2 text-lg font-semibold">
+              <p className="mt-2 flex flex-wrap items-center gap-2 text-lg font-semibold">
                 <CalendarClock className="size-5 text-primary" />
-                D-–
-                <span className="text-sm font-normal text-muted-foreground">(기한 미설정)</span>
+                {dday === null ? (
+                  <>
+                    D-–
+                    <span className="text-sm font-normal text-muted-foreground">(기한 미설정)</span>
+                  </>
+                ) : (
+                  <>
+                    <span className={dday < 0 ? "text-muted-foreground" : dday <= 3 ? "text-destructive" : ""}>
+                      {dday < 0 ? "마감됨" : dday === 0 ? "D-Day" : `마감까지 D-${dday}`}
+                    </span>
+                    <span className="text-sm font-normal text-muted-foreground">({deadline})</span>
+                  </>
+                )}
               </p>
             </div>
           </div>
