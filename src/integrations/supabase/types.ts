@@ -14,6 +14,59 @@ export type Database = {
   }
   public: {
     Tables: {
+      ai_suggestions: {
+        Row: {
+          created_at: string
+          decided_at: string | null
+          decided_by: string | null
+          id: string
+          kind: string
+          original_value: string | null
+          respondent_note: string | null
+          response_id: string
+          route: string
+          status: string
+          suggested_value: string
+          target: string
+        }
+        Insert: {
+          created_at?: string
+          decided_at?: string | null
+          decided_by?: string | null
+          id?: string
+          kind: string
+          original_value?: string | null
+          respondent_note?: string | null
+          response_id: string
+          route: string
+          status?: string
+          suggested_value: string
+          target: string
+        }
+        Update: {
+          created_at?: string
+          decided_at?: string | null
+          decided_by?: string | null
+          id?: string
+          kind?: string
+          original_value?: string | null
+          respondent_note?: string | null
+          response_id?: string
+          route?: string
+          status?: string
+          suggested_value?: string
+          target?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "ai_suggestions_response_id_fkey"
+            columns: ["response_id"]
+            isOneToOne: false
+            referencedRelation: "responses"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       audit_logs: {
         Row: {
           action: string
@@ -71,6 +124,38 @@ export type Database = {
         }
         Relationships: []
       }
+      duty_charts: {
+        Row: {
+          company_id: string
+          id: string
+          org_name: string
+          rows: Json
+          uploaded_at: string
+        }
+        Insert: {
+          company_id: string
+          id?: string
+          org_name: string
+          rows?: Json
+          uploaded_at?: string
+        }
+        Update: {
+          company_id?: string
+          id?: string
+          org_name?: string
+          rows?: Json
+          uploaded_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "duty_charts_company_id_fkey"
+            columns: ["company_id"]
+            isOneToOne: false
+            referencedRelation: "companies"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       example_library: {
         Row: {
           bad_example: string | null
@@ -98,6 +183,33 @@ export type Database = {
           id?: string
           note?: string | null
           sort?: number
+        }
+        Relationships: []
+      }
+      job_catalog: {
+        Row: {
+          company_ids: string[]
+          definition: string | null
+          id: string
+          job_group: string
+          job_name: string
+          job_series: string
+        }
+        Insert: {
+          company_ids?: string[]
+          definition?: string | null
+          id?: string
+          job_group: string
+          job_name: string
+          job_series: string
+        }
+        Update: {
+          company_ids?: string[]
+          definition?: string | null
+          id?: string
+          job_group?: string
+          job_name?: string
+          job_series?: string
         }
         Relationships: []
       }
@@ -272,6 +384,48 @@ export type Database = {
           updated_at?: string
         }
         Relationships: []
+      }
+      org_units: {
+        Row: {
+          company_id: string
+          id: string
+          level: string | null
+          name: string
+          parent_id: string | null
+          sort: number
+        }
+        Insert: {
+          company_id: string
+          id?: string
+          level?: string | null
+          name: string
+          parent_id?: string | null
+          sort?: number
+        }
+        Update: {
+          company_id?: string
+          id?: string
+          level?: string | null
+          name?: string
+          parent_id?: string | null
+          sort?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "org_units_company_id_fkey"
+            columns: ["company_id"]
+            isOneToOne: false
+            referencedRelation: "companies"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "org_units_parent_id_fkey"
+            columns: ["parent_id"]
+            isOneToOne: false
+            referencedRelation: "org_units"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       participants: {
         Row: {
