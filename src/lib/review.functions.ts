@@ -55,6 +55,31 @@ async function jobCounts(
   return counts;
 }
 
+/** 검수 큐 목록 쿼리 한 페이지. 반환 타입이 QueueRow 추론의 원천이기도 하다. */
+function queuePage(
+  admin: SupabaseClient<Database>,
+  filters: z.infer<typeof queueInput>,
+  from: number,
+  to: number,
+) {
+  let q = admin
+    .from("responses")
+    .select(
+      "id, job_group, job_series, job_name, status, submitted_at, updated_at, company_id, companies(name), participants(name, emp_no, org_text, grade, role_level, account_status)",
+    )
+    .neq("status", "draft")
+    // submitted_at 은 중복될 수 있다. id 를 덧붙여야 페이지 경계에서 행이 새거나 겹치지 않는다.
+    .order("submitted_at", { ascending: false })
+    .order("id")
+    .range(from, to);
+  if (filters.companyId) q = q.eq("company_id", filters.companyId);
+  if (filters.status) q = q.eq("status", filters.status);
+  if (filters.jobName) q = q.ilike("job_name", `%${filters.jobName}%`);
+  return q;
+}
+
+type QueueRow = NonNullable<Awaited<ReturnType<typeof queuePage>>["data"]>[number];
+
 export const listReviewQueue = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => queueInput.parse(input ?? {}))
@@ -65,24 +90,14 @@ export const listReviewQueue = createServerFn({ method: "POST" })
 
     const companyId = data.companyId ?? null;
 
-    let q = supabaseAdmin
-      .from("responses")
-      .select(
-        "id, job_group, job_series, job_name, status, submitted_at, updated_at, company_id, companies(name), participants(name, emp_no, org_text, grade, role_level, account_status)",
-      )
-      .neq("status", "draft")
-      .order("submitted_at", { ascending: false });
-    if (companyId) q = q.eq("company_id", companyId);
-    if (data.status) q = q.eq("status", data.status);
-    if (data.jobName) q = q.ilike("job_name", `%${data.jobName}%`);
-
-    const { data: rows, error } = await q;
-    if (error) throw new Error(error.message);
+    const rows = await fetchAll<QueueRow>((from, to) =>
+      queuePage(supabaseAdmin, { ...data, companyId }, from, to),
+    );
 
     const counts = await jobCounts(supabaseAdmin, companyId);
 
     return {
-      rows: (rows ?? []).map((r) => ({
+      rows: rows.map((r) => ({
         ...r,
         jobCount: r.job_name ? (counts[r.job_name] ?? 0) : 0,
       })),

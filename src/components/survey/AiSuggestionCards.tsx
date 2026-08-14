@@ -1,17 +1,16 @@
 // 응답자에게 노출되는 AI 제안 검토 카드. 순수 컴포넌트 — 저장은 호출자가 담당한다.
 //
-// RLS 상 응답자는 본인 응답의 status='요청중' 행만 갱신할 수 있다. 호출자 예시:
+// 응답자의 직접 UPDATE 는 RLS 로 막혀 있고, SECURITY DEFINER RPC 로만 결정할 수 있다.
+// (RPC 가 본인 응답의 status='요청중' 행인지 검증하고, '수정' 시 AI 원문을
+//  ai_suggested_value 로 보존한다.) 호출자 예시:
 //
 //   async function handleDecide(id, decision, note, editedValue) {
-//     const { error } = await supabase
-//       .from("ai_suggestions")
-//       .update({
-//         status: decision,                                   // '수락' | '수정' | '거절'
-//         respondent_note: note ?? null,
-//         ...(decision === "수정" && editedValue ? { suggested_value: editedValue } : {}),
-//         decided_at: new Date().toISOString(),
-//       })
-//       .eq("id", id);
+//     const { error } = await supabase.rpc("decide_suggestion", {
+//       _id: id,
+//       _decision: decision, // '수락' | '수정' | '거절'
+//       _note: note ?? null,
+//       _edited: editedValue ?? null, // '수정' 이면 필수
+//     });
 //     if (error) toast.error(error.message);
 //   }
 //

@@ -16,6 +16,7 @@ export type Database = {
     Tables: {
       ai_suggestions: {
         Row: {
+          ai_suggested_value: string | null
           created_at: string
           decided_at: string | null
           decided_by: string | null
@@ -30,6 +31,7 @@ export type Database = {
           target: string
         }
         Insert: {
+          ai_suggested_value?: string | null
           created_at?: string
           decided_at?: string | null
           decided_by?: string | null
@@ -44,6 +46,7 @@ export type Database = {
           target: string
         }
         Update: {
+          ai_suggested_value?: string | null
           created_at?: string
           decided_at?: string | null
           decided_by?: string | null
@@ -878,6 +881,15 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      decide_suggestion: {
+        Args: {
+          _decision: string
+          _edited?: string
+          _id: string
+          _note?: string
+        }
+        Returns: boolean
+      }
       has_role: {
         Args: {
           _role: Database["public"]["Enums"]["app_role"]
@@ -904,6 +916,10 @@ export type Database = {
       owns_task: {
         Args: { _editable?: boolean; _task_id: string }
         Returns: boolean
+      }
+      touch_my_last_seen: {
+        Args: never
+        Returns: undefined
       }
     }
     Enums: {

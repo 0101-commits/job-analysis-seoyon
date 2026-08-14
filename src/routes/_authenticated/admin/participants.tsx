@@ -36,6 +36,7 @@ import {
   type RosterRow,
 } from "@/lib/roster";
 import { provisionAccounts, resetParticipantPassword } from "@/lib/admin.functions";
+import { fetchAll } from "@/lib/paginate";
 
 export const Route = createFileRoute("/_authenticated/admin/participants")({
   head: () => ({
@@ -120,11 +121,11 @@ function RosterUploadTab() {
 
   const { data: existing } = useQuery({
     queryKey: ["participants-keys"],
-    queryFn: async () => {
-      const { data, error } = await supabase.from("participants").select("emp_no, email");
-      if (error) throw error;
-      return data ?? [];
-    },
+    queryFn: () =>
+      // 중복 판정 근거라 한 행도 빠지면 안 된다. 전량 조회한다.
+      fetchAll<{ emp_no: string; email: string | null }>((from, to) =>
+        supabase.from("participants").select("emp_no, email").order("id").range(from, to),
+      ),
   });
 
   const headers = useMemo(() => Object.keys(rows[0] ?? {}), [rows]);
@@ -363,16 +364,21 @@ function RosterListTab() {
   const { data, isLoading } = useQuery({
     queryKey: ["participants", companyId],
     queryFn: async () => {
-      let query = supabase
-        .from("participants")
-        .select(
-          "id, emp_no, name, email, org_text, grade, role, account_status, user_id, companies(name)",
-        )
-        .order("emp_no");
-      if (companyId !== "all") query = query.eq("company_id", companyId);
-      const { data, error } = await query;
-      if (error) throw error;
-      return (data ?? []) as Participant[];
+      // 전사 스코프에서는 1000명을 넘길 수 있어 페이지를 이어 받는다.
+      return fetchAll<Participant>(async (from, to) => {
+        let query = supabase
+          .from("participants")
+          .select(
+            "id, emp_no, name, email, org_text, grade, role, account_status, user_id, companies(name)",
+          )
+          // emp_no 는 계열사끼리 겹칠 수 있다. id 로 순서를 확정해야 페이지가 어긋나지 않는다.
+          .order("emp_no")
+          .order("id")
+          .range(from, to);
+        if (companyId !== "all") query = query.eq("company_id", companyId);
+        const { data, error } = await query;
+        return { data: (data ?? []) as Participant[], error };
+      });
     },
   });
 

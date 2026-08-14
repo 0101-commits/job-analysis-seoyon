@@ -5,10 +5,6 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 export const DEFAULT_ROLE_LEVELS = ["담당", "선임", "책임", "리더"];
 export const REMINDER_TARGETS = ["미접속", "미제출"] as const;
 
-// system_settings.role_levels 는 신규 마이그레이션(20260814120000) 컬럼이라
-// 자동 생성 파일인 types.ts 에 아직 반영되어 있지 않다. 재생성 전까지 이 파일에서만 캐스팅한다.
-type SystemSettingsLoose = { password_rule?: string; role_levels?: string[] | null };
-
 // 미리보기는 실제 참여자 대신 더미로만 만든다(생년월일·사번이 화면에 노출되지 않게).
 const PREVIEW_SAMPLES = [
   { id: "sample-1", name: "홍*동", emp_no: "20150908", birth_date: "1990-03-12" },
@@ -33,10 +29,9 @@ export const getSettings = createServerFn({ method: "GET" })
         .select("company_id, deadline, reminder_days, reminder_target, reminder_auto"),
     ]);
 
-    const loose = system as SystemSettingsLoose | null;
     return {
-      passwordRule: loose?.password_rule ?? "{birth6}{empno_last4}",
-      roleLevels: loose?.role_levels?.length ? loose.role_levels : DEFAULT_ROLE_LEVELS,
+      passwordRule: system?.password_rule ?? "{birth6}{empno_last4}",
+      roleLevels: system?.role_levels?.length ? system.role_levels : DEFAULT_ROLE_LEVELS,
       companies: companies ?? [],
       surveys: surveys ?? [],
     };

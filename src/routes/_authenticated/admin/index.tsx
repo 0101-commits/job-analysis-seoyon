@@ -13,6 +13,7 @@ import {
 import { useCompanyScope } from "@/components/CompanyContext";
 import { StatusBadge } from "@/components/StatusBadge";
 import { ACCOUNT_STATUS_LABELS } from "@/lib/auth";
+import { fetchAll } from "@/lib/paginate";
 
 export const Route = createFileRoute("/_authenticated/admin/")({
   head: () => ({
@@ -67,16 +68,21 @@ function DashboardPage() {
   const { data, isLoading } = useQuery({
     queryKey: ["dashboard", companyId],
     queryFn: async () => {
-      let query = supabase
-        .from("participants")
-        .select(
-          "id, name, emp_no, org_text, account_status, role, company_id, invited_at, last_seen_at, companies(name)",
-        )
-        .order("emp_no");
-      if (companyId !== "all") query = query.eq("company_id", companyId);
-      const { data, error } = await query;
-      if (error) throw error;
-      return (data ?? []) as ParticipantRow[];
+      // 전사 스코프에서는 1000명을 넘길 수 있어 페이지를 이어 받는다.
+      return fetchAll<ParticipantRow>(async (from, to) => {
+        let query = supabase
+          .from("participants")
+          .select(
+            "id, name, emp_no, org_text, account_status, role, company_id, invited_at, last_seen_at, companies(name)",
+          )
+          // emp_no 는 계열사끼리 겹칠 수 있다. id 로 순서를 확정해야 페이지가 어긋나지 않는다.
+          .order("emp_no")
+          .order("id")
+          .range(from, to);
+        if (companyId !== "all") query = query.eq("company_id", companyId);
+        const { data, error } = await query;
+        return { data: (data ?? []) as ParticipantRow[], error };
+      });
     },
   });
 
