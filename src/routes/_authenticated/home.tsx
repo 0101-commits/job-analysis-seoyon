@@ -1,6 +1,6 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { CalendarClock, FileText, LogOut } from "lucide-react";
+import { CalendarClock, CheckCircle2, FileText, LogOut } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -43,8 +43,58 @@ function RespondentHome() {
     },
   });
 
+  // RLS 상 본인 응답만 조회되므로 participant 조인 없이 바로 읽는다.
+  const { data: response } = useQuery({
+    queryKey: ["my-response-summary"],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("responses")
+        .select("status, current_step, onboarding_done")
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return data;
+    },
+  });
+
   const deadline = data?.companies?.survey_settings?.deadline ?? null;
   const dday = deadline ? daysUntil(deadline) : null;
+
+  const surveyTarget = response?.onboarding_done ? "/survey" : "/onboarding";
+  const { surveyLabel, surveyMessage, surveyAction } = (() => {
+    switch (response?.status) {
+      case "submitted":
+        return {
+          surveyLabel: "제출 완료 (검토 중)",
+          surveyMessage: "제출해 주셔서 감사합니다. 관리자 검토 결과를 기다리고 있습니다.",
+          surveyAction: null,
+        };
+      case "approved":
+        return {
+          surveyLabel: "승인 완료",
+          surveyMessage: "작성하신 업무조사가 승인되었습니다. 더 이상 수정할 수 없습니다.",
+          surveyAction: null,
+        };
+      case "rejected":
+        return {
+          surveyLabel: "반려됨 — 수정하러 가기",
+          surveyMessage: "관리자 검토 의견이 등록되었습니다. 내용을 보완해 다시 제출해 주세요.",
+          surveyAction: surveyTarget,
+        };
+      case "draft":
+        return {
+          surveyLabel: "이어서 작성하기",
+          surveyMessage: "작성 중인 조사가 있습니다. 이어서 마무리해 주세요.",
+          surveyAction: surveyTarget,
+        };
+      default:
+        return {
+          surveyLabel: "조사 시작하기",
+          surveyMessage: "담당 직무의 과업과 필요 역량을 6단계로 작성합니다. 예상 소요 시간은 약 20분입니다.",
+          surveyAction: "/onboarding",
+        };
+    }
+  })();
 
   async function handleSignOut() {
     await queryClient.cancelQueries();
@@ -112,13 +162,25 @@ function RespondentHome() {
         </section>
 
         <section className="rounded-xl border border-dashed bg-card p-5 text-center sm:p-10">
-          <FileText className="mx-auto size-8 text-muted-foreground" />
+          {response?.status === "submitted" || response?.status === "approved" ? (
+            <CheckCircle2 className="mx-auto size-8 text-success" />
+          ) : (
+            <FileText className="mx-auto size-8 text-muted-foreground" />
+          )}
           <h3 className="mt-3 text-base font-semibold">업무조사 작성</h3>
-          <p className="mt-2 text-sm text-muted-foreground">
-            조사 문항은 다음 단계에서 제공될 예정입니다. 조사가 열리면 이곳에서 바로 작성하실 수 있습니다.
-          </p>
-          <Button className="mt-5" disabled>
-            조사 시작하기 (준비 중)
+          <p className="mt-2 text-sm text-muted-foreground">{surveyMessage}</p>
+          {response && response.status !== "draft" && response.status !== "rejected" ? null : (
+            <p className="mt-3 text-xs text-muted-foreground">
+              진행률 {Math.round(((response?.current_step ?? 1) / 6) * 100)}% (
+              {response?.current_step ?? 1}/6 단계)
+            </p>
+          )}
+          <Button
+            className="mt-5"
+            disabled={surveyAction === null}
+            onClick={() => surveyAction && navigate({ to: surveyAction })}
+          >
+            {surveyLabel}
           </Button>
         </section>
       </main>

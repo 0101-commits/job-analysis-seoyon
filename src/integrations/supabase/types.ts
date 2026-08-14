@@ -71,6 +71,36 @@ export type Database = {
         }
         Relationships: []
       }
+      example_library: {
+        Row: {
+          bad_example: string | null
+          category: string
+          field: string
+          good_example: string
+          id: string
+          note: string | null
+          sort: number
+        }
+        Insert: {
+          bad_example?: string | null
+          category: string
+          field: string
+          good_example: string
+          id?: string
+          note?: string | null
+          sort?: number
+        }
+        Update: {
+          bad_example?: string | null
+          category?: string
+          field?: string
+          good_example?: string
+          id?: string
+          note?: string | null
+          sort?: number
+        }
+        Relationships: []
+      }
       mail_batches: {
         Row: {
           company_id: string | null
@@ -323,6 +353,289 @@ export type Database = {
           },
         ]
       }
+      response_activities: {
+        Row: {
+          id: string
+          name: string
+          seq: number
+          task_id: string
+        }
+        Insert: {
+          id?: string
+          name: string
+          seq?: number
+          task_id: string
+        }
+        Update: {
+          id?: string
+          name?: string
+          seq?: number
+          task_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "response_activities_task_id_fkey"
+            columns: ["task_id"]
+            isOneToOne: false
+            referencedRelation: "response_tasks"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      response_requirements: {
+        Row: {
+          ai_draft: boolean
+          education: string | null
+          id: string
+          languages: Json
+          licenses: Json
+          majors_preferred: string | null
+          majors_required: string | null
+          proficiency: string | null
+          response_id: string
+          trainings: string | null
+        }
+        Insert: {
+          ai_draft?: boolean
+          education?: string | null
+          id?: string
+          languages?: Json
+          licenses?: Json
+          majors_preferred?: string | null
+          majors_required?: string | null
+          proficiency?: string | null
+          response_id: string
+          trainings?: string | null
+        }
+        Update: {
+          ai_draft?: boolean
+          education?: string | null
+          id?: string
+          languages?: Json
+          licenses?: Json
+          majors_preferred?: string | null
+          majors_required?: string | null
+          proficiency?: string | null
+          response_id?: string
+          trainings?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "response_requirements_response_id_fkey"
+            columns: ["response_id"]
+            isOneToOne: true
+            referencedRelation: "responses"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      response_skills: {
+        Row: {
+          ai_draft: boolean
+          description: string | null
+          hard_soft: string | null
+          id: string
+          ksao: string | null
+          name: string
+          related_task_ids: string[]
+          response_id: string
+        }
+        Insert: {
+          ai_draft?: boolean
+          description?: string | null
+          hard_soft?: string | null
+          id?: string
+          ksao?: string | null
+          name: string
+          related_task_ids?: string[]
+          response_id: string
+        }
+        Update: {
+          ai_draft?: boolean
+          description?: string | null
+          hard_soft?: string | null
+          id?: string
+          ksao?: string | null
+          name?: string
+          related_task_ids?: string[]
+          response_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "response_skills_response_id_fkey"
+            columns: ["response_id"]
+            isOneToOne: false
+            referencedRelation: "responses"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      response_tasks: {
+        Row: {
+          authority: string | null
+          id: string
+          importance: number | null
+          improve_note: string | null
+          improve_type: string | null
+          is_key: boolean
+          name: string
+          response_id: string
+          seq: number
+          transferable: boolean | null
+        }
+        Insert: {
+          authority?: string | null
+          id?: string
+          importance?: number | null
+          improve_note?: string | null
+          improve_type?: string | null
+          is_key?: boolean
+          name: string
+          response_id: string
+          seq?: number
+          transferable?: boolean | null
+        }
+        Update: {
+          authority?: string | null
+          id?: string
+          importance?: number | null
+          improve_note?: string | null
+          improve_type?: string | null
+          is_key?: boolean
+          name?: string
+          response_id?: string
+          seq?: number
+          transferable?: boolean | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "response_tasks_response_id_fkey"
+            columns: ["response_id"]
+            isOneToOne: false
+            referencedRelation: "responses"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      responses: {
+        Row: {
+          company_id: string
+          coverage_pct: string | null
+          created_at: string
+          current_step: number
+          definition: string | null
+          id: string
+          job_group: string | null
+          job_name: string | null
+          job_series: string | null
+          mission: string | null
+          missed_note: string | null
+          onboarding_done: boolean
+          pain_note: string | null
+          participant_id: string
+          reviewed_at: string | null
+          reviewed_by: string | null
+          status: string
+          submitted_at: string | null
+          updated_at: string
+        }
+        Insert: {
+          company_id: string
+          coverage_pct?: string | null
+          created_at?: string
+          current_step?: number
+          definition?: string | null
+          id?: string
+          job_group?: string | null
+          job_name?: string | null
+          job_series?: string | null
+          mission?: string | null
+          missed_note?: string | null
+          onboarding_done?: boolean
+          pain_note?: string | null
+          participant_id: string
+          reviewed_at?: string | null
+          reviewed_by?: string | null
+          status?: string
+          submitted_at?: string | null
+          updated_at?: string
+        }
+        Update: {
+          company_id?: string
+          coverage_pct?: string | null
+          created_at?: string
+          current_step?: number
+          definition?: string | null
+          id?: string
+          job_group?: string | null
+          job_name?: string | null
+          job_series?: string | null
+          mission?: string | null
+          missed_note?: string | null
+          onboarding_done?: boolean
+          pain_note?: string | null
+          participant_id?: string
+          reviewed_at?: string | null
+          reviewed_by?: string | null
+          status?: string
+          submitted_at?: string | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "responses_company_id_fkey"
+            columns: ["company_id"]
+            isOneToOne: false
+            referencedRelation: "companies"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "responses_participant_id_fkey"
+            columns: ["participant_id"]
+            isOneToOne: true
+            referencedRelation: "participants"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      review_comments: {
+        Row: {
+          author_id: string
+          body: string
+          created_at: string
+          id: string
+          kind: string
+          response_id: string
+          step: number | null
+        }
+        Insert: {
+          author_id: string
+          body: string
+          created_at?: string
+          id?: string
+          kind?: string
+          response_id: string
+          step?: number | null
+        }
+        Update: {
+          author_id?: string
+          body?: string
+          created_at?: string
+          id?: string
+          kind?: string
+          response_id?: string
+          step?: number | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "review_comments_response_id_fkey"
+            columns: ["response_id"]
+            isOneToOne: false
+            referencedRelation: "responses"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       survey_settings: {
         Row: {
           company_id: string
@@ -366,18 +679,21 @@ export type Database = {
           created_at: string
           id: boolean
           password_rule: string
+          role_levels: string[]
           updated_at: string
         }
         Insert: {
           created_at?: string
           id?: boolean
           password_rule?: string
+          role_levels?: string[]
           updated_at?: string
         }
         Update: {
           created_at?: string
           id?: boolean
           password_rule?: string
+          role_levels?: string[]
           updated_at?: string
         }
         Relationships: []
@@ -415,9 +731,25 @@ export type Database = {
         }
         Returns: boolean
       }
+      job_suggestions: {
+        Args: { _company_id: string }
+        Returns: {
+          job_group: string | null
+          job_series: string | null
+          job_name: string | null
+        }[]
+      }
       link_current_user: {
         Args: never
         Returns: Database["public"]["Enums"]["app_role"]
+      }
+      owns_response: {
+        Args: { _editable?: boolean; _response_id: string }
+        Returns: boolean
+      }
+      owns_task: {
+        Args: { _editable?: boolean; _task_id: string }
+        Returns: boolean
       }
     }
     Enums: {
