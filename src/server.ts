@@ -71,7 +71,7 @@ export default {
     // CF 워커 바인딩(서비스 바인딩 등)을 서버 모듈에서 쓸 수 있게 노출.
     // workers.dev 워커끼리는 일반 fetch 가 오류 1042 로 차단되므로
     // llm.server.ts 가 ELIZAX_PROXY 서비스 바인딩을 이 경로로 찾는다.
-    (globalThis as Record<string, unknown>).__CF_ENV__ = env;
+    (globalThis as Record<string, unknown>)["__CF_ENV__"] = env;
     try {
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
@@ -97,7 +97,7 @@ export default {
     env: unknown,
     ctx: { waitUntil?: (p: Promise<unknown>) => void },
   ) {
-    (globalThis as Record<string, unknown>).__CF_ENV__ = env;
+    (globalThis as Record<string, unknown>)["__CF_ENV__"] = env;
     const job = runScheduledJobs().catch((error) => console.error("스케줄러 실패", error));
     ctx?.waitUntil?.(job);
     await job;
