@@ -17,6 +17,21 @@ type MessagesResponse = {
   error?: { message?: string };
 };
 
+type BoundFetcher = { fetch: (input: string, init?: RequestInit) => Promise<Response> };
+
+/**
+ * CF Workers 배포에서는 같은 계정 workers.dev 워커끼리 일반 fetch 가 오류 1042 로 차단된다.
+ * 서비스 바인딩(ELIZAX_PROXY, deploy.yml 에서 주입)이 있으면 그 fetch 를 쓰고,
+ * 로컬 dev 등 바인딩이 없는 환경은 일반 fetch 로 폴백한다.
+ */
+function proxyFetch(url: string, init: RequestInit): Promise<Response> {
+  const env = (globalThis as Record<string, unknown>)["__CF_ENV__"] as
+    | Record<string, unknown>
+    | undefined;
+  const bound = env?.["ELIZAX_PROXY"] as BoundFetcher | undefined;
+  return typeof bound?.fetch === "function" ? bound.fetch(url, init) : fetch(url, init);
+}
+
 export async function callLLM({
   system,
   user,
@@ -28,7 +43,7 @@ export async function callLLM({
 }): Promise<string> {
   let res: Response;
   try {
-    res = await fetch(`${proxyUrl()}/api/messages`, {
+    res = await proxyFetch(`${proxyUrl()}/api/messages`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
