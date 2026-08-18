@@ -67,11 +67,18 @@ function normalizeBirth(value: string): string | null {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
+/**
+ * @param allowedDomains 허용 이메일 도메인. 빈 배열이면 도메인 검사를 건너뛴다(= 제한 없음).
+ */
 export function validateRoster(
   rows: RosterRaw[],
   companies: { id: string; name: string }[],
   existing: { emp_no: string; email: string | null }[],
+  allowedDomains: string[] = [],
 ): RosterRow[] {
+  const allowed = new Set(
+    allowedDomains.map((d) => d.trim().replace(/^@/, "").toLowerCase()).filter(Boolean),
+  );
   const seenEmp = new Map<string, number>();
   const seenEmail = new Map<string, number>();
   const existingEmp = new Set(existing.map((e) => e.emp_no.trim()));
@@ -95,6 +102,10 @@ export function validateRoster(
     if (!emp_no) errors.push("사번 누락");
     if (!emailRaw) errors.push("이메일 누락");
     else if (!EMAIL_RE.test(emailRaw)) errors.push("이메일 형식 오류");
+    else if (allowed.size > 0) {
+      const domain = emailRaw.slice(emailRaw.lastIndexOf("@") + 1).toLowerCase();
+      if (!allowed.has(domain)) errors.push(`허용되지 않은 이메일 도메인(@${domain})`);
+    }
 
     const birth_date = birthRaw ? normalizeBirth(birthRaw) : null;
     if (birthRaw && !birth_date) errors.push("생년월일 형식 오류 (YYMMDD)");

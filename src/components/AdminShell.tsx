@@ -37,7 +37,7 @@ type NavItem = {
 const NAV: NavItem[] = [
   { to: "/admin", label: "대시보드", icon: LayoutDashboard, exact: true },
   { to: "/admin/participants", label: "참여자 관리", icon: Users },
-  { to: "/admin/review", label: "검토 큐", icon: ClipboardCheck },
+  { to: "/admin/review", label: "응답 검토", icon: ClipboardCheck },
   { to: "/admin/master", label: "마스터 관리", icon: Database },
   { to: "/admin/mail", label: "메일 발송", icon: Mail },
   { to: "/admin/ai", label: "AI 도구", icon: Sparkles },
@@ -152,28 +152,6 @@ export function AdminShell({ children }: { children: ReactNode }) {
         )}
 
         <main className="min-w-0 flex-1 px-4 py-6 sm:px-6 sm:py-8">{children}</main>
-      </div>
-    </div>
-  );
-}
-
-export function AdminPagePlaceholder({
-  title,
-  description,
-}: {
-  title: string;
-  description: string;
-}) {
-  return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-bold sm:text-2xl">{title}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{description}</p>
-      </div>
-      <div className="rounded-xl border border-dashed bg-card p-8 text-center sm:p-12">
-        <p className="text-sm text-muted-foreground">
-          이 화면은 다음 단계에서 구현될 예정입니다.
-        </p>
       </div>
     </div>
   );

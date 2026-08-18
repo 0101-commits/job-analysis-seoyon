@@ -1,10 +1,11 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { CalendarClock, CheckCircle2, FileText, LogOut } from "lucide-react";
+import { AlertTriangle, CalendarClock, CheckCircle2, FileText, LogOut } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/StatusBadge";
+import { getLatestReject } from "@/lib/survey.data";
 import {
   AiSuggestionCards,
   type AiSuggestionItem,
@@ -57,12 +58,19 @@ function RespondentHome() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("responses")
-        .select("status, current_step, onboarding_done")
+        .select("id, status, current_step, onboarding_done")
         .limit(1)
         .maybeSingle();
       if (error) throw error;
       return data;
     },
+  });
+
+  // 반려 사유는 홈에서 바로 읽을 수 있어야 한다 — 조사 화면까지 들어가야 보이면 아무도 못 본다.
+  const { data: reject } = useQuery({
+    queryKey: ["my-latest-reject", response?.id],
+    queryFn: () => getLatestReject(response!.id),
+    enabled: response?.status === "rejected" && !!response?.id,
   });
 
   // RLS 상 본인 응답의 '요청중' 제안만 조회된다.
@@ -111,6 +119,7 @@ function RespondentHome() {
   const dday = deadline ? daysUntil(deadline) : null;
 
   const surveyTarget = response?.onboarding_done ? "/survey" : "/onboarding";
+  const rejectStep = reject?.step ?? null;
   const { surveyLabel, surveyMessage, surveyAction } = (() => {
     switch (response?.status) {
       case "submitted":
@@ -127,7 +136,10 @@ function RespondentHome() {
         };
       case "rejected":
         return {
-          surveyLabel: "반려됨 — 수정하러 가기",
+          surveyLabel:
+            rejectStep && surveyTarget === "/survey"
+              ? `${rejectStep}단계부터 보완하기`
+              : "반려됨 — 수정하러 가기",
           surveyMessage: "관리자 검토 의견이 등록되었습니다. 내용을 보완해 다시 제출해 주세요.",
           surveyAction: surveyTarget,
         };
@@ -230,10 +242,33 @@ function RespondentHome() {
               {response?.current_step ?? 1}/6 단계)
             </p>
           )}
+          {response?.status === "rejected" && reject ? (
+            <div className="mt-5 rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-left">
+              <div className="flex items-center justify-between gap-2">
+                <p className="flex items-center gap-2 text-sm font-semibold text-destructive">
+                  <AlertTriangle className="size-4" />
+                  반려 사유
+                  {rejectStep ? ` · ${rejectStep}단계` : ""}
+                </p>
+                <span className="text-xs text-muted-foreground">
+                  {new Date(reject.created_at).toLocaleString("ko-KR")}
+                </span>
+              </div>
+              <p className="mt-2 whitespace-pre-wrap text-sm text-foreground">{reject.body}</p>
+            </div>
+          ) : null}
+
           <Button
             className="mt-5"
             disabled={surveyAction === null}
-            onClick={() => surveyAction && navigate({ to: surveyAction })}
+            onClick={() => {
+              if (!surveyAction) return;
+              if (surveyAction === "/survey" && rejectStep) {
+                void navigate({ to: "/survey", search: { step: rejectStep } });
+                return;
+              }
+              void navigate({ to: surveyAction });
+            }}
           >
             {surveyLabel}
           </Button>

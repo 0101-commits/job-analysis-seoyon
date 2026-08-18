@@ -31,9 +31,11 @@ import {
   aiProxyStatus,
   applyMerge,
   applySuggestion,
+  confirmAiDrafts,
   detectPoorResponses,
   draftMissingFields,
   listSuggestions,
+  pingProxy,
   requestReview,
   scanTypos,
   suggestMerges,
@@ -123,29 +125,53 @@ function AiPage() {
     queryFn: () => aiProxyStatus(),
   });
 
+  const pingMutation = useMutation({
+    mutationFn: () => pingProxy(),
+    onSuccess: () => {
+      setProxyError(null);
+      toast.success("AI 서버에 정상 연결됩니다.");
+    },
+    onError: (err) => {
+      setProxyError(errorMessage(err));
+      toast.error("AI 서버에 연결할 수 없습니다. 조사 진행에는 영향이 없습니다.");
+    },
+  });
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-xl font-bold sm:text-2xl">AI 도구</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          업무기술서 오탈자 검수, 부실 응답 탐지, 결측 필드 초안, 표기 병합을 지원합니다.
+          업무기술서 오탈자 검수, 부실 응답 탐지, 빈 항목 초안, 표기 병합을 지원합니다.
         </p>
       </div>
 
-      {(proxy?.configured === false || proxyError) && (
-        <div className="flex items-start gap-3 rounded-xl border border-warning/40 bg-warning/10 p-4">
-          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" />
-          <div className="text-sm">
-            <p className="font-semibold text-warning">
-              {proxyError ? "AI 호출 실패" : "ELIZAX_PROXY_URL 미설정"}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-4">
+        <div className="flex min-w-0 items-start gap-3 text-sm">
+          {proxyError && <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" />}
+          <div className="min-w-0">
+            <p className="font-semibold">
+              {proxyError
+                ? "AI 서버: 연결 실패"
+                : proxy?.configured
+                  ? "AI 서버: 연결 설정 완료"
+                  : "AI 서버: 기본 연결 사용 중(운영 설정 권장)"}
             </p>
             <p className="mt-1 text-muted-foreground">
-              {proxyError ??
-                `환경변수가 없어 기본 프록시(${proxy?.url ?? ""})로 호출합니다. 운영 환경에서는 ELIZAX_PROXY_URL 을 지정하세요.`}
+              {proxyError ?? "AI 기능을 쓰지 않아도 조사 진행에는 영향이 없습니다."}
             </p>
           </div>
         </div>
-      )}
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={pingMutation.isPending}
+          onClick={() => pingMutation.mutate()}
+        >
+          {pingMutation.isPending && <Loader2 className="size-4 animate-spin" />}
+          연결 점검
+        </Button>
+      </div>
 
       <Tabs defaultValue="typos">
         <TabsList className="flex w-full flex-wrap justify-start">
@@ -283,12 +309,12 @@ function TypoTab({
                 ) : (
                   <Check className="size-4" />
                 )}
-                직접 반영 (A)
+                관리자가 바로 수정
               </Button>
             </div>
           </div>
           <p className="text-xs text-muted-foreground">
-            오타 검수는 관리자가 직접 반영하는 경로 A 전용입니다. 응답자 검토가 필요하면 자동 채움
+            오타 검수는 관리자가 바로 고치는 기능입니다. 작성자에게 확인을 받아야 하면 자동 채움
             탭을 사용하세요.
           </p>
 
@@ -318,7 +344,7 @@ function TypoTab({
                         disabled={busy}
                         onClick={() => applyMutation.mutate([s.id])}
                       >
-                        직접 반영
+                        바로 수정
                       </Button>
                     </div>
                   </div>
@@ -463,7 +489,7 @@ function FillTab({
     onSuccess: (res) => {
       onProxyError(null);
       toast.success(
-        res.inserted > 0 ? `초안 ${res.inserted}건을 만들었습니다.` : "채울 결측 필드가 없습니다.",
+        res.inserted > 0 ? `초안 ${res.inserted}건을 만들었습니다.` : "채울 빈 항목이 없습니다.",
       );
       void invalidate();
     },
@@ -477,8 +503,41 @@ function FillTab({
   const reviewMutation = useMutation({
     mutationFn: (ids: string[]) => requestReview({ data: { suggestionIds: ids } }),
     onSuccess: (res) => {
-      toast.success(`${res.requested}건을 응답자 검토로 넘겼습니다.`);
+      toast.success(`${res.requested}건을 작성자 확인으로 넘겼습니다.`);
       void invalidate();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  // 응답에 남은 'AI 초안' 표시 건수. 이 표시가 남아 있으면 응답을 승인할 수 없다.
+  const draftCountKey = ["ai-draft-marks", responseId];
+  const draftCountQuery = useQuery({
+    queryKey: draftCountKey,
+    queryFn: async () => {
+      const [skills, reqs] = await Promise.all([
+        supabase
+          .from("response_skills")
+          .select("id", { count: "exact", head: true })
+          .eq("response_id", responseId)
+          .eq("ai_draft", true),
+        supabase
+          .from("response_requirements")
+          .select("response_id", { count: "exact", head: true })
+          .eq("response_id", responseId)
+          .eq("ai_draft", true),
+      ]);
+      return (skills.count ?? 0) + (reqs.count ?? 0);
+    },
+    enabled: Boolean(responseId),
+  });
+  const draftMarks = draftCountQuery.data ?? 0;
+
+  const confirmMutation = useMutation({
+    mutationFn: () => confirmAiDrafts({ data: { responseId } }),
+    onSuccess: (res) => {
+      toast.success(`AI 초안 표시 ${res.confirmed}건을 확정했습니다.`);
+      void invalidate();
+      void queryClient.invalidateQueries({ queryKey: draftCountKey });
     },
     onError: (err) => toast.error(errorMessage(err)),
   });
@@ -508,7 +567,33 @@ function FillTab({
             )}
             초안 생성
           </Button>
+          <Button
+            variant="outline"
+            disabled={!responseId || draftMarks === 0 || confirmMutation.isPending}
+            onClick={() => {
+              if (
+                !window.confirm(
+                  `AI 초안 표시 ${draftMarks}건을 확정합니다. 확정해야 이 응답을 승인할 수 있습니다.`,
+                )
+              )
+                return;
+              confirmMutation.mutate();
+            }}
+          >
+            {confirmMutation.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Check className="size-4" />
+            )}
+            AI 초안 일괄 확정{draftMarks > 0 ? ` ${draftMarks}건` : ""}
+          </Button>
         </div>
+        {responseId && draftMarks > 0 && (
+          <p className="text-xs text-muted-foreground">
+            이 응답에 AI 초안 표시가 {draftMarks}건 남아 있어 승인할 수 없습니다. 내용을 확인한 뒤
+            확정하세요.
+          </p>
+        )}
       </div>
 
       {drafts.length > 0 && (
@@ -525,7 +610,7 @@ function FillTab({
               ) : (
                 <Send className="size-4" />
               )}
-              전체 검토 요청 (B)
+              작성자에게 확인 요청
             </Button>
           </div>
           <ul className="space-y-2">
@@ -548,7 +633,7 @@ function FillTab({
                   disabled={reviewMutation.isPending}
                   onClick={() => reviewMutation.mutate([d.id])}
                 >
-                  이 건만 검토 요청
+                  이 건만 확인 요청
                 </Button>
               </li>
             ))}

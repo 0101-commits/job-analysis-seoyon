@@ -1,11 +1,57 @@
 import { createServerFn } from "@tanstack/react-start";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import type { Database } from "@/integrations/supabase/types";
 
 const filtersSchema = z.object({
   companyId: z.string().uuid().nullable().optional(),
   statuses: z.array(z.string()).optional(),
 });
+
+/** 미리보기와 테스트 발송이 함께 쓰는 표본 치환 변수. 초기 비밀번호는 노출하지 않고 마스킹한다. */
+async function buildSampleVars(
+  admin: SupabaseClient<Database>,
+  companyId?: string | null,
+  origin?: string,
+) {
+  const { appUrl } = await import("@/lib/mailer.server");
+  const { buildMailVars } = await import("@/lib/mail-vars");
+
+  let query = admin
+    .from("participants")
+    .select("name, email, org_text, company_id, companies(name)")
+    .eq("role", "respondent")
+    .not("email", "is", null)
+    .order("emp_no")
+    .limit(1);
+  if (companyId) query = query.eq("company_id", companyId);
+  const { data: rows } = await query;
+  const sample = rows?.[0] ?? null;
+
+  let deadline: string | null = null;
+  if (sample) {
+    const { data: setting } = await admin
+      .from("survey_settings")
+      .select("deadline")
+      .eq("company_id", sample.company_id)
+      .maybeSingle();
+    deadline = setting?.deadline ?? null;
+  }
+
+  return {
+    sampleName: (sample?.name as string | undefined) ?? null,
+    vars: buildMailVars({
+      name: sample?.name ?? "홍길동",
+      company: sample?.companies?.name ?? "서연",
+      org: sample?.org_text ?? "경영지원팀",
+      email: sample?.email ?? "hong@example.com",
+      initialPassword: "●●●●",
+      deadline,
+      link: appUrl(origin ?? null),
+    }),
+  };
+}
 
 export const listTemplates = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -102,45 +148,92 @@ export const previewTemplate = createServerFn({ method: "POST" })
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { appUrl } = await import("@/lib/mailer.server");
-    const { buildMailVars, renderMailText } = await import("@/lib/mail-vars");
+    const { renderMailHtml } = await import("@/lib/mailer.server");
+    const { renderMailText } = await import("@/lib/mail-vars");
 
-    let query = supabaseAdmin
-      .from("participants")
-      .select("name, email, org_text, company_id, companies(name)")
-      .eq("role", "respondent")
-      .not("email", "is", null)
-      .order("emp_no")
-      .limit(1);
-    if (data.companyId) query = query.eq("company_id", data.companyId);
-    const { data: rows } = await query;
-    const sample = rows?.[0] ?? null;
-
-    let deadline: string | null = null;
-    if (sample) {
-      const { data: setting } = await supabaseAdmin
-        .from("survey_settings")
-        .select("deadline")
-        .eq("company_id", sample.company_id)
-        .maybeSingle();
-      deadline = setting?.deadline ?? null;
-    }
-
-    const vars = buildMailVars({
-      name: sample?.name ?? "홍길동",
-      company: sample?.companies?.name ?? "서연",
-      org: sample?.org_text ?? "경영지원팀",
-      email: sample?.email ?? "hong@example.com",
-      initialPassword: "●●●●",
-      deadline,
-      link: appUrl(data.origin ?? null),
-    });
+    const { sampleName, vars } = await buildSampleVars(supabaseAdmin, data.companyId, data.origin);
+    const body = renderMailText(data.body, vars);
 
     return {
-      sampleName: sample?.name ?? null,
+      sampleName,
       subject: renderMailText(data.subject, vars),
-      body: renderMailText(data.body, vars),
+      body,
+      html: renderMailHtml(body, vars["접속링크"]),
     };
+  });
+
+/** 로그인한 관리자 본인에게만 1건 발송한다(수신자 지정 불가 — 오발송 방지). */
+export const sendTestMail = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        templateId: z.string().uuid(),
+        companyId: z.string().uuid().nullable().optional(),
+        origin: z.string().url().optional(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { isSimulationMode, sendMail } = await import("@/lib/mailer.server");
+    const { renderMailText } = await import("@/lib/mail-vars");
+
+    const { data: userData } = await context.supabase.auth.getUser();
+    const to = userData?.user?.email ?? null;
+    if (!to) throw new Error("로그인 계정에 이메일이 없어 테스트 발송을 할 수 없습니다.");
+
+    const { data: template } = await supabaseAdmin
+      .from("mail_templates")
+      .select("id, subject, body")
+      .eq("id", data.templateId)
+      .maybeSingle();
+    if (!template) throw new Error("메일 템플릿을 찾을 수 없습니다.");
+
+    const { vars } = await buildSampleVars(supabaseAdmin, data.companyId, data.origin);
+    const subject = `[테스트] ${renderMailText(template.subject, vars)}`;
+    const body = renderMailText(template.body, vars);
+
+    const simulated = isSimulationMode();
+    let status: "성공" | "실패" | "시뮬레이션" = "시뮬레이션";
+    let errorMessage: string | null = null;
+    let providerId: string | null = null;
+    if (!simulated) {
+      try {
+        providerId = await sendMail(to, subject, body, vars["접속링크"]);
+        status = "성공";
+      } catch (err) {
+        status = "실패";
+        errorMessage = err instanceof Error ? err.message : "알 수 없는 오류";
+      }
+    }
+
+    // 테스트 발송은 배치에 속하지 않으므로 batch_id 는 비운다(nullable 컬럼).
+    await supabaseAdmin.from("mail_logs").insert({
+      batch_id: null,
+      participant_id: null,
+      template_id: template.id,
+      to_email: to,
+      to_name: "테스트 발송",
+      subject,
+      body,
+      status,
+      error_message: errorMessage,
+      provider_id: providerId,
+    });
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      actor_email: to,
+      action: "테스트 메일 발송",
+      target_type: "mail_template",
+      target_id: template.id,
+      detail: { to, status },
+    });
+
+    return { to, status, simulated, error: errorMessage };
   });
 
 export const countRecipients = createServerFn({ method: "POST" })

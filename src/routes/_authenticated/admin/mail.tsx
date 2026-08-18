@@ -2,7 +2,16 @@ import { useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { AlertTriangle, ChevronDown, Plus, RotateCw, Send, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ImagePlus,
+  MailCheck,
+  Plus,
+  RotateCw,
+  Send,
+  Trash2,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -19,7 +28,14 @@ import {
 import { StatusBadge } from "@/components/StatusBadge";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { ACCOUNT_STATUS_LABELS } from "@/lib/auth";
-import { MAIL_VARIABLES } from "@/lib/mail-vars";
+import { supabase } from "@/integrations/supabase/client";
+import {
+  DEFAULT_IMAGE_WIDTH,
+  MAIL_ASSET_BUCKET,
+  MAIL_VARIABLES,
+  MAX_IMAGE_WIDTH,
+  imageToken,
+} from "@/lib/mail-vars";
 import {
   countRecipients,
   deleteTemplate,
@@ -27,6 +43,7 @@ import {
   listLogs,
   listTemplates,
   previewTemplate,
+  sendTestMail,
   upsertTemplate,
 } from "@/lib/mail.functions";
 import {
@@ -81,9 +98,10 @@ function MailPage() {
         <div className="flex items-start gap-3 rounded-xl border border-warning/40 bg-warning/10 p-4">
           <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" />
           <div className="text-sm">
-            <p className="font-semibold text-warning">시뮬레이션 모드</p>
+            <p className="font-semibold text-warning">테스트 모드(실제 발송 안 함)</p>
             <p className="mt-1 text-muted-foreground">
-              RESEND_API_KEY 미설정 — 실발송 없이 로그만 기록됩니다.
+              메일 발송 키가 등록되지 않아 테스트 모드로 동작합니다. 실제 메일은 나가지 않고 발송
+              기록만 남습니다.
             </p>
           </div>
         </div>
@@ -130,11 +148,17 @@ function TemplatesTab() {
   const queryClient = useQueryClient();
   const { companyId } = useCompanyScope();
   const [editor, setEditor] = useState<EditorState | null>(null);
-  const [preview, setPreview] = useState<{ sampleName: string | null; subject: string; body: string } | null>(
-    null,
-  );
+  const [preview, setPreview] = useState<{
+    sampleName: string | null;
+    subject: string;
+    body: string;
+    html: string;
+  } | null>(null);
+  const [imageWidth, setImageWidth] = useState(DEFAULT_IMAGE_WIDTH);
+  const [uploading, setUploading] = useState(false);
   const subjectRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   const focusedRef = useRef<"subject" | "body">("body");
 
   const { data: templates, isLoading } = useQuery({
@@ -176,10 +200,10 @@ function TemplatesTab() {
     onError: (err) => toast.error(`미리보기에 실패했습니다: ${errorMessage(err)}`),
   });
 
-  /** 마지막으로 포커스된 입력의 커서 위치에 변수 토큰을 끼워 넣는다. */
-  function insertToken(token: string) {
+  /** 마지막으로 포커스된 입력의 커서 위치에 토큰을 끼워 넣는다(이미지는 본문에만). */
+  function insertToken(token: string, target?: "subject" | "body") {
     if (!editor) return;
-    const field = focusedRef.current;
+    const field = target ?? focusedRef.current;
     const el = field === "subject" ? subjectRef.current : bodyRef.current;
     const value = field === "subject" ? editor.subject : editor.body;
     const start = el?.selectionStart ?? value.length;
@@ -192,12 +216,34 @@ function TemplatesTab() {
     });
   }
 
+  /** 이미지는 공개 버킷에 올리고 본문에는 경로 토큰만 남긴다(발송 시 <img> 로 변환). */
+  async function uploadImage(file: File) {
+    if (!["image/png", "image/jpeg", "image/gif"].includes(file.type)) {
+      toast.error("PNG · JPG · GIF 이미지만 삽입할 수 있습니다.");
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast.error("이미지는 2MB 이하만 삽입할 수 있습니다.");
+      return;
+    }
+    setUploading(true);
+    const path = `${Date.now()}_${file.name.replace(/[^A-Za-z0-9.]+/g, "_").slice(-60)}`;
+    const { error } = await supabase.storage
+      .from(MAIL_ASSET_BUCKET)
+      .upload(path, file, { contentType: file.type });
+    setUploading(false);
+    if (error) {
+      toast.error(`이미지 업로드에 실패했습니다: ${error.message}`);
+      return;
+    }
+    insertToken(imageToken(path, imageWidth), "body");
+    toast.success("본문 커서 위치에 이미지를 삽입했습니다.");
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
-        <p className="text-sm text-muted-foreground">
-          총 {templates?.length ?? 0}개의 템플릿
-        </p>
+        <p className="text-sm text-muted-foreground">총 {templates?.length ?? 0}개의 템플릿</p>
         <Button
           size="sm"
           onClick={() => {
@@ -262,9 +308,7 @@ function TemplatesTab() {
 
       {editor && (
         <div className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-          <h2 className="text-base font-semibold">
-            {editor.id ? "템플릿 편집" : "새 템플릿"}
-          </h2>
+          <h2 className="text-base font-semibold">{editor.id ? "템플릿 편집" : "새 템플릿"}</h2>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
@@ -295,7 +339,7 @@ function TemplatesTab() {
           </div>
 
           <div className="space-y-2">
-            <Label>변수 팔레트</Label>
+            <Label>자동 입력 항목</Label>
             <div className="flex flex-wrap gap-2">
               {MAIL_VARIABLES.map((v) => (
                 <button
@@ -311,6 +355,47 @@ function TemplatesTab() {
             </div>
             <p className="text-xs text-muted-foreground">
               클릭하면 마지막으로 편집하던 입력창의 커서 위치에 삽입됩니다.
+            </p>
+          </div>
+
+          <div className="space-y-2 rounded-lg border bg-background p-3">
+            <Label htmlFor="tpl-image-width">이미지 삽입</Label>
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                id="tpl-image-width"
+                type="number"
+                min={80}
+                max={MAX_IMAGE_WIDTH}
+                value={imageWidth}
+                onChange={(e) => setImageWidth(Number(e.target.value))}
+                className="w-28"
+              />
+              <span className="text-sm text-muted-foreground">px 폭으로</span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => fileRef.current?.click()}
+                disabled={uploading}
+              >
+                <ImagePlus className="size-4" />
+                {uploading ? "올리는 중..." : "이미지 삽입"}
+              </Button>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/png,image/jpeg,image/gif"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (file) void uploadImage(file);
+                }}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              PNG · JPG · GIF, 2MB 이하. 최대 폭 {MAX_IMAGE_WIDTH}px. 본문 커서 위치에 이미지 자리
+              표시가 삽입되고 발송 시 그림으로 바뀝니다.
             </p>
           </div>
 
@@ -372,8 +457,15 @@ function TemplatesTab() {
                   : "참여자 데이터가 없어 예시 값으로 치환했습니다."}
               </p>
               <p className="mt-3 font-semibold">{preview.subject}</p>
-              <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">
-                {preview.body}
+              <iframe
+                title="메일 미리보기"
+                sandbox=""
+                srcDoc={preview.html}
+                className="mt-2 h-96 w-full rounded-md border bg-white"
+              />
+              <p className="mt-2 text-xs text-muted-foreground">
+                실제 메일에서 보이는 모습입니다. 메일 프로그램에 따라 여백·글꼴은 조금 다를 수
+                있습니다.
               </p>
             </div>
           )}
@@ -419,7 +511,7 @@ function SendTab() {
       else
         toast.success(
           `발송 완료 — 성공 ${result.sent ?? 0}건 / 실패 ${result.failed ?? 0}건${
-            result.simulated ? " (시뮬레이션)" : ""
+            result.simulated ? " (테스트 모드 — 실제 발송 안 함)" : ""
           }`,
         );
       void queryClient.invalidateQueries({ queryKey: ["mail-batches"] });
@@ -427,9 +519,25 @@ function SendTab() {
     onError: (err) => toast.error(`발송에 실패했습니다: ${errorMessage(err)}`),
   });
 
-  const reminderMutation = useMutation({
+  const testMutation = useMutation({
     mutationFn: () =>
-      triggerReminders({ data: { companyId: filterCompanyId, origin: origin() } }),
+      sendTestMail({
+        data: { templateId, companyId: filterCompanyId, origin: origin() },
+      }),
+    onSuccess: (result) => {
+      if (result.simulated) {
+        toast.info(`테스트 모드라 실발송되지 않았습니다. (수신 예정: ${result.to})`);
+      } else if (result.status === "실패") {
+        toast.error(`테스트 발송에 실패했습니다: ${result.error ?? "알 수 없는 오류"}`);
+      } else {
+        toast.success(`${result.to} 으로 테스트 메일을 보냈습니다.`);
+      }
+    },
+    onError: (err) => toast.error(`테스트 발송에 실패했습니다: ${errorMessage(err)}`),
+  });
+
+  const reminderMutation = useMutation({
+    mutationFn: () => triggerReminders({ data: { companyId: filterCompanyId, origin: origin() } }),
     onSuccess: (result) => {
       const sent = result.results.reduce((acc, r) => acc + r.sent, 0);
       toast.success(`리마인더 ${sent}건을 처리했습니다.`);
@@ -439,9 +547,7 @@ function SendTab() {
   });
 
   function toggleStatus(status: string, checked: boolean) {
-    setStatuses((prev) =>
-      checked ? [...prev, status] : prev.filter((s) => s !== status),
-    );
+    setStatuses((prev) => (checked ? [...prev, status] : prev.filter((s) => s !== status)));
   }
 
   return (
@@ -464,7 +570,7 @@ function SendTab() {
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="send-name">배치 이름</Label>
+          <Label htmlFor="send-name">발송 이름</Label>
           <Input
             id="send-name"
             value={name}
@@ -511,23 +617,31 @@ function SendTab() {
             value={scheduledAt}
             onChange={(e) => setScheduledAt(e.target.value)}
           />
-          <p className="text-xs text-muted-foreground">
-            비워두면 즉시 발송됩니다.
-          </p>
+          <p className="text-xs text-muted-foreground">비워두면 즉시 발송됩니다.</p>
         </div>
 
-        <Button
-          className="h-11 w-full sm:w-auto"
-          onClick={() => sendMutation.mutate()}
-          disabled={!templateId || sendMutation.isPending}
-        >
-          <Send className="size-4" />
-          {sendMutation.isPending
-            ? "처리 중..."
-            : scheduledAt
-              ? "예약 등록"
-              : "즉시 발송"}
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            className="h-11 w-full sm:w-auto"
+            onClick={() => sendMutation.mutate()}
+            disabled={!templateId || sendMutation.isPending}
+          >
+            <Send className="size-4" />
+            {sendMutation.isPending ? "처리 중..." : scheduledAt ? "예약 등록" : "즉시 발송"}
+          </Button>
+          <Button
+            variant="outline"
+            className="h-11 w-full sm:w-auto"
+            onClick={() => testMutation.mutate()}
+            disabled={!templateId || testMutation.isPending}
+          >
+            <MailCheck className="size-4" />
+            {testMutation.isPending ? "보내는 중..." : "나에게 테스트 발송"}
+          </Button>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          테스트 발송은 대상자와 무관하게 로그인한 관리자 본인에게 1건만 보냅니다.
+        </p>
       </div>
 
       <div className="rounded-xl border bg-card p-4 shadow-sm sm:p-6">
@@ -583,7 +697,7 @@ function HistoryTab() {
                 {b.name}
                 {b.simulated && (
                   <span className="ml-2 rounded-full bg-warning/15 px-2 py-0.5 text-xs font-normal text-warning">
-                    시뮬레이션
+                    테스트 모드
                   </span>
                 )}
               </p>
@@ -664,9 +778,7 @@ function BatchLogs({ batchId }: { batchId: string }) {
           <div className="min-w-0">
             <p className="text-sm font-medium">
               {log.to_name ?? "이름 없음"}
-              <span className="ml-2 text-xs font-normal text-muted-foreground">
-                {log.to_email}
-              </span>
+              <span className="ml-2 text-xs font-normal text-muted-foreground">{log.to_email}</span>
             </p>
             <p className="mt-0.5 text-xs text-muted-foreground">
               {log.sent_at.slice(0, 16).replace("T", " ")}

@@ -189,6 +189,50 @@ export type Database = {
         }
         Relationships: []
       }
+      info_change_requests: {
+        Row: {
+          admin_note: string | null
+          created_at: string
+          fields: Json
+          handled_at: string | null
+          handled_by: string | null
+          id: string
+          note: string | null
+          participant_id: string
+          status: string
+        }
+        Insert: {
+          admin_note?: string | null
+          created_at?: string
+          fields?: Json
+          handled_at?: string | null
+          handled_by?: string | null
+          id?: string
+          note?: string | null
+          participant_id: string
+          status?: string
+        }
+        Update: {
+          admin_note?: string | null
+          created_at?: string
+          fields?: Json
+          handled_at?: string | null
+          handled_by?: string | null
+          id?: string
+          note?: string | null
+          participant_id?: string
+          status?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "info_change_requests_participant_id_fkey"
+            columns: ["participant_id"]
+            isOneToOne: false
+            referencedRelation: "participants"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       job_catalog: {
         Row: {
           company_ids: string[]
@@ -433,6 +477,7 @@ export type Database = {
       participants: {
         Row: {
           account_status: Database["public"]["Enums"]["account_status"]
+          archived_at: string | null
           birth_date: string | null
           company_id: string
           created_at: string
@@ -449,13 +494,16 @@ export type Database = {
           must_change_password: boolean
           name: string
           org_text: string | null
+          org_unit_id: string | null
           role: Database["public"]["Enums"]["app_role"]
           role_level: string | null
+          tags: string[]
           updated_at: string
           user_id: string | null
         }
         Insert: {
           account_status?: Database["public"]["Enums"]["account_status"]
+          archived_at?: string | null
           birth_date?: string | null
           company_id: string
           created_at?: string
@@ -472,13 +520,16 @@ export type Database = {
           must_change_password?: boolean
           name: string
           org_text?: string | null
+          org_unit_id?: string | null
           role?: Database["public"]["Enums"]["app_role"]
           role_level?: string | null
+          tags?: string[]
           updated_at?: string
           user_id?: string | null
         }
         Update: {
           account_status?: Database["public"]["Enums"]["account_status"]
+          archived_at?: string | null
           birth_date?: string | null
           company_id?: string
           created_at?: string
@@ -495,8 +546,10 @@ export type Database = {
           must_change_password?: boolean
           name?: string
           org_text?: string | null
+          org_unit_id?: string | null
           role?: Database["public"]["Enums"]["app_role"]
           role_level?: string | null
+          tags?: string[]
           updated_at?: string
           user_id?: string | null
         }
@@ -592,6 +645,7 @@ export type Database = {
           description: string | null
           hard_soft: string | null
           id: string
+          is_general: boolean
           ksao: string | null
           name: string
           related_task_ids: string[]
@@ -602,6 +656,7 @@ export type Database = {
           description?: string | null
           hard_soft?: string | null
           id?: string
+          is_general?: boolean
           ksao?: string | null
           name: string
           related_task_ids?: string[]
@@ -612,6 +667,7 @@ export type Database = {
           description?: string | null
           hard_soft?: string | null
           id?: string
+          is_general?: boolean
           ksao?: string | null
           name?: string
           related_task_ids?: string[]
@@ -916,6 +972,14 @@ export type Database = {
       owns_task: {
         Args: { _editable?: boolean; _task_id: string }
         Returns: boolean
+      }
+      save_skills_tx: {
+        Args: { _expected?: string | null; _response_id: string; _skills: Json }
+        Returns: string
+      }
+      save_tasks_tx: {
+        Args: { _expected?: string | null; _response_id: string; _tasks: Json }
+        Returns: string
       }
       touch_my_last_seen: {
         Args: never

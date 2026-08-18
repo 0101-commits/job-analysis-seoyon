@@ -2,10 +2,10 @@
 import { supabase } from "@/integrations/supabase/client";
 import type { Database, Json } from "@/integrations/supabase/types";
 import { CUSTOM } from "@/components/survey/RequirementsForm";
+import type { ExampleLibRow } from "@/components/survey/TaskGrid";
 import type {
   Authority,
   Education,
-  ExampleRow,
   HardSoft,
   ImproveType,
   Ksao,
@@ -132,6 +132,7 @@ export async function loadFull(responseId: string): Promise<FullResponse> {
     hardSoft: row.hard_soft as HardSoft | null,
     description: row.description ?? "",
     relatedTaskIds: row.related_task_ids ?? [],
+    isGeneral: row.is_general,
   }));
 
   const r = reqRes.data;
@@ -150,94 +151,95 @@ export async function loadFull(responseId: string): Promise<FullResponse> {
   return { tasks, skills, requirements };
 }
 
-/** responses 본문 필드 부분 저장 (단계 이동 시 current_step 도 함께 갱신) */
-export async function saveResponseFields(
-  responseId: string,
-  patch: Database["public"]["Tables"]["responses"]["Update"],
-) {
-  const { error } = await supabase.from("responses").update(patch).eq("id", responseId);
-  if (error) throw error;
-}
-
-/** id 목록에 없는 행을 지운다. 목록이 비면 전체 삭제. */
-function notIn(ids: string[]) {
-  return `(${ids.join(",")})`;
-}
-
-export async function saveTasks(responseId: string, tasks: TaskItem[]) {
-  const taskIds = tasks.map((t) => t.id);
-
-  // 1. 삭제분 정리 (활동은 FK cascade 로 함께 사라진다)
-  const deleteTasks = supabase.from("response_tasks").delete().eq("response_id", responseId);
-  const { error: delError } = await (taskIds.length
-    ? deleteTasks.not("id", "in", notIn(taskIds))
-    : deleteTasks);
-  if (delError) throw delError;
-
-  if (!tasks.length) return;
-
-  // 2. 과업 upsert (seq = 화면 순서)
-  const { error: taskError } = await supabase.from("response_tasks").upsert(
-    tasks.map((t, i) => ({
-      id: t.id,
-      response_id: responseId,
-      seq: i,
-      name: t.name,
-      importance: t.importance,
-      authority: t.authority,
-      transferable: t.transferable,
-      is_key: t.isKey,
-      improve_type: t.improveType,
-      improve_note: t.improveNote || null,
-    })),
-  );
-  if (taskError) throw taskError;
-
-  // 3. 활동 upsert + 삭제분 정리
-  const activityIds = tasks.flatMap((t) => t.activities.map((a) => a.id));
-  const deleteActivities = supabase.from("response_activities").delete().in("task_id", taskIds);
-  const { error: actDelError } = await (activityIds.length
-    ? deleteActivities.not("id", "in", notIn(activityIds))
-    : deleteActivities);
-  if (actDelError) throw actDelError;
-
-  const activityRows = tasks.flatMap((t) =>
-    t.activities.map((a, i) => ({ id: a.id, task_id: t.id, seq: i, name: a.name })),
-  );
-  if (activityRows.length) {
-    const { error: actError } = await supabase.from("response_activities").upsert(activityRows);
-    if (actError) throw actError;
+/**
+ * 낙관적 락 충돌 — 마지막으로 읽은 뒤 관리자가 같은 응답을 고쳤다.
+ * 저장 RPC 는 P0002 로, responses 조건부 UPDATE 는 0행 갱신으로 나타난다.
+ */
+export class ConflictError extends Error {
+  constructor() {
+    super("관리자가 이 응답을 수정했습니다.");
+    this.name = "ConflictError";
   }
 }
 
-export async function saveSkills(responseId: string, skills: SkillItem[]) {
-  const ids = skills.map((s) => s.id);
-  const del = supabase.from("response_skills").delete().eq("response_id", responseId);
-  const { error: delError } = await (ids.length ? del.not("id", "in", notIn(ids)) : del);
-  if (delError) throw delError;
+export function isConflict(err: unknown): boolean {
+  if (err instanceof ConflictError) return true;
+  return typeof err === "object" && err !== null && (err as { code?: string }).code === "P0002";
+}
 
-  if (!skills.length) return;
-
-  // 삭제된 과업을 가리키는 고아 참조 제거 — 저장 시점의 실제 과업 id 만 남긴다.
-  const { data: taskRows, error: taskError } = await supabase
-    .from("response_tasks")
-    .select("id")
-    .eq("response_id", responseId);
-  if (taskError) throw taskError;
-  const liveTaskIds = new Set((taskRows ?? []).map((t) => t.id));
-
-  const { error } = await supabase.from("response_skills").upsert(
-    skills.map((s) => ({
-      id: s.id,
-      response_id: responseId,
-      name: s.name,
-      ksao: s.ksao,
-      hard_soft: s.hardSoft,
-      description: s.description || null,
-      related_task_ids: s.relatedTaskIds.filter((id) => liveTaskIds.has(id)),
-    })),
-  );
+/**
+ * responses 본문 필드 부분 저장 (단계 이동 시 current_step 도 함께 갱신).
+ * expected 를 주면 그 시점 이후 바뀌지 않았을 때만 저장한다. 반환값 = 새 updated_at.
+ */
+export async function saveResponseFields(
+  responseId: string,
+  patch: Database["public"]["Tables"]["responses"]["Update"],
+  expected?: string | null,
+): Promise<string> {
+  const update = supabase.from("responses").update(patch).eq("id", responseId);
+  const { data, error } = await (expected ? update.eq("updated_at", expected) : update)
+    .select("updated_at")
+    .maybeSingle();
   if (error) throw error;
+  if (!data) throw new ConflictError();
+  return data.updated_at;
+}
+
+/**
+ * 과업·활동 전체 교체. delete→insert 를 서버 트랜잭션(save_tasks_tx)에서 한 번에 처리하므로
+ * 중간에 끊겨도 반쯤 지워진 상태가 남지 않는다. 반환값 = 새 updated_at.
+ * 활동 id 는 서버가 새로 발급한다(화면 순서만 seq 로 보존).
+ */
+export async function saveTasks(
+  responseId: string,
+  tasks: TaskItem[],
+  expected?: string | null,
+): Promise<string> {
+  const payload = tasks.map((t, i) => ({
+    id: t.id,
+    seq: i,
+    name: t.name,
+    importance: t.importance,
+    authority: t.authority,
+    transferable: t.transferable,
+    is_key: t.isKey,
+    improve_type: t.improveType,
+    improve_note: t.improveNote || null,
+    activities: t.activities.map((a, ai) => ({ seq: ai, name: a.name })),
+  }));
+
+  const { data, error } = await supabase.rpc("save_tasks_tx", {
+    _response_id: responseId,
+    _tasks: payload as unknown as Json,
+    _expected: expected ?? null,
+  });
+  if (error) throw error;
+  return data;
+}
+
+/** 스킬 전체 교체(save_skills_tx). 고아 과업 참조는 서버가 걸러낸다. 반환값 = 새 updated_at. */
+export async function saveSkills(
+  responseId: string,
+  skills: SkillItem[],
+  expected?: string | null,
+): Promise<string> {
+  const payload = skills.map((s) => ({
+    id: s.id,
+    name: s.name,
+    ksao: s.ksao,
+    hard_soft: s.hardSoft,
+    description: s.description || null,
+    related_task_ids: s.relatedTaskIds,
+    is_general: s.isGeneral ?? false,
+  }));
+
+  const { data, error } = await supabase.rpc("save_skills_tx", {
+    _response_id: responseId,
+    _skills: payload as unknown as Json,
+    _expected: expected ?? null,
+  });
+  if (error) throw error;
+  return data;
 }
 
 export async function saveRequirements(responseId: string, value: RequirementsValue) {
@@ -280,14 +282,17 @@ export async function submit(
 }
 
 /** 작성 예시 라이브러리 전체 (건수가 작아 한 번에 읽는다) */
-export async function getExamples(): Promise<ExampleRow[]> {
+export async function getExamples(): Promise<ExampleLibRow[]> {
   const { data, error } = await supabase
     .from("example_library")
-    .select("category, field, good_example, bad_example, note")
+    // ponytail: is_common·job_group_key 가 아직 생성 타입(integrations/supabase/types.ts)에 없어
+    //           컬럼을 나열하면 타입 오류가 난다 — 작은 표라 * 로 읽고 캐스팅한다.
+    //           타입 재생성 후 컬럼 나열로 되돌리는 것이 정공법.
+    .select("*")
     .order("category", { ascending: true })
     .order("sort", { ascending: true });
   if (error) throw error;
-  return (data ?? []) as ExampleRow[];
+  return (data ?? []) as unknown as ExampleLibRow[];
 }
 
 /**
@@ -307,11 +312,25 @@ export async function getJobSuggestions(companyId: string) {
   };
 }
 
-/** 반려 배너용 최신 반려 코멘트 */
+/** 반려 이력 전체 (최신순). 배너·홈 카드가 모두 이 한 벌을 쓴다. */
+export async function getRejectHistory(responseId: string) {
+  const { data, error } = await supabase
+    .from("review_comments")
+    .select("id, body, step, created_at")
+    .eq("response_id", responseId)
+    .eq("kind", "reject")
+    .order("created_at", { ascending: false });
+  if (error) return [];
+  return data ?? [];
+}
+
+export type RejectComment = Awaited<ReturnType<typeof getRejectHistory>>[number];
+
+/** 반려 배너용 최신 반려 코멘트 (되돌릴 단계 포함) */
 export async function getLatestReject(responseId: string) {
   const { data, error } = await supabase
     .from("review_comments")
-    .select("body, created_at")
+    .select("body, step, created_at")
     .eq("response_id", responseId)
     .eq("kind", "reject")
     .order("created_at", { ascending: false })
@@ -320,3 +339,53 @@ export async function getLatestReject(responseId: string) {
   if (error) return null;
   return data;
 }
+
+/** 정정 요청 대상 인사정보 항목. applicable=false 는 관리자가 이 화면에서 바로 반영할 수 없다. */
+export const INFO_FIELDS = [
+  { key: "name", label: "성명", applicable: true },
+  { key: "emp_no", label: "사번", applicable: false },
+  { key: "email", label: "이메일", applicable: true },
+  { key: "company", label: "회사", applicable: false },
+  { key: "org_text", label: "소속", applicable: true },
+  { key: "grade", label: "직급", applicable: true },
+  { key: "role_level", label: "역할단계", applicable: true },
+] as const;
+
+export type InfoFieldKey = (typeof INFO_FIELDS)[number]["key"];
+
+export function infoFieldLabel(key: string) {
+  return INFO_FIELDS.find((f) => f.key === key)?.label ?? key;
+}
+
+export interface InfoChangeField {
+  field: string;
+  current: string;
+  requested: string;
+}
+
+/** 인사정보 정정 요청 등록. 본인 여부는 RLS(insert own request)가 검증한다. */
+export async function createInfoChangeRequest(
+  participantId: string,
+  fields: InfoChangeField[],
+  note: string,
+) {
+  const { error } = await supabase.from("info_change_requests").insert({
+    participant_id: participantId,
+    fields: fields as unknown as Json,
+    note: note.trim() || null,
+  });
+  if (error) throw error;
+}
+
+/** 본인이 낸 정정 요청 목록 (최신순) */
+export async function getMyInfoRequests(participantId: string) {
+  const { data, error } = await supabase
+    .from("info_change_requests")
+    .select("id, fields, note, status, admin_note, created_at, handled_at")
+    .eq("participant_id", participantId)
+    .order("created_at", { ascending: false });
+  if (error) return [];
+  return data ?? [];
+}
+
+export type MyInfoRequest = Awaited<ReturnType<typeof getMyInfoRequests>>[number];

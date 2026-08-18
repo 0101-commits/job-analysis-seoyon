@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { buildMailVars, renderMailText } from "./mail-vars";
+import { MAIL_ASSET_BUCKET, buildMailVars, renderMailText, replaceImageTokens } from "./mail-vars";
 import { fetchAll } from "./paginate";
 
 export type BatchFilters = {
@@ -59,13 +59,65 @@ export async function selectTargets(
   });
 }
 
-async function sendViaResend(to: string, subject: string, text: string) {
+function escapeHtml(text: string) {
+  return text.replace(
+    /[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c] as string,
+  );
+}
+
+function mailAssetUrl(path: string) {
+  const base = process.env["SUPABASE_URL"] ?? "";
+  return `${base}/storage/v1/object/public/${MAIL_ASSET_BUCKET}/${path}`;
+}
+
+/**
+ * 변수 치환이 끝난 평문 본문 → 메일용 HTML.
+ * 본문에 있는 URL 을 통째로 링크로 만들면 피싱으로 오인되므로, 접속링크 값만 <a> 로 감싼다.
+ */
+export function renderMailHtml(body: string, link?: string | null) {
+  let html = escapeHtml(body);
+  if (link) {
+    const safeLink = escapeHtml(link);
+    html = html.replaceAll(
+      safeLink,
+      `<a href="${safeLink}" style="color:#1d4ed8;text-decoration:underline">${safeLink}</a>`,
+    );
+  }
+  html = replaceImageTokens(
+    html,
+    (path, width) =>
+      `<img src="${mailAssetUrl(path)}" width="${width}" alt="" style="max-width:100%;height:auto;border:0;display:block;margin:12px 0" />`,
+  );
+  html = html.replace(/\r?\n/g, "<br />");
+  return [
+    '<div style="margin:0;padding:24px 12px;background:#f4f5f7">',
+    '<div style="max-width:600px;margin:0 auto;padding:28px 24px;background:#ffffff;border-radius:12px;',
+    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Malgun Gothic',sans-serif;",
+    'font-size:14px;line-height:1.75;color:#1f2937">',
+    html,
+    "</div></div>",
+  ].join("");
+}
+
+/** 이미지 토큰은 HTML 전용이므로 평문 폴백에서는 지운다. */
+function toPlainText(body: string) {
+  return replaceImageTokens(body, () => "");
+}
+
+export async function sendMail(to: string, subject: string, body: string, link?: string | null) {
   const key = process.env["RESEND_API_KEY"];
   const from = process.env["RESEND_FROM"] ?? "서연 그룹 업무조사 <onboarding@resend.dev>";
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from, to: [to], subject, text }),
+    body: JSON.stringify({
+      from,
+      to: [to],
+      subject,
+      html: renderMailHtml(body, link),
+      text: toPlainText(body),
+    }),
   });
   const json = (await res.json().catch(() => ({}))) as { id?: string; message?: string };
   if (!res.ok) throw new Error(json.message ?? `발송 실패 (HTTP ${res.status})`);
@@ -125,7 +177,7 @@ export async function processBatch(admin: SupabaseClient, batchId: string, origi
 
       if (!simulate) {
         try {
-          providerId = await sendViaResend(p.email as string, subject, body);
+          providerId = await sendMail(p.email as string, subject, body, link);
           status = "성공";
         } catch (err) {
           status = "실패";
@@ -256,7 +308,7 @@ export async function resendLog(admin: SupabaseClient, logId: string, origin?: s
   let providerId: string | null = null;
   if (!simulate) {
     try {
-      providerId = await sendViaResend(toEmail, subject, body);
+      providerId = await sendMail(toEmail, subject, body, appUrl(origin));
       status = "성공";
     } catch (err) {
       status = "실패";
@@ -309,7 +361,10 @@ export async function runScheduledBatches(admin: SupabaseClient, origin?: string
         .update({ status: "실패", finished_at: new Date().toISOString() })
         .eq("id", b.id)
         .eq("status", "대기");
-      results.push({ batchId: b.id, error: err instanceof Error ? err.message : "알 수 없는 오류" });
+      results.push({
+        batchId: b.id,
+        error: err instanceof Error ? err.message : "알 수 없는 오류",
+      });
     }
   }
   return results;

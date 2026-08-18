@@ -103,6 +103,21 @@ export const aiProxyStatus = createServerFn({ method: "GET" })
     return { configured: isProxyConfigured(), url: proxyUrl() };
   });
 
+/** AI 서버가 실제로 응답하는지 최소 호출로 확인한다(연결 점검 버튼). */
+export const pingProxy = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { callLLM } = await import("@/lib/llm.server");
+    const text = await callLLM({
+      system: "연결 확인용 호출이다. 다른 말 없이 pong 만 출력한다.",
+      user: "ping",
+      maxTokens: 16,
+    });
+    return { ok: true, reply: text.trim().slice(0, 40) };
+  });
+
 export const listSuggestions = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>

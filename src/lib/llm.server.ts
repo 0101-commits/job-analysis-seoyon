@@ -33,7 +33,8 @@ export async function callLLM({
       headers: {
         "content-type": "application/json",
         // Worker 의 Origin 화이트리스트 통과용. 서버간 호출이라 브라우저가 붙여주지 않는다.
-        origin: "http://localhost:8080",
+        // 운영 도메인(APP_URL)이 화이트리스트에 있어야 한다 — 미설정 시 로컬 개발 origin.
+        origin: process.env["APP_URL"] ?? "http://localhost:8080",
       },
       body: JSON.stringify({
         model: "claude-sonnet-5",

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Eye, Plus, Save, X } from "lucide-react";
+import { AlertTriangle, Eye, Plus, Save, X } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,9 +18,12 @@ import {
 } from "@/components/ui/select";
 import { PASSWORD_TOKENS, validatePasswordRule } from "@/lib/password-rule";
 import {
+  EMAIL_DOMAIN_RE,
   REMINDER_TARGETS,
   getSettings,
+  normalizeEmailDomain,
   previewPasswordRule,
+  systemStatus,
   updateSystemSettings,
   upsertSurveySetting,
 } from "@/lib/settings.functions";
@@ -44,6 +47,7 @@ type SurveyDraft = {
   reminderDays: string;
   reminderTarget: ReminderTarget;
   reminderAuto: boolean;
+  staleDays: string;
 };
 
 async function authHeaders() {
@@ -75,9 +79,16 @@ function SettingsPage() {
     queryFn: async () => getSettings({ headers: await authHeaders() }),
   });
 
+  const { data: status } = useQuery({
+    queryKey: ["admin-system-status"],
+    queryFn: async () => systemStatus({ headers: await authHeaders() }),
+  });
+
   const [rule, setRule] = useState("");
   const [levels, setLevels] = useState<string[]>([]);
   const [levelInput, setLevelInput] = useState("");
+  const [domains, setDomains] = useState<string[]>([]);
+  const [domainInput, setDomainInput] = useState("");
   const [drafts, setDrafts] = useState<Record<string, SurveyDraft>>({});
   const [samples, setSamples] = useState<
     { id: string; name: string; empNo: string; password: string }[]
@@ -87,6 +98,7 @@ function SettingsPage() {
     if (!data) return;
     setRule(data.passwordRule);
     setLevels(data.roleLevels);
+    setDomains(data.allowedEmailDomains);
     setDrafts(
       Object.fromEntries(
         data.companies.map((c) => {
@@ -98,6 +110,7 @@ function SettingsPage() {
               reminderDays: (s?.reminder_days ?? [7, 3, 1]).join(", "),
               reminderTarget: (s?.reminder_target === "미접속" ? "미접속" : "미제출") as ReminderTarget,
               reminderAuto: s?.reminder_auto ?? false,
+              staleDays: String(s?.stale_days ?? 7),
             },
           ];
         }),
@@ -108,8 +121,11 @@ function SettingsPage() {
   const ruleError = rule ? validatePasswordRule(rule) : null;
 
   const saveSystem = useMutation({
-    mutationFn: async (payload: { passwordRule?: string; roleLevels?: string[] }) =>
-      updateSystemSettings({ data: payload, headers: await authHeaders() }),
+    mutationFn: async (payload: {
+      passwordRule?: string;
+      roleLevels?: string[];
+      allowedEmailDomains?: string[];
+    }) => updateSystemSettings({ data: payload, headers: await authHeaders() }),
     onSuccess: () => {
       toast.success("저장되었습니다.");
       void queryClient.invalidateQueries({ queryKey: ["admin-settings"] });
@@ -124,6 +140,7 @@ function SettingsPage() {
       reminderDays: number[];
       reminderTarget: ReminderTarget;
       reminderAuto: boolean;
+      staleDays: number;
     }) => upsertSurveySetting({ data: payload, headers: await authHeaders() }),
     onSuccess: () => {
       toast.success("계열사 설정이 저장되었습니다.");
@@ -158,12 +175,18 @@ function SettingsPage() {
       toast.error("리마인더 일자는 0~60 사이 숫자를 쉼표로 구분해 입력해 주세요.");
       return;
     }
+    const staleDays = Number(draft.staleDays);
+    if (!Number.isInteger(staleDays) || staleDays < 1 || staleDays > 60) {
+      toast.error("미진행 기준일은 1~60 사이 숫자로 입력해 주세요.");
+      return;
+    }
     saveSurvey.mutate({
       companyId,
       deadline: draft.deadline || null,
       reminderDays: days,
       reminderTarget: draft.reminderTarget,
       reminderAuto: draft.reminderAuto,
+      staleDays,
     });
   }
 
@@ -178,6 +201,21 @@ function SettingsPage() {
     setLevelInput("");
   }
 
+  function addDomain() {
+    const value = normalizeEmailDomain(domainInput);
+    if (!value) return;
+    if (!EMAIL_DOMAIN_RE.test(value)) {
+      toast.error("도메인 형식이 올바르지 않습니다. 예: seoyon.com");
+      return;
+    }
+    if (domains.includes(value)) {
+      toast.error("이미 있는 도메인입니다.");
+      return;
+    }
+    setDomains((prev) => [...prev, value]);
+    setDomainInput("");
+  }
+
   return (
     <div className="space-y-6">
       <div>
@@ -190,12 +228,121 @@ function SettingsPage() {
       {isLoading ? (
         <p className="text-sm text-muted-foreground">불러오는 중...</p>
       ) : (
-        <Tabs defaultValue="password">
+        <Tabs defaultValue="ops">
           <TabsList className="w-full justify-start overflow-x-auto">
+            <TabsTrigger value="ops">운영 기본</TabsTrigger>
             <TabsTrigger value="password">초기 비밀번호</TabsTrigger>
             <TabsTrigger value="survey">계열사 운영</TabsTrigger>
             <TabsTrigger value="levels">역할단계</TabsTrigger>
           </TabsList>
+
+          {/* 0. 운영 기본 — 허용 도메인 + 연결 상태 */}
+          <TabsContent value="ops" className="mt-4 space-y-4">
+            <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
+              <div>
+                <Label htmlFor="domain-input">허용 이메일 도메인</Label>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  명부를 올릴 때 이 목록에 없는 도메인의 이메일은 오류로 표시됩니다. 비워 두면 모든
+                  도메인을 허용합니다.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                {domains.map((d) => (
+                  <span
+                    key={d}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-secondary px-3 py-1.5 text-sm"
+                  >
+                    @{d}
+                    <button
+                      type="button"
+                      aria-label={`${d} 삭제`}
+                      className="text-muted-foreground hover:text-destructive"
+                      onClick={() => setDomains((prev) => prev.filter((v) => v !== d))}
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </span>
+                ))}
+                {domains.length === 0 && (
+                  <p className="text-sm text-muted-foreground">
+                    등록된 도메인이 없습니다 — 현재 모든 도메인을 허용합니다.
+                  </p>
+                )}
+              </div>
+
+              <div className="flex gap-2">
+                <Input
+                  id="domain-input"
+                  value={domainInput}
+                  onChange={(e) => setDomainInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      addDomain();
+                    }
+                  }}
+                  placeholder="예: seoyon.com"
+                  inputMode="email"
+                />
+                <Button type="button" variant="outline" onClick={addDomain}>
+                  <Plus className="size-4" />
+                  추가
+                </Button>
+              </div>
+
+              <Button
+                type="button"
+                disabled={saveSystem.isPending}
+                onClick={() => saveSystem.mutate({ allowedEmailDomains: domains })}
+              >
+                <Save className="size-4" />
+                저장
+              </Button>
+            </section>
+
+            <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
+              <div>
+                <h2 className="font-semibold">연결 상태</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  메일과 AI 연결이 실제 운영용으로 준비되었는지 보여줍니다. 이 화면에서는 바꿀 수
+                  없고, 서버 배포 설정에서 조정합니다.
+                </p>
+              </div>
+
+              {status ? (
+                <ul className="space-y-2">
+                  {status.items.map((item) => (
+                    <li
+                      key={item.key}
+                      className="flex flex-col gap-1 rounded-lg border px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between sm:gap-4"
+                    >
+                      <span className="text-sm font-medium">{item.label}</span>
+                      <div className="flex min-w-0 flex-col items-start gap-1 sm:items-end">
+                        <span
+                          className={
+                            item.warn
+                              ? "inline-flex items-center gap-1.5 rounded-full bg-orange-100 px-2.5 py-1 text-xs font-semibold text-orange-800 dark:bg-orange-950 dark:text-orange-200"
+                              : "inline-flex items-center gap-1.5 rounded-full bg-secondary px-2.5 py-1 text-xs font-semibold"
+                          }
+                        >
+                          {item.warn && <AlertTriangle className="size-3.5" />}
+                          {item.value}
+                        </span>
+                        {item.note && (
+                          <span className="text-xs text-muted-foreground sm:text-right">
+                            {item.note}
+                          </span>
+                        )}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-muted-foreground">상태를 확인하는 중...</p>
+              )}
+            </section>
+          </TabsContent>
 
           {/* 1. 초기 비밀번호 규칙 */}
           <TabsContent value="password" className="mt-4 space-y-4">
@@ -203,7 +350,7 @@ function SettingsPage() {
               <div>
                 <Label htmlFor="password-rule">비밀번호 규칙</Label>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  토큰을 눌러 규칙을 조립하거나 직접 입력할 수 있습니다. 생성되는 비밀번호는 8자
+                  자동 입력 항목을 눌러 규칙을 조립하거나 직접 입력할 수 있습니다. 생성되는 비밀번호는 8자
                   이상이어야 합니다.
                 </p>
               </div>
@@ -234,7 +381,7 @@ function SettingsPage() {
                 <p className="text-xs text-destructive">{ruleError}</p>
               ) : (
                 <p className="text-xs text-muted-foreground">
-                  사용 가능한 토큰: {PASSWORD_TOKENS.map((t) => t.token).join(" ")} · 그 외 문자는
+                  사용 가능한 자동 입력 항목: {PASSWORD_TOKENS.map((t) => t.token).join(" ")} · 그 외 문자는
                   그대로 사용됩니다.
                 </p>
               )}
@@ -336,7 +483,23 @@ function SettingsPage() {
                       </Select>
                     </div>
 
-                    <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2 sm:mt-6">
+                    <div className="space-y-1.5">
+                      <Label htmlFor={`stale-${c.id}`}>미진행 기준일 (일)</Label>
+                      <Input
+                        id={`stale-${c.id}`}
+                        type="number"
+                        min={1}
+                        max={60}
+                        value={draft.staleDays}
+                        onChange={(e) => updateDraft(c.id, { staleDays: e.target.value })}
+                        inputMode="numeric"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        마지막 저장 이후 이 일수가 지나면 &lsquo;미진행&rsquo;으로 봅니다.
+                      </p>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
                       <Label htmlFor={`auto-${c.id}`} className="cursor-pointer">
                         자동 발송
                       </Label>

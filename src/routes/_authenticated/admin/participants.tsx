@@ -4,18 +4,32 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   AlertTriangle,
+  Archive,
   CheckCircle2,
   Download,
   KeyRound,
   Loader2,
+  Pencil,
+  Plus,
+  Search,
+  Trash2,
   Upload,
   UserPlus,
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -35,7 +49,17 @@ import {
   type RosterRaw,
   type RosterRow,
 } from "@/lib/roster";
-import { provisionAccounts, resetParticipantPassword } from "@/lib/admin.functions";
+import {
+  archiveParticipant,
+  createParticipant,
+  deleteParticipant,
+  provisionAccounts,
+  resetParticipantPassword,
+  setParticipantTags,
+  updateParticipant,
+  upsertParticipants,
+} from "@/lib/admin.functions";
+import { getAllowedEmailDomains } from "@/lib/settings.functions";
 import { fetchAll } from "@/lib/paginate";
 
 export const Route = createFileRoute("/_authenticated/admin/participants")({
@@ -73,6 +97,27 @@ function downloadCsv(name: string, body: string) {
   URL.revokeObjectURL(url);
 }
 
+type Company = { id: string; name: string };
+
+function useCompanies() {
+  return useQuery({
+    queryKey: ["companies"],
+    queryFn: async () => {
+      const { data, error } = await supabase.from("companies").select("id, name").order("created_at");
+      if (error) throw error;
+      return (data ?? []) as Company[];
+    },
+  });
+}
+
+/** 허용 이메일 도메인은 설정 화면(system_settings)이 단일 원천이다. 검증에 그대로 넘긴다. */
+function useAllowedDomains() {
+  return useQuery({
+    queryKey: ["allowed-email-domains"],
+    queryFn: async () => getAllowedEmailDomains({ headers: await authHeaders() }),
+  });
+}
+
 /** 파일 헤더 ↔ 명부 열 자동 추정. 이름이 같으면 바로, 아니면 유사도 0.6 이상. */
 function guessMapping(headers: string[]) {
   const mapping: Record<string, string> = {};
@@ -98,33 +143,67 @@ function guessMapping(headers: string[]) {
   return mapping;
 }
 
-/* ─────────────────────── ① 명부 업로드 → 계정 생성 ─────────────────────── */
+/* ─────────────────── ① 명부 업로드 → 신규 등록 · 기존 갱신 ─────────────────── */
+
+type ExistingKey = { company_id: string; emp_no: string; email: string | null };
+type ExistingIndex = { byKey: Map<string, string | null>; emailOwner: Map<string, string> };
+type Classified = RosterRow & { isUpdate: boolean };
+
+function keyOf(companyId: string | null, empNo: string) {
+  return `${companyId ?? ""}|${empNo.trim()}`;
+}
+
+function indexExisting(rows: ExistingKey[]): ExistingIndex {
+  const byKey = new Map<string, string | null>();
+  const emailOwner = new Map<string, string>();
+  for (const r of rows) {
+    const key = keyOf(r.company_id, r.emp_no);
+    byKey.set(key, r.email);
+    if (r.email) emailOwner.set(r.email.toLowerCase(), key);
+  }
+  return { byKey, emailOwner };
+}
+
+/**
+ * 재업로드를 갱신으로 받기 위한 재분류.
+ * validateRoster 는 계열사를 구분하지 않고 기등록 사번·이메일을 오류로 본다.
+ * 실제 유니크 제약은 (계열사, 사번) 하나뿐이므로
+ *  - '이미 등록된 사번' 은 항상 되돌리고, 같은 키가 있으면 갱신 대상으로 표시한다.
+ *  - '이미 등록된 이메일' 은 그 이메일의 주인이 같은 사람일 때만 되돌린다(남의 이메일은 진짜 오류).
+ */
+function reclassify(rows: RosterRow[], index: ExistingIndex): Classified[] {
+  return rows.map((r) => {
+    const key = keyOf(r.parsed.company_id, r.parsed.emp_no);
+    const isUpdate = index.byKey.has(key);
+    const ownEmail =
+      !!r.parsed.email && index.emailOwner.get(r.parsed.email.toLowerCase()) === key;
+    const errors = r.errors.filter(
+      (e) => e !== "이미 등록된 사번" && !(e === "이미 등록된 이메일" && ownEmail),
+    );
+    return { ...r, errors, isUpdate };
+  });
+}
 
 function RosterUploadTab() {
   const queryClient = useQueryClient();
   const [fileName, setFileName] = useState("");
   const [rows, setRows] = useState<RosterRaw[]>([]);
   const [mapping, setMapping] = useState<Record<string, string>>({});
-  const [validated, setValidated] = useState<RosterRow[] | null>(null);
+  const [validated, setValidated] = useState<Classified[] | null>(null);
 
-  const { data: companies } = useQuery({
-    queryKey: ["companies"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("companies")
-        .select("id, name")
-        .order("created_at");
-      if (error) throw error;
-      return data ?? [];
-    },
-  });
+  const { data: companies } = useCompanies();
+  const { data: domainInfo } = useAllowedDomains();
 
   const { data: existing } = useQuery({
     queryKey: ["participants-keys"],
     queryFn: () =>
-      // 중복 판정 근거라 한 행도 빠지면 안 된다. 전량 조회한다.
-      fetchAll<{ emp_no: string; email: string | null }>((from, to) =>
-        supabase.from("participants").select("emp_no, email").order("id").range(from, to),
+      // 신규/갱신 판정 근거라 한 행도 빠지면 안 된다. 전량 조회한다.
+      fetchAll<ExistingKey>((from, to) =>
+        supabase
+          .from("participants")
+          .select("company_id, emp_no, email")
+          .order("id")
+          .range(from, to),
       ),
   });
 
@@ -147,8 +226,10 @@ function RosterUploadTab() {
 
   const validRows = (validated ?? []).filter((r) => r.errors.length === 0);
   const errorRows = (validated ?? []).filter((r) => r.errors.length > 0);
+  const updateCount = validRows.filter((r) => r.isUpdate).length;
+  const newCount = validRows.length - updateCount;
 
-  const insert = useMutation({
+  const reflect = useMutation({
     mutationFn: async () => {
       const payload = validRows.map((r) => ({
         company_id: r.parsed.company_id as string,
@@ -160,13 +241,13 @@ function RosterUploadTab() {
         grade: r.parsed.grade,
         role_level: r.parsed.role_level,
       }));
-      if (payload.length === 0) throw new Error("반영할 행이 없습니다.");
-      const { error } = await supabase.from("participants").insert(payload);
-      if (error) throw new Error(error.message);
-      return payload.length;
+      if (payload.length === 0) throw new Error("반영할 건이 없습니다.");
+      return upsertParticipants({ data: { rows: payload }, headers: await authHeaders() });
     },
-    onSuccess: (count) => {
-      toast.success(`${count}명을 명부에 등록했습니다. 명단 탭에서 계정을 생성하세요.`);
+    onSuccess: () => {
+      toast.success(
+        `신규 ${newCount}명 등록, 갱신 ${updateCount}명 완료했습니다. 명단 탭에서 계정을 생성하세요.`,
+      );
       reset();
       void queryClient.invalidateQueries({ queryKey: ["participants"] });
       void queryClient.invalidateQueries({ queryKey: ["participants-keys"] });
@@ -199,11 +280,15 @@ function RosterUploadTab() {
   }
 
   function runValidation() {
-    const result = validateRoster(mapped, companies ?? [], existing ?? []);
+    const index = indexExisting(existing ?? []);
+    const result = reclassify(
+      validateRoster(mapped, companies ?? [], existing ?? [], domainInfo?.domains ?? []),
+      index,
+    );
     setValidated(result);
     const bad = result.filter((r) => r.errors.length > 0).length;
-    if (bad === 0) toast.success(`검증 통과 — ${result.length}행 모두 반영 가능합니다.`);
-    else toast.error(`${bad}행에 오류가 있습니다.`);
+    if (bad === 0) toast.success(`검증 통과 — ${result.length}건 모두 반영 가능합니다.`);
+    else toast.error(`${bad}건에 오류가 있습니다.`);
   }
 
   return (
@@ -233,15 +318,20 @@ function RosterUploadTab() {
         />
         {fileName && (
           <span className="text-sm text-muted-foreground">
-            {fileName} · {rows.length}행
+            {fileName} · {rows.length}건
           </span>
         )}
       </div>
 
+      <p className="rounded-xl border bg-secondary/40 p-3 text-xs text-muted-foreground">
+        이미 등록된 사번은 같은 계열사 기준으로 <strong>갱신</strong>됩니다. 이름·이메일·생년월일·소속·
+        직급·역할단계만 덮어쓰고, 계정·상태·초기 비밀번호는 그대로 둡니다.
+      </p>
+
       {rows.length > 0 && (
         <>
           <div className="rounded-xl border bg-card p-4">
-            <p className="text-sm font-medium">컬럼 매핑</p>
+            <p className="text-sm font-medium">항목 맞추기</p>
             <p className="mt-1 text-xs text-muted-foreground">
               파일의 열을 명부 항목에 연결합니다. 헤더 이름으로 자동 추정했습니다.
             </p>
@@ -289,17 +379,24 @@ function RosterUploadTab() {
 
           {validated && (
             <div className="space-y-2 rounded-xl border bg-card p-4">
-              {errorRows.length === 0 ? (
-                <p className="flex items-start gap-2 text-sm">
+              <p className="flex items-start gap-2 text-sm">
+                {errorRows.length === 0 ? (
                   <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-primary" />
-                  {validRows.length}행 모두 반영 가능합니다.
-                </p>
-              ) : (
+                ) : (
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+                )}
+                <span>
+                  신규 {newCount}명 / 갱신 {updateCount}명
+                  {errorRows.length > 0 && (
+                    <span className="font-medium text-destructive">
+                      {" "}
+                      · 오류 {errorRows.length}건 · 정상 {validRows.length}건
+                    </span>
+                  )}
+                </span>
+              </p>
+              {errorRows.length > 0 && (
                 <>
-                  <p className="flex items-center gap-2 text-sm font-medium text-destructive">
-                    <AlertTriangle className="size-4" />
-                    오류 {errorRows.length}행 · 정상 {validRows.length}행
-                  </p>
                   <ul className="max-h-56 space-y-1 overflow-y-auto text-xs">
                     {errorRows.slice(0, 50).map((r) => (
                       <li key={r.rowNo}>
@@ -310,7 +407,7 @@ function RosterUploadTab() {
                   </ul>
                   {errorRows.length > 50 && (
                     <p className="text-xs text-muted-foreground">
-                      외 {errorRows.length - 50}행 더 있습니다.
+                      외 {errorRows.length - 50}건 더 있습니다.
                     </p>
                   )}
                 </>
@@ -324,13 +421,13 @@ function RosterUploadTab() {
             </Button>
             <Button
               variant="secondary"
-              disabled={!validated || validRows.length === 0 || insert.isPending}
-              onClick={() => insert.mutate()}
+              disabled={!validated || validRows.length === 0 || reflect.isPending}
+              onClick={() => reflect.mutate()}
             >
-              {insert.isPending && <Loader2 className="size-4 animate-spin" />}
-              오류 제외하고 {validRows.length}행 반영
+              {reflect.isPending && <Loader2 className="size-4 animate-spin" />}
+              오류 제외하고 {validRows.length}건 반영
             </Button>
-            <Button variant="ghost" disabled={insert.isPending} onClick={reset}>
+            <Button variant="ghost" disabled={reflect.isPending} onClick={reset}>
               전체 취소
             </Button>
           </div>
@@ -344,22 +441,302 @@ function RosterUploadTab() {
 
 type Participant = {
   id: string;
+  company_id: string;
   emp_no: string;
   name: string;
   email: string | null;
+  birth_date: string | null;
   org_text: string | null;
   grade: string | null;
+  role_level: string | null;
   role: string;
   account_status: string;
   user_id: string | null;
+  tags: string[] | null;
+  archived_at: string | null;
   companies: { name: string } | null;
 };
+
+const PARTICIPANT_COLUMNS =
+  "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, role, account_status, user_id, tags, archived_at, companies(name)";
+
+/** 추가·수정 공용 폼. 참여자가 null 이면 추가(계열사·사번 입력), 있으면 수정(둘은 고정). */
+function ParticipantFormDialog({
+  open,
+  participant,
+  companies,
+  defaultCompanyId,
+  onOpenChange,
+}: {
+  open: boolean;
+  participant: Participant | null;
+  companies: Company[];
+  defaultCompanyId: string;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [form, setForm] = useState(() => ({
+    companyId: participant?.company_id ?? defaultCompanyId,
+    emp_no: participant?.emp_no ?? "",
+    name: participant?.name ?? "",
+    email: participant?.email ?? "",
+    birth_date: participant?.birth_date ?? "",
+    org_text: participant?.org_text ?? "",
+    grade: participant?.grade ?? "",
+    role_level: participant?.role_level ?? "",
+  }));
+
+  function set<K extends keyof typeof form>(key: K, value: string) {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  const save = useMutation({
+    mutationFn: async () => {
+      const headers = await authHeaders();
+      const fields = {
+        name: form.name.trim(),
+        email: form.email.trim(),
+        birth_date: form.birth_date || null,
+        org_text: form.org_text.trim(),
+        grade: form.grade.trim(),
+        role_level: form.role_level.trim(),
+      };
+      if (participant) {
+        return updateParticipant({
+          data: { participantId: participant.id, ...fields },
+          headers,
+        });
+      }
+      return createParticipant({
+        data: { companyId: form.companyId, emp_no: form.emp_no.trim(), ...fields },
+        headers,
+      });
+    },
+    onSuccess: () => {
+      toast.success(
+        participant
+          ? `${form.name.trim()} 정보를 수정했습니다.`
+          : `${form.name.trim()}을 명부에 등록했습니다. 목록에서 선택해 계정을 생성하세요.`,
+      );
+      onOpenChange(false);
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+      void queryClient.invalidateQueries({ queryKey: ["participants-keys"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const canSave =
+    form.name.trim().length > 0 &&
+    (participant !== null || (form.emp_no.trim().length > 0 && form.companyId.length > 0));
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>{participant ? "참여자 수정" : "참여자 추가"}</DialogTitle>
+          <DialogDescription>
+            {participant
+              ? `${participant.companies?.name ?? "-"} · 사번 ${participant.emp_no}. 계열사와 사번은 바꿀 수 없습니다.`
+              : "한 명을 직접 등록합니다. 계정은 등록 후 명단에서 선택해 발급하세요."}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          {!participant && (
+            <>
+              <div className="space-y-1.5">
+                <Label htmlFor="p-company">계열사 *</Label>
+                <Select value={form.companyId} onValueChange={(v) => set("companyId", v)}>
+                  <SelectTrigger id="p-company">
+                    <SelectValue placeholder="선택" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {companies.map((c) => (
+                      <SelectItem key={c.id} value={c.id}>
+                        {c.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="p-empno">사번 *</Label>
+                <Input
+                  id="p-empno"
+                  value={form.emp_no}
+                  onChange={(e) => set("emp_no", e.target.value)}
+                  placeholder="20150908"
+                />
+              </div>
+            </>
+          )}
+          <div className="space-y-1.5">
+            <Label htmlFor="p-name">이름 *</Label>
+            <Input id="p-name" value={form.name} onChange={(e) => set("name", e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="p-email">이메일</Label>
+            <Input
+              id="p-email"
+              type="email"
+              value={form.email}
+              onChange={(e) => set("email", e.target.value)}
+              placeholder="gildong.hong@seoyon.example"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="p-birth">생년월일</Label>
+            <Input
+              id="p-birth"
+              type="date"
+              value={form.birth_date}
+              onChange={(e) => set("birth_date", e.target.value)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="p-grade">직급</Label>
+            <Input id="p-grade" value={form.grade} onChange={(e) => set("grade", e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="p-role-level">역할단계</Label>
+            <Input
+              id="p-role-level"
+              value={form.role_level}
+              onChange={(e) => set("role_level", e.target.value)}
+            />
+          </div>
+          <div className="space-y-1.5 sm:col-span-2">
+            <Label htmlFor="p-org">소속</Label>
+            <Input
+              id="p-org"
+              value={form.org_text}
+              onChange={(e) => set("org_text", e.target.value)}
+              placeholder="경영기획본부 / 기획팀"
+            />
+          </div>
+        </div>
+
+        {participant?.user_id && form.email.trim() !== (participant.email ?? "") && (
+          <p className="text-xs text-muted-foreground">
+            이메일을 바꾸면 로그인 계정 아이디도 함께 변경됩니다.
+          </p>
+        )}
+
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+            취소
+          </Button>
+          <Button disabled={!canSave || save.isPending} onClick={() => save.mutate()}>
+            {save.isPending && <Loader2 className="size-4 animate-spin" />}
+            {participant ? "저장" : "등록"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** 보관(로그인 차단, 이력 유지) 과 완전 삭제 중 하나를 고르는 확인 창. */
+function RemoveDialog({
+  participant,
+  onOpenChange,
+}: {
+  participant: Participant;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const queryClient = useQueryClient();
+  const archived = !!participant.archived_at;
+
+  function done(message: string) {
+    toast.success(message);
+    onOpenChange(false);
+    void queryClient.invalidateQueries({ queryKey: ["participants"] });
+    void queryClient.invalidateQueries({ queryKey: ["participants-keys"] });
+  }
+
+  const archive = useMutation({
+    mutationFn: async () =>
+      archiveParticipant({
+        data: { participantId: participant.id, archived: !archived },
+        headers: await authHeaders(),
+      }),
+    onSuccess: () =>
+      done(archived ? "보관을 해제했습니다." : "보관했습니다. 로그인이 차단됩니다."),
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const remove = useMutation({
+    mutationFn: async () =>
+      deleteParticipant({ data: { participantId: participant.id }, headers: await authHeaders() }),
+    onSuccess: () => done("완전히 삭제했습니다."),
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const pending = archive.isPending || remove.isPending;
+
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>
+            {participant.name} · 사번 {participant.emp_no}
+          </DialogTitle>
+          <DialogDescription>
+            {participant.companies?.name ?? "-"} · 상태 {participant.account_status}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-2 text-sm">
+          <p className="rounded-lg border p-3">
+            <strong>보관</strong> — 명단에서 숨기고 로그인을 차단합니다. 작성한 응답은 그대로
+            남습니다.
+          </p>
+          <p className="rounded-lg border p-3">
+            <strong>완전 삭제</strong> — 명부와 로그인 계정을 지웁니다. 응답이 있거나 상태가
+            미발송이 아니면 거부됩니다.
+          </p>
+        </div>
+
+        <DialogFooter>
+          <Button variant="ghost" disabled={pending} onClick={() => onOpenChange(false)}>
+            취소
+          </Button>
+          <Button variant="outline" disabled={pending} onClick={() => archive.mutate()}>
+            {archive.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Archive className="size-4" />
+            )}
+            {archived ? "보관 해제" : "보관"}
+          </Button>
+          <Button variant="destructive" disabled={pending} onClick={() => remove.mutate()}>
+            {remove.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Trash2 className="size-4" />
+            )}
+            완전 삭제
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 function RosterListTab() {
   const { companyId } = useCompanyScope();
   const queryClient = useQueryClient();
   const [statusFilter, setStatusFilter] = useState("all");
+  const [tagFilter, setTagFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [includeArchived, setIncludeArchived] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [tagInput, setTagInput] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<Participant | null>(null);
+  const [removing, setRemoving] = useState<Participant | null>(null);
+
+  const { data: companies } = useCompanies();
 
   const { data, isLoading } = useQuery({
     queryKey: ["participants", companyId],
@@ -368,24 +745,33 @@ function RosterListTab() {
       return fetchAll<Participant>(async (from, to) => {
         let query = supabase
           .from("participants")
-          .select(
-            "id, emp_no, name, email, org_text, grade, role, account_status, user_id, companies(name)",
-          )
+          .select(PARTICIPANT_COLUMNS)
           // emp_no 는 계열사끼리 겹칠 수 있다. id 로 순서를 확정해야 페이지가 어긋나지 않는다.
           .order("emp_no")
           .order("id")
           .range(from, to);
         if (companyId !== "all") query = query.eq("company_id", companyId);
         const { data, error } = await query;
-        return { data: (data ?? []) as Participant[], error };
+        return { data: (data ?? []) as unknown as Participant[], error };
       });
     },
   });
 
-  const rows = useMemo(
-    () => (data ?? []).filter((p) => statusFilter === "all" || p.account_status === statusFilter),
-    [data, statusFilter],
+  const allTags = useMemo(
+    () => [...new Set((data ?? []).flatMap((p) => p.tags ?? []))].sort(),
+    [data],
   );
+
+  const rows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (data ?? []).filter((p) => {
+      if (!includeArchived && p.archived_at) return false;
+      if (statusFilter !== "all" && p.account_status !== statusFilter) return false;
+      if (tagFilter !== "all" && !(p.tags ?? []).includes(tagFilter)) return false;
+      if (!q) return true;
+      return [p.name, p.emp_no, p.email ?? ""].some((v) => v.toLowerCase().includes(q));
+    });
+  }, [data, search, statusFilter, tagFilter, includeArchived]);
 
   const provision = useMutation({
     mutationFn: async (ids: string[]) =>
@@ -409,8 +795,56 @@ function RosterListTab() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  const bulkReset = useMutation({
+    // ponytail: 순차 호출. 수백 명이면 느리지만 Auth admin API 를 몰아치지 않는다.
+    //           체감이 문제되면 서버에서 배치 함수로 옮긴다.
+    mutationFn: async (ids: string[]) => {
+      const headers = await authHeaders();
+      let ok = 0;
+      const failures: string[] = [];
+      for (const id of ids) {
+        try {
+          await resetParticipantPassword({ data: { participantId: id }, headers });
+          ok += 1;
+        } catch (err) {
+          failures.push(errorMessage(err));
+        }
+      }
+      return { ok, failures };
+    },
+    onSuccess: ({ ok, failures }) => {
+      toast.success(`${ok}명의 비밀번호를 초기화했습니다.`);
+      for (const f of failures.slice(0, 3)) toast.error(f);
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const tagMutation = useMutation({
+    mutationFn: async (mode: "add" | "remove") =>
+      setParticipantTags({
+        data: {
+          participantIds: [...selected],
+          tags: tagInput
+            .split(",")
+            .map((t) => t.trim())
+            .filter(Boolean),
+          mode,
+        },
+        headers: await authHeaders(),
+      }),
+    onSuccess: (res) => {
+      toast.success(`${res.changed}명의 태그를 변경했습니다.`);
+      setTagInput("");
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
   const selectedIds = [...selected];
   const allSelected = rows.length > 0 && rows.every((r) => selected.has(r.id));
+  const hasTagInput = tagInput.trim().length > 0;
+  const busy = provision.isPending || bulkReset.isPending || tagMutation.isPending;
 
   function toggle(id: string) {
     setSelected((prev) => {
@@ -423,51 +857,133 @@ function RosterListTab() {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-4">
-        <div className="flex flex-wrap items-center gap-3">
-          <Select value={statusFilter} onValueChange={setStatusFilter}>
-            <SelectTrigger className="w-[150px]" aria-label="상태 필터">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">전체 상태</SelectItem>
-              {ACCOUNT_STATUS_LABELS.map((s) => (
-                <SelectItem key={s} value={s}>
-                  {s}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={rows.length === 0}
-            onClick={() => setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))}
-          >
-            {allSelected ? "전체 해제" : "전체 선택"}
-          </Button>
+      <div className="space-y-3 rounded-xl border bg-card p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="이름 · 사번 · 이메일"
+                aria-label="참여자 검색"
+                className="w-[220px] pl-8"
+              />
+            </div>
+            <Select value={statusFilter} onValueChange={setStatusFilter}>
+              <SelectTrigger className="w-[140px]" aria-label="상태 필터">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">전체 상태</SelectItem>
+                {ACCOUNT_STATUS_LABELS.map((s) => (
+                  <SelectItem key={s} value={s}>
+                    {s}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={tagFilter} onValueChange={setTagFilter}>
+              <SelectTrigger className="w-[140px]" aria-label="태그 필터">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">전체 태그</SelectItem>
+                {allTags.map((t) => (
+                  <SelectItem key={t} value={t}>
+                    {t}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox
+                checked={includeArchived}
+                onCheckedChange={(v) => setIncludeArchived(v === true)}
+              />
+              보관 포함
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={rows.length === 0}
+              onClick={() => setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))}
+            >
+              {allSelected ? "전체 해제" : "전체 선택"}
+            </Button>
+            <Button size="sm" onClick={() => setAdding(true)}>
+              <Plus className="size-4" />
+              참여자 추가
+            </Button>
+          </div>
         </div>
-        <Button
-          disabled={selectedIds.length === 0 || provision.isPending}
-          onClick={() => provision.mutate(selectedIds)}
-        >
-          {provision.isPending ? (
-            <Loader2 className="size-4 animate-spin" />
-          ) : (
-            <UserPlus className="size-4" />
-          )}
-          선택 {selectedIds.length}명 계정 생성
-        </Button>
+
+        <p className="text-xs text-muted-foreground">
+          {rows.length}명 표시 중 · 선택 {selectedIds.length}명
+        </p>
+
+        {selectedIds.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+            <Button disabled={busy} onClick={() => provision.mutate(selectedIds)}>
+              {provision.isPending ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <UserPlus className="size-4" />
+              )}
+              계정 생성
+            </Button>
+            <Button variant="outline" disabled={busy} onClick={() => bulkReset.mutate(selectedIds)}>
+              {bulkReset.isPending ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <KeyRound className="size-4" />
+              )}
+              비밀번호 초기화
+            </Button>
+            <Input
+              value={tagInput}
+              onChange={(e) => setTagInput(e.target.value)}
+              placeholder="태그 (쉼표로 여러 개)"
+              aria-label="일괄 적용할 태그"
+              className="w-[200px]"
+            />
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={busy || !hasTagInput}
+              onClick={() => tagMutation.mutate("add")}
+            >
+              태그 부여
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy || !hasTagInput}
+              onClick={() => tagMutation.mutate("remove")}
+            >
+              태그 제거
+            </Button>
+          </div>
+        )}
       </div>
 
       {isLoading ? (
         <p className="text-sm text-muted-foreground">불러오는 중...</p>
+      ) : rows.length === 0 ? (
+        <p className="rounded-xl border bg-card p-8 text-center text-sm text-muted-foreground">
+          조건에 맞는 참여자가 없습니다.
+        </p>
       ) : (
         <>
           {/* 모바일: 카드 스택 */}
           <ul className="space-y-3 md:hidden">
             {rows.map((p) => (
-              <li key={p.id} className="rounded-xl border bg-card p-4 shadow-sm">
+              <li
+                key={p.id}
+                className={`rounded-xl border bg-card p-4 shadow-sm ${p.archived_at ? "opacity-60" : ""}`}
+              >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex min-w-0 items-start gap-3">
                     <Checkbox
@@ -505,16 +1021,26 @@ function RosterListTab() {
                     <dd className="mt-0.5 truncate font-medium">{p.email ?? "-"}</dd>
                   </div>
                 </dl>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="mt-3"
-                  disabled={!p.user_id || resetPassword.isPending}
-                  onClick={() => resetPassword.mutate(p.id)}
-                >
-                  <KeyRound className="size-4" />
-                  비밀번호 초기화
-                </Button>
+                <TagChips participant={p} />
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button size="sm" variant="outline" onClick={() => setEditing(p)}>
+                    <Pencil className="size-4" />
+                    수정
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!p.user_id || resetPassword.isPending}
+                    onClick={() => resetPassword.mutate(p.id)}
+                  >
+                    <KeyRound className="size-4" />
+                    비밀번호 초기화
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setRemoving(p)}>
+                    <Trash2 className="size-4" />
+                    삭제 · 보관
+                  </Button>
+                </div>
               </li>
             ))}
           </ul>
@@ -530,14 +1056,14 @@ function RosterListTab() {
                   <th className="px-4 py-3 font-medium">계열사</th>
                   <th className="px-4 py-3 font-medium">소속</th>
                   <th className="px-4 py-3 font-medium">직급</th>
-                  <th className="px-4 py-3 font-medium">권한</th>
+                  <th className="px-4 py-3 font-medium">태그</th>
                   <th className="px-4 py-3 font-medium">상태</th>
-                  <th className="px-4 py-3 font-medium">계정</th>
+                  <th className="px-4 py-3 font-medium">관리</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((p) => (
-                  <tr key={p.id} className="border-t">
+                  <tr key={p.id} className={`border-t ${p.archived_at ? "opacity-60" : ""}`}>
                     <td className="px-4 py-3">
                       <Checkbox
                         checked={selected.has(p.id)}
@@ -546,24 +1072,49 @@ function RosterListTab() {
                       />
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">{p.emp_no}</td>
-                    <td className="px-4 py-3 font-medium">{p.name}</td>
+                    <td className="px-4 py-3 font-medium">
+                      {p.name}
+                      {p.archived_at && (
+                        <span className="ml-2 text-xs font-normal text-muted-foreground">보관</span>
+                      )}
+                    </td>
                     <td className="px-4 py-3">{p.companies?.name}</td>
                     <td className="px-4 py-3 text-muted-foreground">{p.org_text}</td>
                     <td className="px-4 py-3">{p.grade ?? "-"}</td>
-                    <td className="px-4 py-3">{p.role === "admin" ? "관리자" : "응답자"}</td>
+                    <td className="px-4 py-3">
+                      <TagChips participant={p} />
+                    </td>
                     <td className="px-4 py-3">
                       <StatusBadge status={p.account_status} />
                     </td>
                     <td className="px-4 py-3">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={!p.user_id || resetPassword.isPending}
-                        onClick={() => resetPassword.mutate(p.id)}
-                      >
-                        <KeyRound className="size-4" />
-                        비밀번호 초기화
-                      </Button>
+                      <div className="flex gap-1">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          aria-label={`${p.name} 수정`}
+                          onClick={() => setEditing(p)}
+                        >
+                          <Pencil className="size-4" />
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          aria-label={`${p.name} 비밀번호 초기화`}
+                          disabled={!p.user_id || resetPassword.isPending}
+                          onClick={() => resetPassword.mutate(p.id)}
+                        >
+                          <KeyRound className="size-4" />
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          aria-label={`${p.name} 삭제 또는 보관`}
+                          onClick={() => setRemoving(p)}
+                        >
+                          <Trash2 className="size-4" />
+                        </Button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -572,6 +1123,49 @@ function RosterListTab() {
           </div>
         </>
       )}
+
+      {adding && (
+        <ParticipantFormDialog
+          open
+          participant={null}
+          companies={companies ?? []}
+          defaultCompanyId={
+            companyId !== "all" ? companyId : ((companies ?? [])[0]?.id ?? "")
+          }
+          onOpenChange={(open) => !open && setAdding(false)}
+        />
+      )}
+      {editing && (
+        <ParticipantFormDialog
+          key={editing.id}
+          open
+          participant={editing}
+          companies={companies ?? []}
+          defaultCompanyId={editing.company_id}
+          onOpenChange={(open) => !open && setEditing(null)}
+        />
+      )}
+      {removing && (
+        <RemoveDialog
+          key={removing.id}
+          participant={removing}
+          onOpenChange={(open) => !open && setRemoving(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function TagChips({ participant }: { participant: Participant }) {
+  const tags = participant.tags ?? [];
+  if (tags.length === 0) return <span className="text-xs text-muted-foreground">-</span>;
+  return (
+    <div className="mt-2 flex flex-wrap gap-1 md:mt-0">
+      {tags.map((t) => (
+        <span key={t} className="rounded-full bg-secondary px-2 py-0.5 text-xs">
+          {t}
+        </span>
+      ))}
     </div>
   );
 }
@@ -582,7 +1176,7 @@ function ParticipantsPage() {
       <div>
         <h1 className="text-xl font-bold sm:text-2xl">참여자 관리</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          명부를 업로드해 참여자를 등록하고, 계정을 일괄 생성합니다.
+          참여자를 등록·수정·보관하고, 계정을 일괄 생성합니다.
         </p>
       </div>
 

@@ -47,6 +47,7 @@ jobs:
             if (process.env.SUPABASE_SERVICE_ROLE_KEY) j.vars.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
             if (process.env.RESEND_API_KEY) j.vars.RESEND_API_KEY = process.env.RESEND_API_KEY;
             if (process.env.RESEND_FROM) j.vars.RESEND_FROM = process.env.RESEND_FROM;
+            if (process.env.ELIZAX_PROXY_URL) j.vars.ELIZAX_PROXY_URL = process.env.ELIZAX_PROXY_URL;
             // 자동 백업/리마인더/예약 발송용 cron (UTC 21:00·09:00 = KST 06:00·18:00).
             // CF 무료 플랜은 계정당 cron 5개 상한 — ENABLE_CRON=1 시크릿이 있을 때만 등록.
             if (process.env.ENABLE_CRON === "1") j.triggers = { crons: ["0 21,9 * * *"] };
@@ -60,6 +61,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          ELIZAX_PROXY_URL: ${{ secrets.ELIZAX_PROXY_URL }}
           ENABLE_CRON: ${{ secrets.ENABLE_CRON }}
 
       - name: Deploy to Cloudflare Workers

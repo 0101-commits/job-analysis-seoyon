@@ -57,6 +57,14 @@ function toCsv(sheet: Sheet) {
   return "﻿" + [sheet.headers, ...sheet.rows].map((row) => row.map(csvCell).join(",")).join("\r\n");
 }
 
+/** 시트 키는 표준 양식 규격이라 그대로 두고, 화면에만 한글 이름을 보여준다. */
+const SHEET_LABELS: Record<string, string> = {
+  job_description: "직무기술서",
+  task_activity: "과업·활동",
+  skill: "스킬",
+  skill_pool: "스킬풀",
+};
+
 function download(filename: string, content: string, mime: string) {
   const url = URL.createObjectURL(new Blob([content], { type: mime }));
   const a = document.createElement("a");
@@ -115,7 +123,7 @@ function ExportPage() {
     onSuccess: (res) => {
       download(`seoyon_export_${today()}.json`, res.json, "application/json;charset=utf-8");
       if (res.meta.jobs === 0) toast.info("조건에 해당하는 응답이 없습니다.");
-      else toast.success(`직무 ${res.meta.jobs}건을 담은 JSON 을 내려받았습니다.`);
+      else toast.success(`직무 ${res.meta.jobs}건을 담은 원본 파일을 내려받았습니다.`);
     },
     onError: (err) => toast.error(errorMessage(err)),
   });
@@ -125,13 +133,14 @@ function ExportPage() {
     onSuccess: (res) => {
       download(`snapshot_${stamp()}.json`, res.json, "application/json;charset=utf-8");
       const rows = Object.values(res.counts).reduce((a, b) => a + b, 0);
-      toast.success(`전체 ${rows}행을 백업했습니다.`);
+      toast.success(`전체 ${rows}건을 백업했습니다.`);
     },
     onError: (err) => toast.error(errorMessage(err)),
   });
 
   function downloadSheet(sheet: Sheet) {
-    download(`seoyon_stdjob_${sheet.name}_${today()}.csv`, toCsv(sheet), "text/csv;charset=utf-8");
+    const label = SHEET_LABELS[sheet.name] ?? sheet.name;
+    download(`서연_직무기술서_${label}_${today()}.csv`, toCsv(sheet), "text/csv;charset=utf-8");
   }
 
   const companySelect = (
@@ -161,20 +170,18 @@ function ExportPage() {
       <div>
         <h1 className="text-xl font-bold sm:text-2xl">내보내기</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          조사 결과를 표준 직무기술서 양식(CSV)과 AI 판독용 JSON 으로 내려받고, 전체 데이터를
-          백업합니다.
+          조사 결과를 표준 직무기술서 양식(엑셀)으로 내려받고, 전체 데이터를 백업합니다.
         </p>
       </div>
 
-      {/* 1. stdjob 양식 */}
+      {/* 1. 표준 직무기술서 양식 */}
       <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
         <div className="flex items-center gap-2">
           <FileSpreadsheet className="size-5 text-primary" />
-          <h2 className="font-semibold">stdjob 양식 내보내기</h2>
+          <h2 className="font-semibold">표준 직무기술서 양식(엑셀)</h2>
         </div>
         <p className="text-sm text-muted-foreground">
-          job_description · task_activity · skill · skill_pool 4개 시트를 각각 CSV 파일로
-          내려받습니다. Excel 에서 바로 열 수 있도록 UTF-8(BOM) 로 저장됩니다.
+          직무기술서·과업·스킬·스킬풀 4개 시트를 각각 파일로 내려받습니다. 엑셀에서 바로 열립니다.
         </p>
 
         <div className="grid gap-4 sm:grid-cols-2">
@@ -183,11 +190,11 @@ function ExportPage() {
             {companySelect}
           </div>
           <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2 sm:mt-6">
-            <Label htmlFor="stdjob-approved" className="cursor-pointer">
+            <Label htmlFor="std-approved" className="cursor-pointer">
               승인된 응답만 포함
             </Label>
             <Switch
-              id="stdjob-approved"
+              id="std-approved"
               checked={approvedOnly}
               onCheckedChange={(v) => {
                 setApprovedOnly(v);
@@ -207,8 +214,8 @@ function ExportPage() {
             {sheets.map((sheet) => (
               <div key={sheet.name} className="flex items-center justify-between gap-3">
                 <span className="min-w-0 truncate text-sm">
-                  <span className="font-medium">{sheet.name}</span>
-                  <span className="ml-2 text-xs text-muted-foreground">{sheet.rows.length}행</span>
+                  <span className="font-medium">{SHEET_LABELS[sheet.name] ?? sheet.name}</span>
+                  <span className="ml-2 text-xs text-muted-foreground">{sheet.rows.length}건</span>
                 </span>
                 <Button
                   type="button"
@@ -218,7 +225,7 @@ function ExportPage() {
                   onClick={() => downloadSheet(sheet)}
                 >
                   <Download className="size-4" />
-                  CSV
+                  내려받기
                 </Button>
               </div>
             ))}
@@ -231,20 +238,20 @@ function ExportPage() {
               onClick={() => sheets.filter((s) => s.rows.length > 0).forEach(downloadSheet)}
             >
               <Download className="size-4" />
-              4개 파일 모두 내려받기
+              4개 시트 모두 내려받기
             </Button>
           </div>
         )}
       </section>
 
-      {/* 2. AI 판독용 JSON */}
+      {/* 2. 데이터 원본 내려받기 */}
       <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
         <div className="flex items-center gap-2">
           <Braces className="size-5 text-primary" />
-          <h2 className="font-semibold">AI 판독용 JSON</h2>
+          <h2 className="font-semibold">데이터 원본 내려받기(시스템용)</h2>
         </div>
         <p className="text-sm text-muted-foreground">
-          각 필드의 뜻을 함께 담은 구조화 JSON 입니다. 생성형 AI 에 그대로 넣어 직무 분석에 활용할
+          각 항목의 뜻을 함께 담은 데이터 원본 파일입니다. 다른 시스템이나 AI 분석에 그대로 넣어 쓸
           수 있습니다. 위에서 고른 계열사 기준으로 생성됩니다.
         </p>
 
@@ -274,18 +281,18 @@ function ExportPage() {
 
         <Button type="button" disabled={buildJson.isPending} onClick={() => buildJson.mutate()}>
           <Download className="size-4" />
-          {buildJson.isPending ? "생성하는 중..." : "JSON 내려받기"}
+          {buildJson.isPending ? "생성하는 중..." : "원본 파일 내려받기"}
         </Button>
       </section>
 
-      {/* 3. 수동 스냅샷 */}
+      {/* 3. 수동 백업 */}
       <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
         <div className="flex items-center gap-2">
           <Database className="size-5 text-primary" />
-          <h2 className="font-semibold">수동 스냅샷</h2>
+          <h2 className="font-semibold">수동 백업</h2>
         </div>
         <p className="text-sm text-muted-foreground">
-          참여자·응답·마스터·메일 이력 등 전체 테이블을 JSON 한 파일로 백업합니다. 초기 비밀번호와
+          참여자·응답·기준정보·메일 이력 등 전체 데이터를 한 파일로 백업합니다. 초기 비밀번호와
           생년월일은 포함되지 않습니다. <strong>주요 마일스톤마다 보관하세요.</strong>
         </p>
         <p className="rounded-lg border border-dashed bg-secondary/50 p-3 text-xs text-muted-foreground">

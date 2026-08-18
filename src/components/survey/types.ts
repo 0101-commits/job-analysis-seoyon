@@ -31,6 +31,7 @@ export interface SkillItem {
   hardSoft: HardSoft | null;
   description: string;
   relatedTaskIds: string[]; // TaskItem.id 참조
+  isGeneral?: boolean; // 특정 과업과 무관한 직무 공통 스킬
 }
 
 export interface LicenseItem {
@@ -67,6 +68,8 @@ export interface TaskGridProps {
   onChange: (next: TaskItem[]) => void;
   examples: ExampleRow[]; // field==='task'|'activity' 만 전달됨
   disabled?: boolean;
+  /** 과업 삭제 직전 확인. false 를 반환하면 삭제를 취소한다(연결된 스킬 경고용). */
+  confirmRemove?: (task: TaskItem) => boolean;
 }
 
 export interface SkillGridProps {

@@ -32,16 +32,19 @@ import {
   correctField,
   getJobComparison,
   getResponseDetail,
+  handleInfoRequest,
+  listInfoRequests,
   listReviewQueue,
   rejectResponse,
 } from "@/lib/review.functions";
+import { infoFieldLabel } from "@/lib/survey.data";
 
 export const Route = createFileRoute("/_authenticated/admin/review")({
   head: () => ({
     meta: [
-      { title: "검토 큐 | 서연 그룹 업무조사" },
+      { title: "응답 검토 | 서연 그룹 업무조사" },
       { name: "description", content: "제출된 업무조사를 검토하고 승인 또는 반려합니다." },
-      { property: "og:title", content: "검토 큐 | 서연 그룹 업무조사" },
+      { property: "og:title", content: "응답 검토 | 서연 그룹 업무조사" },
       { property: "og:description", content: "제출된 업무조사를 검토하고 승인 또는 반려합니다." },
     ],
   }),
@@ -77,8 +80,11 @@ const STEPS = [
   "6. 자기평가",
 ];
 
-const LV_GUIDE =
-  "Lv.1 기본·일상 수행 → Lv.2 독립 완결 → Lv.3 복잡 업무·코칭 → Lv.4 방향 제시";
+const LV_GUIDE = "Lv.1 기본·일상 수행 → Lv.2 독립 완결 → Lv.3 복잡 업무·코칭 → Lv.4 방향 제시";
+
+/** K/S/A 코드만 보면 뜻을 모르므로 화면에는 한글을 함께 적는다. */
+const KSAO_LABEL: Record<string, string> = { K: "지식 K", S: "기술 S", A: "태도 A" };
+const ksaoLabel = (code: string) => KSAO_LABEL[code] ?? code;
 
 function errorMessage(err: unknown) {
   return err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
@@ -126,10 +132,19 @@ function ReviewPage() {
   const rows = data?.rows ?? [];
   const jobNames = Object.keys(data?.jobCounts ?? {}).sort((a, b) => a.localeCompare(b));
 
+  const [infoStatus, setInfoStatus] = useState("요청");
+  const { data: infoData, isLoading: infoLoading } = useQuery({
+    queryKey: ["info-requests", infoStatus],
+    queryFn: () =>
+      listInfoRequests({
+        data: { status: infoStatus === "all" ? null : (infoStatus as "요청" | "처리완료" | "반려") },
+      }),
+  });
+
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-bold sm:text-2xl">검토 큐</h1>
+        <h1 className="text-xl font-bold sm:text-2xl">응답 검토</h1>
         <p className="mt-1 text-sm text-muted-foreground">
           제출된 업무조사를 검토하고 승인 또는 반려합니다. 총 {rows.length}건
         </p>
@@ -142,6 +157,14 @@ function ReviewPage() {
           </TabsTrigger>
           <TabsTrigger value="compare" className="flex-1 sm:flex-none">
             직무 비교
+          </TabsTrigger>
+          <TabsTrigger value="info" className="flex-1 gap-2 sm:flex-none">
+            정정 요청
+            {infoData?.pending ? (
+              <span className="rounded-full bg-destructive px-1.5 py-0.5 text-[11px] font-semibold text-destructive-foreground">
+                {infoData.pending}
+              </span>
+            ) : null}
           </TabsTrigger>
         </TabsList>
 
@@ -232,6 +255,15 @@ function ReviewPage() {
 
         <TabsContent value="compare" className="mt-4">
           <JobComparison jobNames={jobNames} companyId={scope} />
+        </TabsContent>
+
+        <TabsContent value="info" className="mt-4">
+          <InfoRequests
+            rows={infoData?.rows ?? []}
+            isLoading={infoLoading}
+            status={infoStatus}
+            onStatusChange={setInfoStatus}
+          />
         </TabsContent>
       </Tabs>
     </div>
@@ -574,7 +606,11 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                   {s.ai_draft && <AiDraftBadge />}
                 </div>
                 <div className="mt-1 flex flex-wrap gap-2 text-xs">
-                  {s.ksao && <span className="rounded-full bg-secondary px-2 py-0.5">{s.ksao}</span>}
+                  {s.ksao && (
+                    <span className="rounded-full bg-secondary px-2 py-0.5">
+                      {ksaoLabel(s.ksao)}
+                    </span>
+                  )}
                   {s.hard_soft && (
                     <span className="rounded-full bg-secondary px-2 py-0.5">{s.hard_soft}</span>
                   )}
@@ -817,6 +853,203 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
   );
 }
 
+type InfoRequestRow = Awaited<ReturnType<typeof listInfoRequests>>["rows"][number];
+type InfoField = { field: string; current: string; requested: string };
+
+/** A9 정정 수신함 — 참여자가 보낸 인사정보 정정 요청을 확인하고 반영한다. */
+function InfoRequests({
+  rows,
+  isLoading,
+  status,
+  onStatusChange,
+}: {
+  rows: InfoRequestRow[];
+  isLoading: boolean;
+  status: string;
+  onStatusChange: (v: string) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [target, setTarget] = useState<{ row: InfoRequestRow; action: "처리완료" | "반려" } | null>(
+    null,
+  );
+  const [adminNote, setAdminNote] = useState("");
+  const [apply, setApply] = useState(true);
+
+  const handle = useMutation({
+    mutationFn: () =>
+      handleInfoRequest({
+        data: {
+          id: target!.row.id,
+          action: target!.action,
+          adminNote: adminNote.trim() || undefined,
+          apply: target!.action === "처리완료" ? apply : false,
+        },
+      }),
+    onSuccess: (result) => {
+      setTarget(null);
+      setAdminNote("");
+      toast.success(
+        result.applied.length > 0
+          ? `처리했습니다. ${result.applied.map(infoFieldLabel).join(", ")} 항목을 반영했습니다.`
+          : "처리했습니다.",
+      );
+      void queryClient.invalidateQueries({ queryKey: ["info-requests"] });
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+    },
+    onError: (err) => toast.error(`처리에 실패했습니다: ${errorMessage(err)}`),
+  });
+
+  const fieldsOf = (value: unknown): InfoField[] =>
+    Array.isArray(value) ? (value as InfoField[]) : [];
+
+  return (
+    <div className="space-y-4">
+      <div className="max-w-sm">
+        <Select value={status} onValueChange={onStatusChange}>
+          <SelectTrigger aria-label="정정 요청 상태 필터">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="요청">요청</SelectItem>
+            <SelectItem value="처리완료">처리완료</SelectItem>
+            <SelectItem value="반려">반려</SelectItem>
+            <SelectItem value="all">전체</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {isLoading ? (
+        <p className="text-sm text-muted-foreground">불러오는 중...</p>
+      ) : rows.length === 0 ? (
+        <p className="rounded-xl border border-dashed bg-card p-8 text-center text-sm text-muted-foreground">
+          조건에 맞는 정정 요청이 없습니다.
+        </p>
+      ) : (
+        <ul className="space-y-3">
+          {rows.map((r) => (
+            <li key={r.id} className="rounded-xl border bg-card p-4 shadow-sm">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="font-semibold">
+                    {r.participants?.name ?? "-"}
+                    <span className="ml-2 text-xs font-normal text-muted-foreground">
+                      사번 {r.participants?.emp_no ?? "-"} ·{" "}
+                      {r.participants?.companies?.name ?? "계열사 미지정"}
+                    </span>
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <StatusBadge status={r.status} />
+                  <span className="text-xs text-muted-foreground">{formatDate(r.created_at)}</span>
+                </div>
+              </div>
+
+              <ul className="mt-3 space-y-1 text-sm">
+                {fieldsOf(r.fields).map((f, i) => (
+                  <li key={`${f.field}-${i}`} className="flex flex-wrap gap-2">
+                    <span className="font-medium">{infoFieldLabel(f.field)}</span>
+                    <span className="text-muted-foreground">{f.current || "(비어 있음)"}</span>
+                    <span className="text-muted-foreground">→</span>
+                    <span className="font-medium text-primary">{f.requested}</span>
+                  </li>
+                ))}
+              </ul>
+
+              {r.note && (
+                <p className="mt-2 whitespace-pre-wrap rounded-lg bg-secondary p-3 text-sm text-muted-foreground">
+                  {r.note}
+                </p>
+              )}
+
+              {r.admin_note && (
+                <p className="mt-2 whitespace-pre-wrap text-xs text-muted-foreground">
+                  관리자 의견: {r.admin_note}
+                </p>
+              )}
+
+              {r.status === "요청" && (
+                <div className="mt-3 flex gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      setApply(true);
+                      setAdminNote("");
+                      setTarget({ row: r, action: "처리완료" });
+                    }}
+                  >
+                    처리
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setAdminNote("");
+                      setTarget({ row: r, action: "반려" });
+                    }}
+                  >
+                    반려
+                  </Button>
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <Dialog open={!!target} onOpenChange={(open) => !open && setTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {target?.action === "반려" ? "정정 요청 반려" : "정정 요청 처리"}
+            </DialogTitle>
+            <DialogDescription>
+              처리 결과와 의견은 참여자의 1단계 화면에 그대로 표시됩니다.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {target?.action === "처리완료" && (
+              <>
+                <label className="flex items-start gap-3 rounded-lg border p-3 text-sm">
+                  <Checkbox checked={apply} onCheckedChange={(v) => setApply(v === true)} />
+                  <span>
+                    요청값을 참여자 정보에 바로 반영합니다. 성명·이메일·소속·직급·역할단계만
+                    반영되며 사번·회사는 반영되지 않습니다.
+                  </span>
+                </label>
+                <p className="rounded-lg bg-secondary p-3 text-xs text-muted-foreground">
+                  이메일 변경 시 계정 이메일은 참여자 관리에서 별도 갱신해야 합니다.
+                </p>
+              </>
+            )}
+            <div className="space-y-1.5">
+              <Label htmlFor="info-admin-note">관리자 의견 (선택)</Label>
+              <Textarea
+                id="info-admin-note"
+                rows={3}
+                value={adminNote}
+                onChange={(e) => setAdminNote(e.target.value)}
+                placeholder="처리 결과나 반려 사유를 적어 주세요."
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setTarget(null)} disabled={handle.isPending}>
+              취소
+            </Button>
+            <Button
+              variant={target?.action === "반려" ? "destructive" : "default"}
+              disabled={handle.isPending}
+              onClick={() => handle.mutate()}
+            >
+              {target?.action === "반려" ? "반려" : "처리완료"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
 function JobComparison({ jobNames, companyId }: { jobNames: string[]; companyId: string | null }) {
   const [job, setJob] = useState("");
 
@@ -829,7 +1062,7 @@ function JobComparison({ jobNames, companyId }: { jobNames: string[]; companyId:
   return (
     <div className="space-y-4">
       <div className="rounded-xl border border-primary/30 bg-primary-soft p-3 text-sm text-accent-foreground">
-        <p className="font-semibold">역할단계 참조 틀 (안랩 Lv 기준)</p>
+        <p className="font-semibold">역할단계 참조표</p>
         <p className="mt-1">{LV_GUIDE}</p>
       </div>
 
@@ -905,7 +1138,7 @@ function JobComparison({ jobNames, companyId }: { jobNames: string[]; companyId:
                     <span className="text-muted-foreground">·</span>
                     <span className="min-w-0 flex-1">
                       {s.name}
-                      {s.ksao ? ` (${s.ksao})` : ""}
+                      {s.ksao ? ` (${ksaoLabel(s.ksao)})` : ""}
                     </span>
                   </li>
                 ))}

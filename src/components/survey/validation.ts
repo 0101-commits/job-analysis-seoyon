@@ -120,7 +120,7 @@ export function validateSkills(skills: SkillItem[]): TaskValidation {
   const errors: string[] = [];
 
   if (skills.length < 3) {
-    errors.push("스킬을 3개 이상 작성해야 제출할 수 있습니다");
+    errors.push("스킬을 3개 이상 작성해야 제출할 수 있습니다(5개 이상 권장)");
   }
   skills.forEach((skill, index) => {
     const name = skill.name.trim() === "" ? `${index + 1}번째 스킬` : `'${skill.name.trim()}'`;

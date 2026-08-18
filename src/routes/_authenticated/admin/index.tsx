@@ -28,7 +28,7 @@ export const Route = createFileRoute("/_authenticated/admin/")({
 });
 
 const DONE_STATUSES = ["제출", "승인"];
-/** 이 일수 이상 움직임이 없는 미제출자를 정체자로 본다. */
+/** 이 일수 이상 움직임이 없는 미제출자를 미진행자로 본다. */
 const STALE_DAYS = 7;
 
 type ParticipantRow = {
@@ -172,7 +172,7 @@ function DashboardPage() {
       </div>
 
       <div className="rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-        <h2 className="text-base font-semibold">상태 퍼널</h2>
+        <h2 className="text-base font-semibold">진행 단계 현황</h2>
         <p className="mt-1 text-xs text-muted-foreground">
           미발송에서 승인까지 단계별 인원입니다. 막대는 전체 대비 비율입니다.
         </p>
@@ -247,9 +247,9 @@ function DashboardPage() {
               <Checkbox
                 checked={staleOnly}
                 onCheckedChange={(checked) => setStaleOnly(checked === true)}
-                aria-label="정체자만 보기"
+                aria-label={`${STALE_DAYS}일 이상 미진행자만 보기`}
               />
-              정체자만
+              {STALE_DAYS}일 이상 미진행자
             </label>
           </div>
         </div>

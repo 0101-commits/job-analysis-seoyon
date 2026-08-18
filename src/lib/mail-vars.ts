@@ -10,6 +10,31 @@ export const MAIL_VARIABLES = [
 
 export type MailVars = Record<string, string>;
 
+/** 메일 본문 이미지 저장소(공개 읽기 버킷). */
+export const MAIL_ASSET_BUCKET = "mail-assets";
+
+export const MAX_IMAGE_WIDTH = 600;
+export const DEFAULT_IMAGE_WIDTH = 480;
+
+/** `{이미지:파일경로|폭}` — 경로에 `|`, `{`, `}` 는 쓸 수 없다(업로드 시 파일명을 안전화한다). */
+const IMAGE_TOKEN = /\{이미지:([^|{}]+)\|(\d{1,4})\}/g;
+
+export function imageToken(path: string, width: number) {
+  return `{이미지:${path}|${clampImageWidth(width)}}`;
+}
+
+export function clampImageWidth(width: number) {
+  if (!Number.isFinite(width) || width <= 0) return DEFAULT_IMAGE_WIDTH;
+  return Math.min(Math.round(width), MAX_IMAGE_WIDTH);
+}
+
+/** 이미지 토큰의 유일한 파서. HTML 변환과 평문 폴백이 모두 이 함수를 거친다. */
+export function replaceImageTokens(text: string, render: (path: string, width: number) => string) {
+  return text.replace(IMAGE_TOKEN, (_match, path: string, width: string) =>
+    render(path.trim(), clampImageWidth(Number(width))),
+  );
+}
+
 export function renderMailText(text: string, vars: MailVars) {
   return Object.entries(vars).reduce(
     (acc, [key, value]) => acc.replaceAll(`{${key}}`, value),

@@ -395,6 +395,119 @@ export const correctField = createServerFn({ method: "POST" })
     return { ok: true, changed: true };
   });
 
+/** 정정 요청을 관리자가 participants 에 바로 반영할 수 있는 컬럼. 사번·회사는 반영 대상이 아니다. */
+const APPLICABLE_INFO_FIELDS = ["name", "email", "org_text", "grade", "role_level"] as const;
+
+interface InfoChangeField {
+  field: string;
+  current: string;
+  requested: string;
+}
+
+export const listInfoRequests = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        status: z.enum(["요청", "처리완료", "반려"]).nullable().optional(),
+      })
+      .parse(input ?? {}),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    let q = supabaseAdmin
+      .from("info_change_requests")
+      .select(
+        "id, fields, note, status, admin_note, handled_at, created_at, participants(id, name, emp_no, companies(name))",
+      )
+      .order("created_at", { ascending: false });
+    if (data.status) q = q.eq("status", data.status);
+
+    const { data: rows, error } = await q;
+    if (error) throw new Error(error.message);
+
+    const { count } = await supabaseAdmin
+      .from("info_change_requests")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "요청");
+
+    return { rows: rows ?? [], pending: count ?? 0 };
+  });
+
+export const handleInfoRequest = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        id: z.string().uuid(),
+        action: z.enum(["처리완료", "반려"]),
+        adminNote: z.string().trim().max(2000).optional(),
+        apply: z.boolean().optional(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: row } = await supabaseAdmin
+      .from("info_change_requests")
+      .select("id, participant_id, fields, status")
+      .eq("id", data.id)
+      .maybeSingle();
+    if (!row) throw new Error("정정 요청을 찾을 수 없습니다.");
+    if (row.status !== "요청") throw new Error("이미 처리된 요청입니다.");
+
+    const applied: string[] = [];
+    if (data.apply && data.action === "처리완료") {
+      const fields = (row.fields ?? []) as unknown as InfoChangeField[];
+      const patch: Record<string, string> = {};
+      for (const f of Array.isArray(fields) ? fields : []) {
+        if (!(APPLICABLE_INFO_FIELDS as readonly string[]).includes(f.field)) continue;
+        // 빈 값 요청은 반영하지 않는다 — 성명처럼 NOT NULL 인 칸을 지워 버릴 수 있다.
+        const value = (f.requested ?? "").trim();
+        if (!value) continue;
+        if (f.field === "email" && !z.string().email().safeParse(value).success) {
+          throw new Error("요청된 이메일 형식이 올바르지 않습니다.");
+        }
+        patch[f.field] = value;
+        applied.push(f.field);
+      }
+      if (applied.length > 0) {
+        const { error } = await supabaseAdmin
+          .from("participants")
+          .update(patch as Database["public"]["Tables"]["participants"]["Update"])
+          .eq("id", row.participant_id);
+        if (error) throw new Error(error.message);
+      }
+    }
+
+    const { error: updateError } = await supabaseAdmin
+      .from("info_change_requests")
+      .update({
+        status: data.action,
+        admin_note: data.adminNote?.trim() || null,
+        handled_by: context.userId,
+        handled_at: new Date().toISOString(),
+      })
+      .eq("id", row.id);
+    if (updateError) throw new Error(updateError.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: `정보 정정 요청 ${data.action}`,
+      target_type: "info_change_request",
+      target_id: row.id,
+      detail: { participant_id: row.participant_id, applied },
+    });
+
+    return { ok: true, applied };
+  });
+
 export const getJobComparison = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
