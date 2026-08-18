@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Download,
+  History,
   MoreHorizontal,
   Plus,
   Sparkles,
@@ -26,6 +27,21 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -40,6 +56,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { OrgCanvas, type CanvasRollup } from "@/components/admin/OrgCanvas";
+import { getOrgOverview, type OrgOverview } from "@/lib/dashboard.functions";
 import { parseRosterFile } from "@/lib/roster";
 import { similarity } from "@/components/survey/validation";
 import {
@@ -47,21 +65,34 @@ import {
   ORG_FIELDS,
   applyResponseMapping,
   createOrgUnit,
+  deleteCatalogVersion,
   deleteJobCatalogRow,
   deleteOrgUnit,
+  diffCatalogVersions,
+  draftDutyCharts,
   draftJobCatalog,
+  DUTY_ORG_LIMIT,
   getMasterStatus,
   jobCatalogTemplateCsv,
+  listCatalogVersions,
   listDutyCharts,
   moveOrgUnit,
   orgTemplateCsv,
+  previewImpact,
   renameOrgUnit,
+  restoreCatalogVersion,
+  saveCatalogVersion,
   suggestResponseMapping,
   uploadDutyChart,
   uploadJobCatalog,
   uploadOrgUnits,
   upsertJobCatalogRow,
+  type CatalogDiff,
+  type DutyDraftChart,
+  type DutyDraftRow,
   type EditResult,
+  type ImpactKind,
+  type ImpactPreview,
   type JobDraftRow,
   type MappingSuggestion,
   type UploadReport,
@@ -101,6 +132,112 @@ function downloadCsv(name: string, body: string) {
 
 function formatDate(value: string) {
   return new Date(value).toLocaleString("ko-KR", { dateStyle: "medium", timeStyle: "short" });
+}
+
+/* ─────────────── 변경 전 영향 확인 다이얼로그 (V14-①) ─────────────── */
+
+type PendingConfirm = {
+  title: string;
+  impact: ImpactPreview;
+  confirmLabel: string;
+  destructive?: boolean;
+  run: () => void;
+};
+
+/**
+ * previewImpact 결과가 0건이면 (always 가 아닌 한) 다이얼로그 없이 바로 실행하고,
+ * 영향이 있으면 요약 + 대상 표본을 보여준 뒤 확인을 받는다.
+ */
+function makeImpactGate(setPending: (pending: PendingConfirm) => void) {
+  return async function gate(opts: {
+    kind: ImpactKind;
+    id: string;
+    title: string;
+    confirmLabel: string;
+    destructive?: boolean;
+    always?: boolean;
+    run: () => void;
+  }) {
+    try {
+      const impact = await previewImpact({
+        data: { kind: opts.kind, id: opts.id },
+        headers: await authHeaders(),
+      });
+      if (impact.count === 0 && !opts.always) {
+        opts.run();
+        return;
+      }
+      setPending({
+        title: opts.title,
+        impact,
+        confirmLabel: opts.confirmLabel,
+        destructive: opts.destructive === true,
+        run: opts.run,
+      });
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  };
+}
+
+function ImpactConfirmDialog({
+  pending,
+  onClose,
+}: {
+  pending: PendingConfirm | null;
+  onClose: () => void;
+}) {
+  return (
+    <AlertDialog
+      open={pending !== null}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{pending?.title}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {pending?.impact.summary || "영향을 받는 대상이 없습니다. 계속할까요?"}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {pending && pending.impact.samples.length > 0 && (
+          <Collapsible>
+            <CollapsibleTrigger className="text-xs font-medium text-primary hover:underline">
+              영향 대상 보기 ({pending.impact.samples.length}건 표시
+              {pending.impact.count > pending.impact.samples.length
+                ? ` / 전체 ${pending.impact.count}건`
+                : ""}
+              )
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <ul className="mt-2 max-h-48 space-y-1 overflow-y-auto rounded-lg border p-2 text-xs text-muted-foreground">
+                {pending.impact.samples.map((sample, index) => (
+                  <li key={index}>{sample}</li>
+                ))}
+              </ul>
+            </CollapsibleContent>
+          </Collapsible>
+        )}
+        <AlertDialogFooter>
+          <AlertDialogCancel>취소</AlertDialogCancel>
+          <AlertDialogAction
+            className={
+              pending?.destructive
+                ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                : undefined
+            }
+            onClick={() => {
+              pending?.run();
+              onClose();
+            }}
+          >
+            {pending?.confirmLabel}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
 }
 
 /* ───────────────── 공통 업로더 (조직도 / 직무분류) ───────────────── */
@@ -591,11 +728,63 @@ function OrgTree({
   return <>{render("__root__", 0)}</>;
 }
 
+/** 대시보드(admin/index.tsx)와 같은 기준: 응답자 계정상태 제출/승인 = 제출 완료. */
+const ORG_DONE_STATUSES = ["제출", "승인"];
+
+/** 조직별 하위 합산 대상/제출 롤업 — 캔버스 노드의 제출률 링에 쓴다. */
+function buildCanvasRollup(overview: OrgOverview | undefined, units: OrgUnit[]): CanvasRollup | null {
+  if (!overview) return null;
+  const ids = new Set(units.map((u) => u.id));
+  const childIds = new Map<string, string[]>();
+  for (const u of units) {
+    if (!u.parent_id || !ids.has(u.parent_id)) continue;
+    const list = childIds.get(u.parent_id);
+    if (list) list.push(u.id);
+    else childIds.set(u.parent_id, [u.id]);
+  }
+
+  const own = new Map<string, { total: number; done: number }>();
+  for (const p of overview.participants) {
+    if (p.role !== "respondent" || !p.org_unit_id || !ids.has(p.org_unit_id)) continue;
+    const acc = own.get(p.org_unit_id) ?? { total: 0, done: 0 };
+    acc.total += 1;
+    if (ORG_DONE_STATUSES.includes(p.account_status)) acc.done += 1;
+    own.set(p.org_unit_id, acc);
+  }
+
+  const rollup: CanvasRollup = new Map();
+  const compute = (id: string): { total: number; done: number } => {
+    const base = own.get(id);
+    const acc = { total: base?.total ?? 0, done: base?.done ?? 0 };
+    for (const child of childIds.get(id) ?? []) {
+      const c = compute(child);
+      acc.total += c.total;
+      acc.done += c.done;
+    }
+    rollup.set(id, acc);
+    return acc;
+  };
+  for (const u of units) {
+    if (!u.parent_id || !ids.has(u.parent_id)) compute(u.id);
+  }
+  return rollup;
+}
+
 function OrgTab() {
   const { companyId } = useCompanyScope();
   const queryClient = useQueryClient();
   const [action, setAction] = useState<OrgAction | null>(null);
   const [newRoot, setNewRoot] = useState("");
+  const [orgView, setOrgView] = useState<"tree" | "canvas">("tree");
+  const [pending, setPending] = useState<PendingConfirm | null>(null);
+  const gate = makeImpactGate(setPending);
+
+  // 제출률 링 데이터. 캔버스를 열 때만 불러온다 (dashboard.functions 재사용, 수정 없음).
+  const { data: overview } = useQuery({
+    queryKey: ["org-overview"],
+    queryFn: async () => getOrgOverview({ headers: await authHeaders() }),
+    enabled: orgView === "canvas",
+  });
 
   const { data: units } = useQuery({
     queryKey: ["master-org-units", companyId],
@@ -630,26 +819,74 @@ function OrgTab() {
   function submitAction(values: { name: string; level: string; parentId: string | null }) {
     if (!action) return;
     const { kind, unit } = action;
-    edit.mutate(async () => {
-      const headers = await authHeaders();
-      if (kind === "rename") {
-        return renameOrgUnit({
-          data: { id: unit.id, name: values.name, level: values.level },
-          headers,
-        });
-      }
-      if (kind === "child") {
-        return createOrgUnit({
-          data: {
-            companyId: unit.company_id,
-            parentId: unit.id,
-            name: values.name,
-            level: values.level,
-          },
-          headers,
-        });
-      }
-      return moveOrgUnit({ data: { id: unit.id, parentId: values.parentId }, headers });
+    const run = () =>
+      edit.mutate(async () => {
+        const headers = await authHeaders();
+        if (kind === "rename") {
+          return renameOrgUnit({
+            data: { id: unit.id, name: values.name, level: values.level },
+            headers,
+          });
+        }
+        if (kind === "child") {
+          return createOrgUnit({
+            data: {
+              companyId: unit.company_id,
+              parentId: unit.id,
+              name: values.name,
+              level: values.level,
+            },
+            headers,
+          });
+        }
+        return moveOrgUnit({ data: { id: unit.id, parentId: values.parentId }, headers });
+      });
+    if (kind === "child") {
+      run();
+      return;
+    }
+    void gate({
+      kind: kind === "rename" ? "org_rename" : "org_move",
+      id: unit.id,
+      title: kind === "rename" ? `「${unit.name}」 이름 변경` : `「${unit.name}」 상위 이동`,
+      confirmLabel: kind === "rename" ? "변경" : "이동",
+      run,
+    });
+  }
+
+  const canvasRollup = useMemo(() => buildCanvasRollup(overview, units ?? []), [overview, units]);
+
+  function handleDelete(unit: OrgUnit) {
+    void gate({
+      kind: "org_delete",
+      id: unit.id,
+      title: `「${unit.name}」 조직 삭제`,
+      confirmLabel: "삭제",
+      destructive: true,
+      always: true,
+      run: () =>
+        edit.mutate(async () =>
+          deleteOrgUnit({ data: { id: unit.id }, headers: await authHeaders() }),
+        ),
+    });
+  }
+
+  /** 캔버스에서 노드를 다른 노드에 드롭 = 상위 이동. 서버 moveOrgUnit 이 순환을 최종 검증한다. */
+  function handleDropMove(unit: OrgUnit, target: OrgUnit) {
+    if (unit.company_id !== target.company_id) {
+      toast.error("같은 계열사 안의 조직으로만 옮길 수 있습니다.");
+      return;
+    }
+    void gate({
+      kind: "org_move",
+      id: unit.id,
+      title: `「${unit.name}」 을(를) 「${target.name}」 하위로 이동`,
+      confirmLabel: "이동",
+      always: true,
+      run: () =>
+        edit.mutate(async () =>
+          moveOrgUnit({ data: { id: unit.id, parentId: target.id }, headers: await authHeaders() }),
+        ),
     });
   }
 
@@ -685,7 +922,27 @@ function OrgTab() {
 
       <div className="rounded-xl border bg-card p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-sm font-medium">조직 트리 {units ? `(${units.length})` : ""}</p>
+          <div className="flex items-center gap-2">
+            <p className="text-sm font-medium">조직도 {units ? `(${units.length})` : ""}</p>
+            <div className="flex items-center rounded-lg border p-0.5">
+              <Button
+                size="sm"
+                variant={orgView === "tree" ? "secondary" : "ghost"}
+                className="h-6 px-2 text-xs"
+                onClick={() => setOrgView("tree")}
+              >
+                트리
+              </Button>
+              <Button
+                size="sm"
+                variant={orgView === "canvas" ? "secondary" : "ghost"}
+                className="h-6 px-2 text-xs"
+                onClick={() => setOrgView("canvas")}
+              >
+                캔버스
+              </Button>
+            </div>
+          </div>
           <div className="flex items-center gap-2">
             <Input
               className="h-8 w-40"
@@ -723,23 +980,47 @@ function OrgTab() {
           배정 인원이 있는 조직은 삭제되지 않습니다.
           {companyId === "all" && " 최상위 추가는 계열사를 선택한 뒤 사용하세요."}
         </p>
-        <div className="mt-3">
-          <OrgTree
-            units={units ?? []}
-            action={action}
-            busy={edit.isPending}
-            onAction={setAction}
-            onCancel={() => setAction(null)}
-            onSubmit={submitAction}
-            onDelete={(unit) => {
-              if (!window.confirm(`「${unit.name}」 조직을 삭제할까요?`)) return;
-              edit.mutate(async () =>
-                deleteOrgUnit({ data: { id: unit.id }, headers: await authHeaders() }),
-              );
-            }}
-          />
-        </div>
+        {orgView === "tree" ? (
+          <div className="mt-3">
+            <OrgTree
+              units={units ?? []}
+              action={action}
+              busy={edit.isPending}
+              onAction={setAction}
+              onCancel={() => setAction(null)}
+              onSubmit={submitAction}
+              onDelete={handleDelete}
+            />
+          </div>
+        ) : (
+          <div className="mt-3 space-y-2">
+            {action && (
+              <OrgNodeEditor
+                key={`${action.kind}-${action.unit.id}`}
+                action={action}
+                units={units ?? []}
+                busy={edit.isPending}
+                onCancel={() => setAction(null)}
+                onSubmit={submitAction}
+              />
+            )}
+            <OrgCanvas
+              units={units ?? []}
+              rollup={canvasRollup}
+              busy={edit.isPending}
+              onAction={setAction}
+              onDelete={handleDelete}
+              onDropMove={handleDropMove}
+            />
+            <p className="text-xs text-muted-foreground">
+              휠로 확대·축소, 빈 곳을 끌어 이동합니다. 노드를 다른 노드 위에 끌어 놓으면 그 조직의
+              하위로 이동합니다. 링은 하위 조직을 합산한 제출률입니다.
+            </p>
+          </div>
+        )}
       </div>
+
+      <ImpactConfirmDialog pending={pending} onClose={() => setPending(null)} />
     </div>
   );
 }
@@ -817,6 +1098,8 @@ function JobRowEditor({
 function JobCatalogList() {
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState<JobEdit | null>(null);
+  const [pending, setPending] = useState<PendingConfirm | null>(null);
+  const gate = makeImpactGate(setPending);
 
   const { data: rows } = useQuery({
     queryKey: ["master-job-catalog"],
@@ -848,19 +1131,31 @@ function JobCatalogList() {
   });
 
   function save(values: JobEdit) {
-    edit.mutate(async () =>
-      upsertJobCatalogRow({
-        data: {
-          id: values.id,
-          job_group: values.job_group.trim(),
-          job_series: values.job_series.trim(),
-          job_name: values.job_name.trim(),
-          definition: values.definition.trim(),
-          companyIds: [],
-        },
-        headers: await authHeaders(),
-      }),
-    );
+    const run = () =>
+      edit.mutate(async () =>
+        upsertJobCatalogRow({
+          data: {
+            id: values.id,
+            job_group: values.job_group.trim(),
+            job_series: values.job_series.trim(),
+            job_name: values.job_name.trim(),
+            definition: values.definition.trim(),
+            companyIds: [],
+          },
+          headers: await authHeaders(),
+        }),
+      );
+    if (!values.id) {
+      run();
+      return;
+    }
+    void gate({
+      kind: "catalog_row_update",
+      id: values.id,
+      title: `「${values.job_name.trim()}」 직무 수정`,
+      confirmLabel: "수정",
+      run,
+    });
   }
 
   // 직군 → 직렬 → 행 으로 묶는다. 쿼리에서 이미 정렬돼 오므로 삽입 순서를 그대로 쓴다.
@@ -962,16 +1257,23 @@ function JobCatalogList() {
                               variant="ghost"
                               className="h-7 text-destructive"
                               disabled={edit.isPending}
-                              onClick={() => {
-                                if (!window.confirm(`「${row.job_name}」 을(를) 삭제할까요?`))
-                                  return;
-                                edit.mutate(async () =>
-                                  deleteJobCatalogRow({
-                                    data: { id: row.id },
-                                    headers: await authHeaders(),
-                                  }),
-                                );
-                              }}
+                              onClick={() =>
+                                void gate({
+                                  kind: "catalog_row_delete",
+                                  id: row.id,
+                                  title: `「${row.job_name}」 직무 삭제`,
+                                  confirmLabel: "삭제",
+                                  destructive: true,
+                                  always: true,
+                                  run: () =>
+                                    edit.mutate(async () =>
+                                      deleteJobCatalogRow({
+                                        data: { id: row.id },
+                                        headers: await authHeaders(),
+                                      }),
+                                    ),
+                                })
+                              }
                             >
                               삭제
                             </Button>
@@ -986,6 +1288,255 @@ function JobCatalogList() {
           })}
         </Accordion>
       )}
+
+      <ImpactConfirmDialog pending={pending} onClose={() => setPending(null)} />
+    </div>
+  );
+}
+
+/* ──────────────── 직무분류 버전 관리 (V6) ──────────────── */
+
+function CatalogVersionPanel() {
+  const queryClient = useQueryClient();
+  const [pending, setPending] = useState<PendingConfirm | null>(null);
+  const gate = makeImpactGate(setPending);
+  const [label, setLabel] = useState("");
+  const [baseId, setBaseId] = useState("current");
+  const [diff, setDiff] = useState<CatalogDiff | null>(null);
+
+  const { data: versions } = useQuery({
+    queryKey: ["catalog-versions"],
+    queryFn: async () => listCatalogVersions({ headers: await authHeaders() }),
+  });
+
+  function invalidateVersions() {
+    void queryClient.invalidateQueries({ queryKey: ["catalog-versions"] });
+  }
+
+  const save = useMutation({
+    mutationFn: async () =>
+      saveCatalogVersion({ data: { label: label.trim() }, headers: await authHeaders() }),
+    onSuccess: (result) => {
+      if (!result.ok) {
+        toast.error(result.message);
+        return;
+      }
+      toast.success(result.message);
+      setLabel("");
+      invalidateVersions();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const remove = useMutation({
+    mutationFn: async (id: string) =>
+      deleteCatalogVersion({ data: { id }, headers: await authHeaders() }),
+    onSuccess: (result) => {
+      if (!result.ok) {
+        toast.error(result.message);
+        return;
+      }
+      toast.success(result.message);
+      setDiff(null);
+      invalidateVersions();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const restore = useMutation({
+    mutationFn: async (id: string) =>
+      restoreCatalogVersion({ data: { id }, headers: await authHeaders() }),
+    onSuccess: (result) => {
+      if (!result.ok) {
+        toast.error(result.message);
+        return;
+      }
+      toast.success(result.message);
+      setDiff(null);
+      invalidateVersions();
+      void queryClient.invalidateQueries({ queryKey: ["master-job-catalog"] });
+      void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const compare = useMutation({
+    mutationFn: async (id: string) =>
+      diffCatalogVersions({
+        data: { id, againstId: baseId === "current" ? null : baseId },
+        headers: await authHeaders(),
+      }),
+    onSuccess: setDiff,
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const busy = save.isPending || remove.isPending || restore.isPending || compare.isPending;
+
+  return (
+    <div className="space-y-3 rounded-xl border bg-card p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-sm font-medium">
+            버전 관리 {versions ? `(${versions.length})` : ""}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            AI 가안 반영·업로드 교체·복원 전에 자동 백업 버전이 만들어집니다. 개별 행 편집은 버전을
+            만들지 않습니다.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Input
+            className="h-8 w-44"
+            value={label}
+            placeholder="버전 라벨(비우면 자동)"
+            aria-label="버전 라벨"
+            onChange={(e) => setLabel(e.target.value)}
+          />
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => save.mutate()}>
+            <History className="size-4" />
+            현재 버전 저장
+          </Button>
+        </div>
+      </div>
+
+      {(versions ?? []).length === 0 ? (
+        <p className="text-sm text-muted-foreground">저장된 버전이 없습니다.</p>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-muted-foreground">비교 기준</span>
+            <Select value={baseId} onValueChange={setBaseId}>
+              <SelectTrigger className="h-8 w-56" aria-label="비교 기준 선택">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="current">현재 직무분류표</SelectItem>
+                {versions?.map((v) => (
+                  <SelectItem key={v.id} value={v.id}>
+                    {v.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <ul className="divide-y rounded-lg border text-sm">
+            {versions?.map((v) => (
+              <li key={v.id} className="flex flex-wrap items-center gap-2 px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-medium">{v.label}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {formatDate(v.createdAt)} · {v.rowCount}행
+                    {v.note ? ` · ${v.note}` : ""}
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7"
+                  disabled={busy || v.id === baseId}
+                  onClick={() => compare.mutate(v.id)}
+                >
+                  비교
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7"
+                  disabled={busy}
+                  onClick={() =>
+                    void gate({
+                      kind: "catalog_restore",
+                      id: v.id,
+                      title: `「${v.label}」 버전으로 복원`,
+                      confirmLabel: "복원",
+                      destructive: true,
+                      always: true,
+                      run: () => restore.mutate(v.id),
+                    })
+                  }
+                >
+                  복원
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 text-destructive"
+                  disabled={busy}
+                  onClick={() => {
+                    if (!window.confirm(`「${v.label}」 버전을 삭제할까요?`)) return;
+                    remove.mutate(v.id);
+                  }}
+                >
+                  삭제
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      {diff && (
+        <div className="space-y-2 rounded-lg border p-3 text-xs">
+          <div className="flex items-center justify-between gap-2">
+            <p className="font-medium">
+              「{diff.aLabel}」 ↔ 「{diff.bLabel}」 비교
+            </p>
+            <Button size="sm" variant="ghost" className="h-7" onClick={() => setDiff(null)}>
+              <X className="size-4" />
+              닫기
+            </Button>
+          </div>
+          {diff.onlyA.length === 0 && diff.onlyB.length === 0 && diff.changed.length === 0 ? (
+            <p className="text-muted-foreground">두 버전의 직무 구성이 같습니다.</p>
+          ) : (
+            <>
+              {diff.onlyB.length > 0 && (
+                <div>
+                  <p className="font-medium text-primary">
+                    {diff.bLabel}에만 있음 — 추가된 직무 {diff.onlyB.length}건
+                  </p>
+                  <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto">
+                    {diff.onlyB.map((key) => (
+                      <li key={key}>{key}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {diff.onlyA.length > 0 && (
+                <div>
+                  <p className="font-medium text-destructive">
+                    {diff.aLabel}에만 있음 — 삭제된 직무 {diff.onlyA.length}건
+                  </p>
+                  <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto">
+                    {diff.onlyA.map((key) => (
+                      <li key={key}>{key}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {diff.changed.length > 0 && (
+                <div>
+                  <p className="font-medium">정의 변경 {diff.changed.length}건</p>
+                  <ul className="mt-1 max-h-40 space-y-1 overflow-y-auto">
+                    {diff.changed.map((item) => (
+                      <li key={item.key}>
+                        <span className="font-medium">{item.key}</span>
+                        <span className="text-muted-foreground">
+                          {" "}
+                          — {item.a || "(정의 없음)"} → {item.b || "(정의 없음)"}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      <ImpactConfirmDialog pending={pending} onClose={() => setPending(null)} />
     </div>
   );
 }
@@ -993,13 +1544,33 @@ function JobCatalogList() {
 function JobDraftPanel({ onApplied }: { onApplied: () => void }) {
   const [draft, setDraft] = useState<JobDraftRow[] | null>(null);
   const [report, setReport] = useState<UploadReport | null>(null);
+  const [failedGroups, setFailedGroups] = useState<string[]>([]);
 
+  // groups 지정 시 해당 직군만 재생성해 기존 가안과 병합한다(부분 실패 복구).
   const generate = useMutation({
-    mutationFn: async () => draftJobCatalog({ headers: await authHeaders() }),
-    onSuccess: (result) => {
-      setDraft(result.rows);
+    mutationFn: async (groups: string[] | null) =>
+      draftJobCatalog({
+        data: groups && groups.length > 0 ? { groups } : {},
+        headers: await authHeaders(),
+      }),
+    onSuccess: (result, groups) => {
+      if (groups && groups.length > 0) {
+        const regenerated = new Set(groups);
+        setDraft((prev) => [
+          ...(prev ?? []).filter((row) => !regenerated.has(row.job_group)),
+          ...result.rows,
+        ]);
+      } else {
+        setDraft(result.rows);
+      }
+      setFailedGroups(result.failedGroups);
       setReport(null);
       toast.success(`직무 ${result.rows.length}건의 가안을 만들었습니다. 검토 후 반영하세요.`);
+      if (result.failedGroups.length > 0) {
+        toast.error(
+          `일부 직군 생성에 실패했습니다: ${result.failedGroups.join(", ")} — 실패 직군만 다시 생성할 수 있습니다.`,
+        );
+      }
     },
     onError: (err) => toast.error(errorMessage(err)),
   });
@@ -1011,6 +1582,7 @@ function JobDraftPanel({ onApplied }: { onApplied: () => void }) {
       return uploadJobCatalog({
         data: {
           confirm: true,
+          source: "ai_draft",
           rows: rows.map((r) => ({
             job_group: r.job_group,
             job_series: r.job_series,
@@ -1051,11 +1623,34 @@ function JobDraftPanel({ onApplied }: { onApplied: () => void }) {
             AI에 전달하지 않습니다. 가안은 아래 표에서 고친 뒤 반영됩니다.
           </p>
         </div>
-        <Button size="sm" disabled={generate.isPending} onClick={() => generate.mutate()}>
+        <Button size="sm" disabled={generate.isPending} onClick={() => generate.mutate(null)}>
           <Wand2 className="size-4" />
           {generate.isPending ? "생성 중..." : "AI 가안 생성"}
         </Button>
       </div>
+
+      {failedGroups.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
+          <AlertTriangle className="size-4 shrink-0 text-destructive" />
+          <span className="text-xs">생성 실패 직군:</span>
+          {failedGroups.map((name) => (
+            <span
+              key={name}
+              className="rounded-full bg-destructive/10 px-2 py-0.5 text-xs font-medium text-destructive"
+            >
+              {name}
+            </span>
+          ))}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={generate.isPending}
+            onClick={() => generate.mutate(failedGroups)}
+          >
+            {generate.isPending ? "생성 중..." : "실패 직군만 다시 생성"}
+          </Button>
+        </div>
+      )}
 
       {draft && draft.length > 0 && (
         <>
@@ -1119,7 +1714,14 @@ function JobDraftPanel({ onApplied }: { onApplied: () => void }) {
             <Button size="sm" disabled={apply.isPending} onClick={() => apply.mutate()}>
               가안 {draft.length}건 반영
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => setDraft(null)}>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setDraft(null);
+                setFailedGroups([]);
+              }}
+            >
               가안 버리기
             </Button>
             <span className="text-xs text-muted-foreground">
@@ -1189,6 +1791,7 @@ function JobTab() {
           setSuggestions(null);
           void queryClient.invalidateQueries({ queryKey: ["master-job-catalog"] });
           void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+          void queryClient.invalidateQueries({ queryKey: ["catalog-versions"] });
         }}
       />
 
@@ -1197,10 +1800,13 @@ function JobTab() {
           setSuggestions(null);
           void queryClient.invalidateQueries({ queryKey: ["master-job-catalog"] });
           void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+          void queryClient.invalidateQueries({ queryKey: ["catalog-versions"] });
         }}
       />
 
       <JobCatalogList />
+
+      <CatalogVersionPanel />
 
       <div className="space-y-3 rounded-xl border bg-card p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1295,6 +1901,271 @@ function JobTab() {
 
 /* ──────────────────────── ③ 업무분장 ──────────────────────── */
 
+/** AI 업무분장 가안 (V8). 생성 → 편집 가능한 검토 표 → 확인 후 조직별 uploadDutyChart 로 반영. */
+function DutyDraftPanel({ onApplied }: { onApplied: () => void }) {
+  const [charts, setCharts] = useState<DutyDraftChart[] | null>(null);
+  const [failedOrgs, setFailedOrgs] = useState<{ orgId: string; orgName: string }[]>([]);
+  const [skipped, setSkipped] = useState(0);
+
+  // orgIds 지정 시 해당 조직만 재생성해 기존 가안과 병합한다(부분 실패 복구).
+  const generate = useMutation({
+    mutationFn: async (orgIds: string[] | null) =>
+      draftDutyCharts({
+        data: orgIds && orgIds.length > 0 ? { orgIds } : {},
+        headers: await authHeaders(),
+      }),
+    onSuccess: (result, orgIds) => {
+      if (orgIds && orgIds.length > 0) {
+        const regenerated = new Set(result.charts.map((c) => c.orgId));
+        setCharts((prev) => [
+          ...(prev ?? []).filter((c) => !regenerated.has(c.orgId)),
+          ...result.charts,
+        ]);
+      } else {
+        setCharts(result.charts);
+      }
+      setFailedOrgs(result.failedOrgs);
+      setSkipped(result.skippedOrgs);
+      toast.success(
+        `${result.charts.length}개 조직의 업무분장 가안을 만들었습니다. 검토 후 반영하세요.`,
+      );
+      if (result.failedOrgs.length > 0) {
+        toast.error(
+          `일부 조직 생성 실패: ${result.failedOrgs.map((f) => f.orgName).join(", ")} — 실패 조직만 다시 생성할 수 있습니다.`,
+        );
+      }
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const apply = useMutation({
+    mutationFn: async () => {
+      const ready = (charts ?? [])
+        .map((c) => ({
+          ...c,
+          rows: c.rows.filter((r) => r.main.trim() !== "" || r.detail.trim() !== ""),
+        }))
+        .filter((c) => c.rows.length > 0);
+      if (ready.length === 0) throw new Error("반영할 조직이 없습니다.");
+      const headers = await authHeaders();
+      // 조직 단위로 기존 uploadDutyChart 를 재사용한다(해당 조직 행 교체 + 스냅샷 + 감사 로그).
+      const settled = await Promise.allSettled(
+        ready.map((c) =>
+          uploadDutyChart({
+            data: {
+              confirm: true,
+              companyId: c.companyId,
+              orgName: c.orgName,
+              rows: c.rows.map((r) => ({ "주요 업무": r.main.trim(), "세부 업무": r.detail.trim() })),
+            },
+            headers,
+          }),
+        ),
+      );
+      const failed = ready.filter((_, i) => settled[i]!.status === "rejected");
+      return { applied: ready.length - failed.length, failed };
+    },
+    onSuccess: ({ applied, failed }) => {
+      if (applied > 0) toast.success(`${applied}개 조직의 업무분장표를 반영했습니다.`);
+      if (failed.length > 0) {
+        toast.error(`반영 실패: ${failed.map((c) => c.orgName).join(", ")} — 표에 남겨두었습니다.`);
+        setCharts(failed);
+      } else {
+        setCharts(null);
+        setFailedOrgs([]);
+      }
+      onApplied();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  function updateRow(ci: number, ri: number, key: keyof DutyDraftRow, value: string) {
+    setCharts((prev) =>
+      (prev ?? []).map((c, i) =>
+        i === ci
+          ? { ...c, rows: c.rows.map((r, j) => (j === ri ? { ...r, [key]: value } : r)) }
+          : c,
+      ),
+    );
+  }
+
+  const totalRows = (charts ?? []).reduce((sum, c) => sum + c.rows.length, 0);
+  const busy = generate.isPending || apply.isPending;
+
+  return (
+    <div className="space-y-3 rounded-xl border bg-card p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-sm font-medium">AI 업무분장 가안</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            인원이 배정된 조직 전체(최대 {DUTY_ORG_LIMIT}개, 배정 인원 많은 순)를 대상으로 조직별
+            「주요 업무 → 세부 업무」 초안을 만듭니다. 근거는 조직도·직급 분포·제출 응답의 과업
+            집계이며 참여자 이름·사번은 AI에 전달하지 않습니다. 반영 전 아래 표에서 검토·수정합니다.
+          </p>
+        </div>
+        <Button size="sm" disabled={busy} onClick={() => generate.mutate(null)}>
+          <Wand2 className="size-4" />
+          {generate.isPending ? "생성 중..." : "AI 가안 생성"}
+        </Button>
+      </div>
+
+      {skipped > 0 && (
+        <p className="text-xs text-muted-foreground">
+          대상 상한을 넘어 {skipped}개 조직이 이번 생성에서 빠졌습니다. 반영 후 다시 생성하면 이어서
+          만들 수 있습니다.
+        </p>
+      )}
+
+      {failedOrgs.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
+          <AlertTriangle className="size-4 shrink-0 text-destructive" />
+          <span className="text-xs">생성 실패 조직:</span>
+          {failedOrgs.map((f) => (
+            <span
+              key={f.orgId}
+              className="rounded-full bg-destructive/10 px-2 py-0.5 text-xs font-medium text-destructive"
+            >
+              {f.orgName}
+            </span>
+          ))}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => generate.mutate(failedOrgs.map((f) => f.orgId))}
+          >
+            {generate.isPending ? "생성 중..." : "실패 조직만 다시 생성"}
+          </Button>
+        </div>
+      )}
+
+      {charts && charts.length > 0 && (
+        <>
+          <div className="max-h-[480px] space-y-3 overflow-y-auto pr-1">
+            {charts.map((chart, ci) => (
+              <div key={chart.orgId} className="rounded-lg border p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-sm font-semibold">
+                    {chart.orgName}
+                    <span className="ml-2 text-xs font-normal text-primary">
+                      {chart.companyName}
+                    </span>
+                    <span className="ml-2 text-xs font-normal text-muted-foreground">
+                      배정 {chart.memberCount}명 · {chart.rows.length}행
+                    </span>
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 text-destructive"
+                    onClick={() => setCharts((prev) => (prev ?? []).filter((_, i) => i !== ci))}
+                  >
+                    조직 제외
+                  </Button>
+                </div>
+                <table className="mt-2 w-full min-w-[420px] text-xs">
+                  <thead className="text-left text-muted-foreground">
+                    <tr>
+                      <th className="w-2/5 px-1 py-1 font-medium">주요 업무</th>
+                      <th className="px-1 py-1 font-medium">세부 업무</th>
+                      <th className="w-14 px-1 py-1" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {chart.rows.map((row, ri) => (
+                      <tr key={ri} className="border-t">
+                        <td className="px-1 py-1">
+                          <Input
+                            className="h-8"
+                            value={row.main}
+                            aria-label={`${chart.orgName} ${ri + 1}번째 행 주요 업무`}
+                            onChange={(e) => updateRow(ci, ri, "main", e.target.value)}
+                          />
+                        </td>
+                        <td className="px-1 py-1">
+                          <Input
+                            className="h-8"
+                            value={row.detail}
+                            aria-label={`${chart.orgName} ${ri + 1}번째 행 세부 업무`}
+                            onChange={(e) => updateRow(ci, ri, "detail", e.target.value)}
+                          />
+                        </td>
+                        <td className="px-1 py-1">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 text-destructive"
+                            onClick={() =>
+                              setCharts((prev) =>
+                                (prev ?? []).map((c, i) =>
+                                  i === ci
+                                    ? { ...c, rows: c.rows.filter((_, j) => j !== ri) }
+                                    : c,
+                                ),
+                              )
+                            }
+                          >
+                            삭제
+                          </Button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="mt-2 h-7"
+                  onClick={() =>
+                    setCharts((prev) =>
+                      (prev ?? []).map((c, i) =>
+                        i === ci ? { ...c, rows: [...c.rows, { main: "", detail: "" }] } : c,
+                      ),
+                    )
+                  }
+                >
+                  <Plus className="size-4" />행 추가
+                </Button>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              disabled={busy}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    `${charts.length}개 조직의 업무분장표(총 ${totalRows}행)를 반영할까요? 같은 조직의 기존 업무분장표는 교체되며, 변경 전 내용은 변경 기록에 저장됩니다.`,
+                  )
+                )
+                  return;
+                apply.mutate();
+              }}
+            >
+              {apply.isPending ? "반영 중..." : `가안 ${charts.length}개 조직 반영`}
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setCharts(null);
+                setFailedOrgs([]);
+              }}
+            >
+              가안 버리기
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              반영 전에는 DB에 저장되지 않습니다.
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function DutyTab() {
   const { companyId } = useCompanyScope();
   const queryClient = useQueryClient();
@@ -1363,6 +2234,13 @@ function DutyTab() {
 
   return (
     <div className="space-y-6">
+      <DutyDraftPanel
+        onApplied={() => {
+          void queryClient.invalidateQueries({ queryKey: ["duty-charts"] });
+          void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+        }}
+      />
+
       <div className="space-y-4 rounded-xl border bg-card p-4">
         <p className="text-xs text-muted-foreground">
           자유 양식 그대로 업로드합니다. 모든 열이 보존되며 같은 회사·조직명으로 다시 올리면 이전

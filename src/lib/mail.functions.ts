@@ -251,6 +251,115 @@ export const countRecipients = createServerFn({ method: "POST" })
     return { count: targets.length };
   });
 
+/** 발송 확인 다이얼로그용 실제 수신 대상 명단. countRecipients 와 같은 selectTargets 를 쓴다. */
+export const listRecipientPreview = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => filtersSchema.parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { selectTargets } = await import("@/lib/mailer.server");
+    const targets = await selectTargets(supabaseAdmin, {
+      companyId: data.companyId ?? null,
+      statuses: data.statuses ?? [],
+    });
+    return {
+      count: targets.length,
+      recipients: targets.map((t) => ({ name: t.name, email: t.email as string })),
+    };
+  });
+
+/**
+ * 예약 배치 취소. mail_batches.status CHECK 에 '취소' 가 없어(DB 변경 불가) 배치 행을 삭제한다.
+ * 예약 배치는 발송 전이라 mail_logs 가 없으므로 잃는 발송 기록이 없고, 취소 사실은 audit_logs 에 남긴다.
+ * '예약' 상태 조건부 삭제라 크론의 '예약'→'대기' 선점과 경합해도 한쪽만 성공한다.
+ */
+export const cancelScheduledBatch = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ batchId: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: batch } = await supabaseAdmin
+      .from("mail_batches")
+      .select("id, name, status, scheduled_at")
+      .eq("id", data.batchId)
+      .maybeSingle();
+    if (!batch) throw new Error("배치를 찾을 수 없습니다.");
+    if (batch.status !== "예약") throw new Error("예약 상태의 배치만 취소할 수 있습니다.");
+
+    const { data: deleted, error } = await supabaseAdmin
+      .from("mail_batches")
+      .delete()
+      .eq("id", data.batchId)
+      .eq("status", "예약")
+      .select("id");
+    if (error) throw new Error(error.message);
+    if (!deleted?.length) throw new Error("이미 발송이 시작되어 취소할 수 없습니다.");
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "메일 예약 취소",
+      target_type: "mail_batch",
+      target_id: data.batchId,
+      detail: { name: batch.name, scheduled_at: batch.scheduled_at },
+    });
+    return { ok: true };
+  });
+
+/**
+ * 배치의 실패 건만 모아 재발송한다(개별 재발송과 같은 파이프라인, 건별 새 로그 기록).
+ * 이미 개별 재발송으로 회복된 참여자는 건너뛰어 중복 발송을 막는다.
+ */
+export const resendFailedLogs = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ batchId: z.string().uuid(), origin: z.string().url().optional() }).parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { resendLog } = await import("@/lib/mailer.server");
+
+    const { data: logs, error } = await supabaseAdmin
+      .from("mail_logs")
+      .select("id, participant_id, status, sent_at")
+      .eq("batch_id", data.batchId)
+      .order("sent_at");
+    if (error) throw new Error(error.message);
+
+    const recovered = new Set(
+      (logs ?? [])
+        .filter((l) => l.status !== "실패" && l.participant_id)
+        .map((l) => l.participant_id),
+    );
+    const fails = (logs ?? []).filter(
+      (l) => l.status === "실패" && (!l.participant_id || !recovered.has(l.participant_id)),
+    );
+    if (!fails.length) return { total: 0, ok: 0, failed: 0 };
+
+    let ok = 0;
+    let failed = 0;
+    for (const log of fails) {
+      const { status } = await resendLog(supabaseAdmin, log.id, data.origin ?? null);
+      if (status === "실패") failed += 1;
+      else ok += 1;
+    }
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "실패 건 일괄 재발송",
+      target_type: "mail_batch",
+      target_id: data.batchId,
+      detail: { total: fails.length, ok, failed },
+    });
+    return { total: fails.length, ok, failed };
+  });
+
 export const listBatches = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {

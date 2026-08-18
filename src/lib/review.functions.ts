@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
-import type { Database } from "@/integrations/supabase/types";
+import type { Database, Json } from "@/integrations/supabase/types";
 import { fetchAll } from "./paginate";
 
 /** 직무별 응답 수 집계에 포함되는 상태 (초안·반려는 제외) */
@@ -29,7 +29,7 @@ type CorrectableTable = keyof typeof CORRECTABLE;
 
 const queueInput = z.object({
   companyId: z.string().uuid().nullable().optional(),
-  status: z.enum(["submitted", "rejected", "approved"]).nullable().optional(),
+  status: z.enum(["draft", "submitted", "rejected", "approved"]).nullable().optional(),
   jobName: z.string().trim().max(120).optional(),
 });
 
@@ -67,7 +67,6 @@ function queuePage(
     .select(
       "id, job_group, job_series, job_name, status, submitted_at, updated_at, company_id, companies(name), participants(name, emp_no, org_text, grade, role_level, account_status)",
     )
-    .neq("status", "draft")
     // submitted_at 은 중복될 수 있다. id 를 덧붙여야 페이지 경계에서 행이 새거나 겹치지 않는다.
     .order("submitted_at", { ascending: false })
     .order("id")
@@ -150,6 +149,44 @@ export const getResponseDetail = createServerFn({ method: "POST" })
       },
       jobCount: row.job_name ? (counts[row.job_name] ?? 0) : 0,
     };
+  });
+
+/** V15-1 재제출 스냅샷 — 목록(seq, created_at)을 반환하고, seq 를 주면 그 시점 payload 도 함께 반환. */
+export const getSubmissionSnapshots = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({ responseId: z.string().uuid(), seq: z.number().int().min(1).optional() })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    // ponytail: submission_snapshots 가 생성 types.ts 에 아직 없어 untyped 캐스팅 — 재생성 시 제거.
+    const db = supabaseAdmin as unknown as { from: (t: string) => any };
+
+    const { data: list, error } = await db
+      .from("submission_snapshots")
+      .select("seq, created_at")
+      .eq("response_id", data.responseId)
+      .order("seq");
+    if (error) throw new Error(error.message);
+
+    let payload: Json | null = null;
+    if (data.seq !== undefined) {
+      const { data: row, error: payloadError } = await db
+        .from("submission_snapshots")
+        .select("payload")
+        .eq("response_id", data.responseId)
+        .eq("seq", data.seq)
+        .maybeSingle();
+      if (payloadError) throw new Error(payloadError.message);
+      payload = (row?.payload ?? null) as Json | null;
+    }
+
+    return { list: (list ?? []) as { seq: number; created_at: string }[], payload };
   });
 
 export const approveResponse = createServerFn({ method: "POST" })
@@ -314,7 +351,7 @@ export const correctField = createServerFn({ method: "POST" })
       .parse(input),
   )
   .handler(async ({ data, context }) => {
-    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    const { requireAdmin, writeAudit, touchResponse } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -383,6 +420,10 @@ export const correctField = createServerFn({ method: "POST" })
 
     const { error } = await db.from(table).update(patch).eq("id", data.id);
     if (error) throw new Error(error.message);
+
+    // 자식 테이블 정정은 responses.updated_at 트리거를 안 태운다. 부모를 밀어야
+    // 참여자의 다음 저장(save_*_tx 낙관적 락)이 이 정정과의 충돌을 감지한다.
+    if (table !== "responses") await touchResponse(supabaseAdmin, data.responseId);
 
     await writeAudit(supabaseAdmin, {
       actor_id: context.userId,

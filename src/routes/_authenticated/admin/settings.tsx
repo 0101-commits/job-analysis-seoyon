@@ -42,6 +42,55 @@ export const Route = createFileRoute("/_authenticated/admin/settings")({
 
 type ReminderTarget = (typeof REMINDER_TARGETS)[number];
 
+/** 고객 질의 대응용 보안 현황. 정적 콘텐츠(DB 조회 없음). */
+const SECURITY_ROWS: { title: string; state: "적용" | "옵션" | "실명 구조"; desc: string }[] = [
+  {
+    title: "행 단위 접근 통제(RLS)",
+    state: "적용",
+    desc: "전 18개 테이블 활성. 응답자는 본인 데이터만, 관리자는 역할 검증 후 전체를 볼 수 있습니다.",
+  },
+  {
+    title: "권한 상승 차단",
+    state: "적용",
+    desc: "응답자는 자기 인사정보를 수정할 수 없습니다(접속 시각만 기록 가능). 자가 승인·계열사 위조·AI 제안 위조는 전부 DB 레벨에서 차단됩니다.",
+  },
+  {
+    title: "로그인 보호",
+    state: "적용",
+    desc: "5회 실패 시 30분 잠금. 계정 존재 여부와 남은 횟수는 노출하지 않습니다.",
+  },
+  {
+    title: "초기 비밀번호",
+    state: "적용",
+    desc: "최초 로그인 시 변경을 강제하고, 변경 완료 즉시 서버에서 삭제합니다.",
+  },
+  {
+    title: "검토 이력 통제",
+    state: "적용",
+    desc: "관리자 정정 이력은 응답자에게 노출되지 않고, 반려 사유만 전달됩니다.",
+  },
+  {
+    title: "AI 개인정보 배제",
+    state: "적용",
+    desc: "AI 프롬프트에 이름·사번·이메일을 포함하지 않습니다(집계값만 사용).",
+  },
+  {
+    title: "변경 기록",
+    state: "적용",
+    desc: "승인·반려·정정·마스터 변경 등 주요 행위를 행위자·시각과 함께 기록합니다.",
+  },
+  {
+    title: "내보내기 익명화",
+    state: "옵션",
+    desc: "파일 내보내기 시 성명·사번·이메일을 제거하는 옵션을 제공합니다. 생년월일은 항상 포함되지 않습니다.",
+  },
+  {
+    title: "응답-작성자 연결",
+    state: "실명 구조",
+    desc: "본 조사는 검토·반려 워크플로가 필요한 실명 조사로, 응답이 참여자와 직접 연결됩니다. 익명 조사 전환이 필요하면 별도 설계가 필요합니다.",
+  },
+];
+
 type SurveyDraft = {
   deadline: string;
   reminderDays: string;
@@ -234,6 +283,7 @@ function SettingsPage() {
             <TabsTrigger value="password">초기 비밀번호</TabsTrigger>
             <TabsTrigger value="survey">계열사 운영</TabsTrigger>
             <TabsTrigger value="levels">역할단계</TabsTrigger>
+            <TabsTrigger value="security">보안</TabsTrigger>
           </TabsList>
 
           {/* 0. 운영 기본 — 허용 도메인 + 연결 상태 */}
@@ -583,6 +633,39 @@ function SettingsPage() {
                 <Save className="size-4" />
                 저장
               </Button>
+            </section>
+          </TabsContent>
+
+          {/* 4. 보안 현황 — 읽기 전용(고객 질의 대응용) */}
+          <TabsContent value="security" className="mt-4 space-y-4">
+            <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
+              <div>
+                <h2 className="font-semibold">보안 장치 현황</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  현재 시스템에 적용된 보안 장치 현황입니다. 이 화면은 확인용이며, 각 항목은 서버와
+                  데이터베이스 수준에서 동작하므로 여기에서 켜고 끌 수 없습니다.
+                </p>
+              </div>
+
+              <ul className="space-y-2">
+                {SECURITY_ROWS.map((row) => (
+                  <li key={row.title} className="rounded-lg border px-3 py-2.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-sm font-medium">{row.title}</span>
+                      <span
+                        className={
+                          row.state === "적용"
+                            ? "inline-flex shrink-0 items-center rounded-full bg-success/15 px-2.5 py-1 text-xs font-semibold text-success"
+                            : "inline-flex shrink-0 items-center rounded-full bg-secondary px-2.5 py-1 text-xs font-semibold text-muted-foreground"
+                        }
+                      >
+                        {row.state}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-muted-foreground">{row.desc}</p>
+                  </li>
+                ))}
+              </ul>
             </section>
           </TabsContent>
         </Tabs>

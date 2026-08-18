@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
+import { Link, createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -7,7 +7,9 @@ import {
   Archive,
   CheckCircle2,
   Download,
+  FileSearch,
   KeyRound,
+  Link2,
   Loader2,
   Pencil,
   Plus,
@@ -51,8 +53,10 @@ import {
 } from "@/lib/roster";
 import {
   archiveParticipant,
+  assignParticipantOrg,
   createParticipant,
   deleteParticipant,
+  matchParticipantOrgUnits,
   provisionAccounts,
   resetParticipantPassword,
   setParticipantTags,
@@ -86,6 +90,10 @@ async function authHeaders() {
 
 function errorMessage(err: unknown) {
   return err instanceof Error ? err.message : "처리 중 오류가 발생했습니다.";
+}
+
+function csvCell(value: string) {
+  return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
 }
 
 function downloadCsv(name: string, body: string) {
@@ -449,6 +457,7 @@ type Participant = {
   org_text: string | null;
   grade: string | null;
   role_level: string | null;
+  org_unit_id: string | null;
   role: string;
   account_status: string;
   user_id: string | null;
@@ -458,7 +467,51 @@ type Participant = {
 };
 
 const PARTICIPANT_COLUMNS =
-  "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, role, account_status, user_id, tags, archived_at, companies(name)";
+  "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, org_unit_id, role, account_status, user_id, tags, archived_at, companies(name)";
+
+/** 조직 트리를 들여쓰기 라벨의 평탄 목록으로. 부모가 조회 범위 밖이면 루트로 취급한다. */
+function flattenOrgUnits(
+  units: { id: string; parent_id: string | null; name: string; sort: number }[],
+): { id: string; label: string }[] {
+  const idSet = new Set(units.map((u) => u.id));
+  const children = new Map<string, typeof units>();
+  for (const u of units) {
+    const key = u.parent_id && idSet.has(u.parent_id) ? u.parent_id : "__root__";
+    const list = children.get(key);
+    if (list) list.push(u);
+    else children.set(key, [u]);
+  }
+  const out: { id: string; label: string }[] = [];
+  const walk = (parentKey: string, depth: number) => {
+    const list = [...(children.get(parentKey) ?? [])].sort(
+      (a, b) => a.sort - b.sort || a.name.localeCompare(b.name),
+    );
+    for (const u of list) {
+      out.push({ id: u.id, label: `${"  ".repeat(depth)}${depth > 0 ? "└ " : ""}${u.name}` });
+      walk(u.id, depth + 1);
+    }
+  };
+  walk("__root__", 0);
+  return out;
+}
+
+/** 해당 계열사의 조직 목록(편집 폼 드롭다운용). companyId 가 없으면 조회하지 않는다. */
+function useOrgUnitOptions(companyId: string) {
+  const { data } = useQuery({
+    queryKey: ["org-units-options", companyId],
+    enabled: companyId.length > 0,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("org_units")
+        .select("id, parent_id, name, sort")
+        .eq("company_id", companyId)
+        .order("sort");
+      if (error) throw error;
+      return data ?? [];
+    },
+  });
+  return useMemo(() => flattenOrgUnits(data ?? []), [data]);
+}
 
 /** 추가·수정 공용 폼. 참여자가 null 이면 추가(계열사·사번 입력), 있으면 수정(둘은 고정). */
 function ParticipantFormDialog({
@@ -484,7 +537,10 @@ function ParticipantFormDialog({
     org_text: participant?.org_text ?? "",
     grade: participant?.grade ?? "",
     role_level: participant?.role_level ?? "",
+    org_unit_id: participant?.org_unit_id ?? "",
   }));
+
+  const orgOptions = useOrgUnitOptions(form.companyId);
 
   function set<K extends keyof typeof form>(key: K, value: string) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -500,6 +556,7 @@ function ParticipantFormDialog({
         org_text: form.org_text.trim(),
         grade: form.grade.trim(),
         role_level: form.role_level.trim(),
+        orgUnitId: form.org_unit_id || null,
       };
       if (participant) {
         return updateParticipant({
@@ -546,7 +603,13 @@ function ParticipantFormDialog({
             <>
               <div className="space-y-1.5">
                 <Label htmlFor="p-company">계열사 *</Label>
-                <Select value={form.companyId} onValueChange={(v) => set("companyId", v)}>
+                <Select
+                  value={form.companyId}
+                  onValueChange={(v) =>
+                    // 계열사가 바뀌면 이전 계열사의 조직 선택은 무효다.
+                    setForm((prev) => ({ ...prev, companyId: v, org_unit_id: "" }))
+                  }
+                >
                   <SelectTrigger id="p-company">
                     <SelectValue placeholder="선택" />
                   </SelectTrigger>
@@ -613,6 +676,30 @@ function ParticipantFormDialog({
               onChange={(e) => set("org_text", e.target.value)}
               placeholder="경영기획본부 / 기획팀"
             />
+          </div>
+          <div className="space-y-1.5 sm:col-span-2">
+            <Label htmlFor="p-org-unit">조직 (조직도 연결)</Label>
+            <Select
+              value={form.org_unit_id || "__none__"}
+              onValueChange={(v) => set("org_unit_id", v === "__none__" ? "" : v)}
+            >
+              <SelectTrigger id="p-org-unit">
+                <SelectValue placeholder="선택 안 함" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__none__">— 선택 안 함</SelectItem>
+                {orgOptions.map((o) => (
+                  <SelectItem key={o.id} value={o.id}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {orgOptions.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                이 계열사에 등록된 조직도가 없습니다. 마스터 관리에서 조직도를 먼저 올리세요.
+              </p>
+            )}
           </div>
         </div>
 
@@ -728,13 +815,21 @@ function RosterListTab() {
   const queryClient = useQueryClient();
   const [statusFilter, setStatusFilter] = useState("all");
   const [tagFilter, setTagFilter] = useState("all");
+  const [orgFilter, setOrgFilter] = useState("all");
+  const [includeSubOrgs, setIncludeSubOrgs] = useState(true);
   const [search, setSearch] = useState("");
   const [includeArchived, setIncludeArchived] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [tagInput, setTagInput] = useState("");
+  const [bulkOrgId, setBulkOrgId] = useState("");
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<Participant | null>(null);
   const [removing, setRemoving] = useState<Participant | null>(null);
+  const [orgMatchReport, setOrgMatchReport] = useState<{
+    matched: number;
+    unmatched: number;
+    unmatchedList: { name: string; emp_no: string; org_text: string | null }[];
+  } | null>(null);
 
   const { data: companies } = useCompanies();
 
@@ -762,16 +857,76 @@ function RosterListTab() {
     [data],
   );
 
+  /** 조직 필터·조직 열·일괄 배정이 함께 쓴다. 전사 스코프면 전 계열사 조직을 가져온다. */
+  const { data: orgUnits } = useQuery({
+    queryKey: ["org-units-filter", companyId],
+    queryFn: async () => {
+      let query = supabase.from("org_units").select("id, parent_id, name, sort").order("sort");
+      if (companyId !== "all") query = query.eq("company_id", companyId);
+      const { data, error } = await query;
+      if (error) throw error;
+      return data ?? [];
+    },
+  });
+  const orgOptions = useMemo(() => flattenOrgUnits(orgUnits ?? []), [orgUnits]);
+  const unitNameById = useMemo(
+    () => new Map((orgUnits ?? []).map((u) => [u.id, u.name])),
+    [orgUnits],
+  );
+
+  /** 선택 조직 + (토글 시) 하위 조직 전체의 id 집합. 전체 조직이면 null. */
+  const orgIdSet = useMemo(() => {
+    if (orgFilter === "all") return null;
+    const set = new Set([orgFilter]);
+    if (!includeSubOrgs) return set;
+    const childrenOf = new Map<string, string[]>();
+    for (const u of orgUnits ?? []) {
+      if (!u.parent_id) continue;
+      const list = childrenOf.get(u.parent_id);
+      if (list) list.push(u.id);
+      else childrenOf.set(u.parent_id, [u.id]);
+    }
+    const stack = [orgFilter];
+    while (stack.length > 0) {
+      for (const child of childrenOf.get(stack.pop()!) ?? []) {
+        if (!set.has(child)) {
+          set.add(child);
+          stack.push(child);
+        }
+      }
+    }
+    return set;
+  }, [orgFilter, includeSubOrgs, orgUnits]);
+
+  /** 응답 검토 바로가기 노출 근거 — draft 를 뺀(제출 이상) 응답이 있는 참여자. */
+  const { data: responded } = useQuery({
+    queryKey: ["participants-responded"],
+    queryFn: () =>
+      fetchAll<{ participant_id: string }>((from, to) =>
+        supabase
+          .from("responses")
+          .select("participant_id")
+          .neq("status", "draft")
+          .order("id")
+          .range(from, to),
+      ),
+  });
+  const respondedSet = useMemo(
+    () => new Set((responded ?? []).map((r) => r.participant_id)),
+    [responded],
+  );
+
   const rows = useMemo(() => {
     const q = search.trim().toLowerCase();
     return (data ?? []).filter((p) => {
       if (!includeArchived && p.archived_at) return false;
       if (statusFilter !== "all" && p.account_status !== statusFilter) return false;
       if (tagFilter !== "all" && !(p.tags ?? []).includes(tagFilter)) return false;
+      if (orgIdSet && !(p.org_unit_id && orgIdSet.has(p.org_unit_id))) return false;
       if (!q) return true;
       return [p.name, p.emp_no, p.email ?? ""].some((v) => v.toLowerCase().includes(q));
     });
-  }, [data, search, statusFilter, tagFilter, includeArchived]);
+  }, [data, search, statusFilter, tagFilter, orgIdSet, includeArchived]);
 
   const provision = useMutation({
     mutationFn: async (ids: string[]) =>
@@ -820,6 +975,19 @@ function RosterListTab() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  const orgMatch = useMutation({
+    mutationFn: async () =>
+      matchParticipantOrgUnits({
+        data: { companyId: companyId !== "all" ? companyId : null },
+        headers: await authHeaders(),
+      }),
+    onSuccess: (res) => {
+      setOrgMatchReport(res);
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
   const tagMutation = useMutation({
     mutationFn: async (mode: "add" | "remove") =>
       setParticipantTags({
@@ -841,10 +1009,50 @@ function RosterListTab() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  const orgAssign = useMutation({
+    mutationFn: async () =>
+      assignParticipantOrg({
+        data: { participantIds: [...selected], orgUnitId: bulkOrgId },
+        headers: await authHeaders(),
+      }),
+    onSuccess: (res) => {
+      toast.success(`${res.changed}명에게 조직을 배정했습니다.`);
+      setBulkOrgId("");
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
   const selectedIds = [...selected];
   const allSelected = rows.length > 0 && rows.every((r) => selected.has(r.id));
   const hasTagInput = tagInput.trim().length > 0;
-  const busy = provision.isPending || bulkReset.isPending || tagMutation.isPending;
+  const busy =
+    provision.isPending || bulkReset.isPending || tagMutation.isPending || orgAssign.isPending;
+
+  /** 현재 필터가 적용된 rows 그대로 CSV 로 만든다. 엑셀 호환을 위해 BOM 을 붙인다. */
+  function downloadRoster() {
+    const header = ["사번", "이름", "계열사", "조직", "소속", "직급", "역할단계", "이메일", "태그", "상태"];
+    const lines = rows.map((p) =>
+      [
+        p.emp_no,
+        p.name,
+        p.companies?.name ?? "",
+        (p.org_unit_id && unitNameById.get(p.org_unit_id)) || "",
+        p.org_text ?? "",
+        p.grade ?? "",
+        p.role_level ?? "",
+        p.email ?? "",
+        (p.tags ?? []).join(" "),
+        p.account_status,
+      ]
+        .map(csvCell)
+        .join(","),
+    );
+    downloadCsv(
+      `참여자_명단_${new Date().toISOString().slice(0, 10)}.csv`,
+      "﻿" + [header.join(","), ...lines].join("\n"),
+    );
+  }
 
   function toggle(id: string) {
     setSelected((prev) => {
@@ -896,6 +1104,28 @@ function RosterListTab() {
                 ))}
               </SelectContent>
             </Select>
+            <Select value={orgFilter} onValueChange={setOrgFilter}>
+              <SelectTrigger className="w-[180px]" aria-label="조직 필터">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">전체 조직</SelectItem>
+                {orgOptions.map((o) => (
+                  <SelectItem key={o.id} value={o.id}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {orgFilter !== "all" && (
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={includeSubOrgs}
+                  onCheckedChange={(v) => setIncludeSubOrgs(v === true)}
+                />
+                하위 조직 포함
+              </label>
+            )}
             <label className="flex items-center gap-2 text-sm">
               <Checkbox
                 checked={includeArchived}
@@ -912,6 +1142,28 @@ function RosterListTab() {
               onClick={() => setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))}
             >
               {allSelected ? "전체 해제" : "전체 선택"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={rows.length === 0}
+              onClick={downloadRoster}
+            >
+              <Download className="size-4" />
+              명단 내려받기
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={orgMatch.isPending}
+              onClick={() => orgMatch.mutate()}
+            >
+              {orgMatch.isPending ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Link2 className="size-4" />
+              )}
+              조직 일괄 매칭
             </Button>
             <Button size="sm" onClick={() => setAdding(true)}>
               <Plus className="size-4" />
@@ -965,6 +1217,31 @@ function RosterListTab() {
             >
               태그 제거
             </Button>
+            <Select
+              value={bulkOrgId || "__pick__"}
+              onValueChange={(v) => setBulkOrgId(v === "__pick__" ? "" : v)}
+            >
+              <SelectTrigger className="w-[200px]" aria-label="일괄 배정할 조직">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__pick__">— 조직 선택</SelectItem>
+                {orgOptions.map((o) => (
+                  <SelectItem key={o.id} value={o.id}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={busy || !bulkOrgId}
+              onClick={() => orgAssign.mutate()}
+            >
+              {orgAssign.isPending && <Loader2 className="size-4 animate-spin" />}
+              조직 배정
+            </Button>
           </div>
         )}
       </div>
@@ -999,7 +1276,8 @@ function RosterListTab() {
                         </span>
                       </p>
                       <p className="mt-1 truncate text-xs text-muted-foreground">
-                        {p.companies?.name} · {p.org_text}
+                        {p.companies?.name} ·{" "}
+                        {p.org_unit_id ? unitNameById.get(p.org_unit_id) : p.org_text}
                       </p>
                     </div>
                   </div>
@@ -1023,6 +1301,14 @@ function RosterListTab() {
                 </dl>
                 <TagChips participant={p} />
                 <div className="mt-3 flex flex-wrap gap-2">
+                  {respondedSet.has(p.id) && (
+                    <Button size="sm" variant="outline" asChild>
+                      <Link to="/admin/review">
+                        <FileSearch className="size-4" />
+                        응답 검토
+                      </Link>
+                    </Button>
+                  )}
                   <Button size="sm" variant="outline" onClick={() => setEditing(p)}>
                     <Pencil className="size-4" />
                     수정
@@ -1054,7 +1340,7 @@ function RosterListTab() {
                   <th className="px-4 py-3 font-medium">사번</th>
                   <th className="px-4 py-3 font-medium">이름</th>
                   <th className="px-4 py-3 font-medium">계열사</th>
-                  <th className="px-4 py-3 font-medium">소속</th>
+                  <th className="px-4 py-3 font-medium">조직</th>
                   <th className="px-4 py-3 font-medium">직급</th>
                   <th className="px-4 py-3 font-medium">태그</th>
                   <th className="px-4 py-3 font-medium">상태</th>
@@ -1079,7 +1365,18 @@ function RosterListTab() {
                       )}
                     </td>
                     <td className="px-4 py-3">{p.companies?.name}</td>
-                    <td className="px-4 py-3 text-muted-foreground">{p.org_text}</td>
+                    <td className="px-4 py-3">
+                      {p.org_unit_id ? (
+                        (unitNameById.get(p.org_unit_id) ?? "-")
+                      ) : (
+                        <span className="text-muted-foreground">
+                          {p.org_text}
+                          <span className="ml-1.5 rounded-full bg-secondary px-2 py-0.5 text-xs">
+                            미배정
+                          </span>
+                        </span>
+                      )}
+                    </td>
                     <td className="px-4 py-3">{p.grade ?? "-"}</td>
                     <td className="px-4 py-3">
                       <TagChips participant={p} />
@@ -1089,6 +1386,14 @@ function RosterListTab() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex gap-1">
+                        {respondedSet.has(p.id) && (
+                          <Button size="sm" variant="ghost" asChild>
+                            {/* review.tsx 는 URL 로 응답 지정을 지원하지 않아 목록 이동까지만. */}
+                            <Link to="/admin/review" aria-label={`${p.name} 응답 검토로 이동`}>
+                              <FileSearch className="size-4" />
+                            </Link>
+                          </Button>
+                        )}
                         <Button
                           size="sm"
                           variant="ghost"
@@ -1151,6 +1456,44 @@ function RosterListTab() {
           participant={removing}
           onOpenChange={(open) => !open && setRemoving(null)}
         />
+      )}
+      {orgMatchReport && (
+        <Dialog open onOpenChange={(open) => !open && setOrgMatchReport(null)}>
+          <DialogContent className="max-h-[85vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>조직 일괄 매칭 결과</DialogTitle>
+              <DialogDescription>
+                조직 미연결 참여자의 소속 표기를 조직도 이름과 대조했습니다 (공백 제거 후 정확
+                일치).
+              </DialogDescription>
+            </DialogHeader>
+            <p className="text-sm">
+              매칭 <strong>{orgMatchReport.matched}명</strong> · 미매칭{" "}
+              <strong>{orgMatchReport.unmatched}명</strong>
+            </p>
+            {orgMatchReport.unmatchedList.length > 0 && (
+              <>
+                <ul className="max-h-64 space-y-1 overflow-y-auto rounded-lg border p-3 text-xs">
+                  {orgMatchReport.unmatchedList.map((u) => (
+                    <li key={`${u.emp_no}-${u.name}`}>
+                      <span className="font-medium">{u.name}</span> ({u.emp_no}) · 소속:{" "}
+                      {u.org_text || "(비어 있음)"}
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-xs text-muted-foreground">
+                  미매칭 건은 참여자 수정 화면에서 조직을 직접 선택하거나, 조직도 이름과 소속
+                  표기를 맞춘 뒤 다시 실행하세요.
+                  {orgMatchReport.unmatched > orgMatchReport.unmatchedList.length &&
+                    ` (목록은 ${orgMatchReport.unmatchedList.length}건까지만 표시)`}
+                </p>
+              </>
+            )}
+            <DialogFooter>
+              <Button onClick={() => setOrgMatchReport(null)}>닫기</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
     </div>
   );

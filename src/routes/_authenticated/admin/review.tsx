@@ -2,7 +2,7 @@ import { useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Check, ChevronLeft, Pencil, Search, Star, X } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Pencil, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -32,6 +32,7 @@ import {
   correctField,
   getJobComparison,
   getResponseDetail,
+  getSubmissionSnapshots,
   handleInfoRequest,
   listInfoRequests,
   listReviewQueue,
@@ -59,6 +60,7 @@ type CorrectTable =
   | "response_requirements";
 
 const STATUS_LABELS: Record<string, string> = {
+  draft: "작성중",
   submitted: "제출",
   rejected: "반려",
   approved: "승인",
@@ -94,6 +96,172 @@ function formatDate(value: string | null) {
   return value ? new Date(value).toLocaleDateString("ko-KR") : "-";
 }
 
+function daysSince(value: string) {
+  return Math.floor((Date.now() - Date.parse(value)) / 86_400_000);
+}
+
+// ── V15-1 재제출 변경분 비교 ──────────────────────────────────
+// 스냅샷 payload(snapshot_submission RPC 산출물)와 현재 데이터를 필드 단위로 비교한다.
+
+type SnapRec = Record<string, unknown>;
+
+interface SnapshotPayload {
+  response?: SnapRec;
+  tasks?: (SnapRec & { activities?: SnapRec[] })[];
+  skills?: SnapRec[];
+  requirements?: SnapRec[];
+}
+
+/** 상세 화면에 표시되는 필드만 비교 대상으로 삼는다 (하이라이트는 표시 레이어이므로). */
+const RESPONSE_DIFF_FIELDS = [
+  "job_group",
+  "job_series",
+  "job_name",
+  "definition",
+  "mission",
+  "missed_note",
+  "pain_note",
+  "coverage_pct",
+  "onboarding_done",
+] as const;
+const TASK_DIFF_FIELDS = [
+  "name",
+  "importance",
+  "authority",
+  "transferable",
+  "improve_type",
+  "improve_note",
+] as const;
+const SKILL_DIFF_FIELDS = ["name", "ksao", "hard_soft", "description"] as const;
+const REQ_DIFF_FIELDS = [
+  "education",
+  "proficiency",
+  "majors_required",
+  "majors_preferred",
+  "trainings",
+  "licenses",
+  "languages",
+] as const;
+
+/** null·undefined·빈 문자열은 같은 값으로, jsonb 배열·객체는 직렬화해 비교한다. */
+function norm(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  return typeof v === "object" ? JSON.stringify(v) : String(v);
+}
+
+interface ListDiff {
+  /** 현재 항목 id → 바뀐 필드 집합 */
+  changed: Map<string, Set<string>>;
+  /** 직전 제출에 없던 현재 항목 id */
+  added: Set<string>;
+  /** 직전 제출에만 있던 항목 (원본 그대로) */
+  removed: SnapRec[];
+  /** 현재 항목 id → 매칭된 직전 항목 */
+  pairs: Map<string, SnapRec>;
+}
+
+/** id 우선, 없으면 이름으로 직전 제출 항목과 매칭해 필드 단위 변경을 계산한다. */
+function diffList(prev: SnapRec[], cur: { id: string }[], fields: readonly string[]): ListDiff {
+  const prevById = new Map(prev.map((p) => [String(p["id"]), p]));
+  const changed = new Map<string, Set<string>>();
+  const added = new Set<string>();
+  const pairs = new Map<string, SnapRec>();
+  const matched = new Set<SnapRec>();
+
+  const compare = (c: { id: string }, p: SnapRec) => {
+    matched.add(p);
+    pairs.set(c.id, p);
+    const fieldDiff = new Set<string>();
+    for (const f of fields) {
+      if (norm((c as SnapRec)[f]) !== norm(p[f])) fieldDiff.add(f);
+    }
+    if (fieldDiff.size > 0) changed.set(c.id, fieldDiff);
+  };
+
+  const unmatchedCur: { id: string }[] = [];
+  for (const c of cur) {
+    const p = prevById.get(c.id);
+    if (p) compare(c, p);
+    else unmatchedCur.push(c);
+  }
+  for (const c of unmatchedCur) {
+    const name = norm((c as SnapRec)["name"]);
+    const p = name ? prev.find((x) => !matched.has(x) && norm(x["name"]) === name) : undefined;
+    if (p) compare(c, p);
+    else added.add(c.id);
+  }
+  return { changed, added, removed: prev.filter((p) => !matched.has(p)), pairs };
+}
+
+type DetailResponse = Awaited<ReturnType<typeof getResponseDetail>>["response"];
+
+interface SnapshotDiff {
+  response: Set<string>;
+  tasks: ListDiff;
+  activityChanged: Set<string>;
+  activityAdded: Set<string>;
+  /** 현재 과업 id → 그 과업에서 삭제된 활동들 */
+  activityRemoved: Map<string, SnapRec[]>;
+  skills: ListDiff;
+  requirements: Set<string>;
+}
+
+function computeDiff(prev: SnapshotPayload, r: DetailResponse): SnapshotDiff {
+  const response = new Set<string>();
+  const cur = r as unknown as SnapRec;
+  for (const f of RESPONSE_DIFF_FIELDS) {
+    if (norm(prev.response?.[f]) !== norm(cur[f])) response.add(f);
+  }
+
+  const tasks = diffList(prev.tasks ?? [], r.response_tasks, TASK_DIFF_FIELDS);
+
+  const activityChanged = new Set<string>();
+  const activityAdded = new Set<string>();
+  const activityRemoved = new Map<string, SnapRec[]>();
+  for (const t of r.response_tasks) {
+    const p = tasks.pairs.get(t.id);
+    if (!p) continue; // 신규 과업은 통째로 "신규" 배지 — 활동은 개별 표시하지 않는다.
+    const d = diffList(
+      ((p as { activities?: SnapRec[] }).activities ?? []) as SnapRec[],
+      t.response_activities,
+      ["name"],
+    );
+    for (const id of d.changed.keys()) activityChanged.add(id);
+    for (const id of d.added) activityAdded.add(id);
+    if (d.removed.length > 0) activityRemoved.set(t.id, d.removed);
+  }
+
+  const skills = diffList(prev.skills ?? [], r.response_skills, SKILL_DIFF_FIELDS);
+
+  const requirements = new Set<string>();
+  const prevReq = prev.requirements?.[0];
+  const curReq = r.response_requirements as unknown as SnapRec | null;
+  for (const f of REQ_DIFF_FIELDS) {
+    if (norm(prevReq?.[f]) !== norm(curReq?.[f])) requirements.add(f);
+  }
+
+  return { response, tasks, activityChanged, activityAdded, activityRemoved, skills, requirements };
+}
+
+/** 변경 필드 노랑 하이라이트 (비교 모드 전용 표시 레이어) */
+const HL = "rounded bg-warning/30 px-1";
+
+function NewBadge() {
+  return (
+    <span className="inline-flex shrink-0 items-center rounded-full bg-success/15 px-2 py-0.5 text-[11px] font-semibold text-success">
+      신규
+    </span>
+  );
+}
+
+function RemovedBadge() {
+  return (
+    <span className="inline-flex shrink-0 items-center rounded-full bg-destructive/10 px-2 py-0.5 text-[11px] font-semibold text-destructive">
+      삭제됨
+    </span>
+  );
+}
+
 /** 직무 응답 수에 따른 신뢰도 배지 — 1인 응답은 인터뷰 없이는 확정할 수 없다. */
 function JobCountBadge({ count }: { count: number }) {
   const style =
@@ -123,7 +291,8 @@ function ReviewPage() {
       listReviewQueue({
         data: {
           companyId: scope,
-          status: status === "all" ? null : (status as "submitted" | "rejected" | "approved"),
+          status:
+            status === "all" ? null : (status as "draft" | "submitted" | "rejected" | "approved"),
           jobName: jobQuery.trim() || undefined,
         },
       }),
@@ -131,6 +300,17 @@ function ReviewPage() {
 
   const rows = data?.rows ?? [];
   const jobNames = Object.keys(data?.jobCounts ?? {}).sort((a, b) => a.localeCompare(b));
+
+  // V15-4 검토 적체 — 현재 목록 중 미검토(제출 상태) 건의 평균 대기일
+  const pendingWaits = rows
+    .filter((r) => r.status === "submitted" && r.submitted_at)
+    .map((r) => daysSince(r.submitted_at!));
+  const avgWait =
+    pendingWaits.length > 0
+      ? Math.round((pendingWaits.reduce((a, b) => a + b, 0) / pendingWaits.length) * 10) / 10
+      : null;
+
+  const selectedIndex = selectedId ? rows.findIndex((r) => r.id === selectedId) : -1;
 
   const [infoStatus, setInfoStatus] = useState("요청");
   const { data: infoData, isLoading: infoLoading } = useQuery({
@@ -178,6 +358,7 @@ function ReviewPage() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="submitted">제출</SelectItem>
+                    <SelectItem value="draft">작성중</SelectItem>
                     <SelectItem value="rejected">반려</SelectItem>
                     <SelectItem value="approved">승인</SelectItem>
                     <SelectItem value="all">전체</SelectItem>
@@ -193,6 +374,11 @@ function ReviewPage() {
                     className="pl-9"
                   />
                 </div>
+                {avgWait !== null && (
+                  <p className="text-xs text-muted-foreground">
+                    미검토 {pendingWaits.length}건 · 제출 후 평균 {avgWait}일 대기
+                  </p>
+                )}
               </div>
 
               {isLoading ? (
@@ -226,8 +412,22 @@ function ReviewPage() {
                           {r.companies?.name} · {r.participants?.org_text ?? "-"}
                         </p>
                         <p className="mt-2 truncate text-sm font-medium">{r.job_name ?? "직무 미입력"}</p>
-                        <div className="mt-2 flex items-center justify-between gap-2">
-                          <JobCountBadge count={r.jobCount} />
+                        <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <JobCountBadge count={r.jobCount} />
+                            {r.status === "submitted" && r.submitted_at && (
+                              <span
+                                className={cn(
+                                  "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold",
+                                  daysSince(r.submitted_at) > 5
+                                    ? "bg-warning/15 text-warning"
+                                    : "bg-secondary text-muted-foreground",
+                                )}
+                              >
+                                제출 후 {daysSince(r.submitted_at)}일
+                              </span>
+                            )}
+                          </div>
                           <span className="text-xs text-muted-foreground">
                             {formatDate(r.submitted_at)}
                           </span>
@@ -241,7 +441,13 @@ function ReviewPage() {
 
             <div className={cn(!selectedId && "hidden lg:block")}>
               {selectedId ? (
-                <ReviewDetail responseId={selectedId} onClose={() => setSelectedId(null)} />
+                <ReviewDetail
+                  responseId={selectedId}
+                  onClose={() => setSelectedId(null)}
+                  prevId={selectedIndex > 0 ? (rows[selectedIndex - 1]?.id ?? null) : null}
+                  nextId={selectedIndex >= 0 ? (rows[selectedIndex + 1]?.id ?? null) : null}
+                  onNavigate={setSelectedId}
+                />
               ) : (
                 <div className="rounded-xl border border-dashed bg-card p-8 text-center sm:p-12">
                   <p className="text-sm text-muted-foreground">
@@ -279,6 +485,8 @@ function EditableText({
   value,
   multiline,
   className,
+  highlight,
+  readOnly,
 }: {
   responseId: string;
   table: CorrectTable;
@@ -287,6 +495,10 @@ function EditableText({
   value: string | null;
   multiline?: boolean;
   className?: string;
+  /** 비교 모드 — 직전 제출과 값이 달라진 필드 */
+  highlight?: boolean;
+  /** 비교 모드 중에는 정정(연필)을 숨긴다 — 표시 레이어와 편집이 섞이지 않게 */
+  readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
@@ -339,18 +551,22 @@ function EditableText({
 
   return (
     <div className={cn("flex items-start gap-2", className)}>
-      <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{value || "-"}</span>
-      <button
-        type="button"
-        aria-label="정정"
-        className="shrink-0 rounded p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
-        onClick={() => {
-          setDraft(value ?? "");
-          setEditing(true);
-        }}
-      >
-        <Pencil className="size-3.5" />
-      </button>
+      <span className={cn("min-w-0 flex-1 whitespace-pre-wrap break-words", highlight && HL)}>
+        {value || "-"}
+      </span>
+      {!readOnly && (
+        <button
+          type="button"
+          aria-label="정정"
+          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+          onClick={() => {
+            setDraft(value ?? "");
+            setEditing(true);
+          }}
+        >
+          <Pencil className="size-3.5" />
+        </button>
+      )}
     </div>
   );
 }
@@ -381,17 +597,44 @@ function AiDraftBadge() {
   );
 }
 
-function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: () => void }) {
+function ReviewDetail({
+  responseId,
+  onClose,
+  prevId,
+  nextId,
+  onNavigate,
+}: {
+  responseId: string;
+  onClose: () => void;
+  prevId: string | null;
+  nextId: string | null;
+  onNavigate: (id: string) => void;
+}) {
   const queryClient = useQueryClient();
   const [approveOpen, setApproveOpen] = useState(false);
   const [interviewChecked, setInterviewChecked] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectStep, setRejectStep] = useState("4");
   const [rejectComment, setRejectComment] = useState("");
+  const [compareOn, setCompareOn] = useState(false);
 
   const { data, isLoading } = useQuery({
     queryKey: ["review-detail", responseId],
     queryFn: () => getResponseDetail({ data: { responseId } }),
+  });
+
+  // V15-1 — 스냅샷이 2개 이상(=재제출)일 때만 비교 버튼을 노출한다.
+  const { data: snapData } = useQuery({
+    queryKey: ["snapshots", responseId],
+    queryFn: () => getSubmissionSnapshots({ data: { responseId } }),
+  });
+  const snaps = snapData?.list ?? [];
+  const prevSnap = snaps.length >= 2 ? snaps[snaps.length - 2] : null;
+
+  const { data: prevPayloadData } = useQuery({
+    queryKey: ["snapshot-payload", responseId, prevSnap?.seq],
+    queryFn: () => getSubmissionSnapshots({ data: { responseId, seq: prevSnap!.seq } }),
+    enabled: compareOn && prevSnap !== null,
   });
 
   function invalidate() {
@@ -439,17 +682,75 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
   const licenses = (req?.licenses ?? []) as { name?: string; kind?: string; grade?: string }[];
   const languages = (req?.languages ?? []) as { language?: string; level?: string }[];
 
+  const diff =
+    compareOn && prevSnap && prevPayloadData?.payload
+      ? computeDiff(prevPayloadData.payload as SnapshotPayload, r)
+      : null;
+  const ro = diff !== null;
+  const hlR = (f: string) => !!diff?.response.has(f);
+  const hlT = (id: string, f: string) => !!diff?.tasks.changed.get(id)?.has(f);
+  const hlS = (id: string, f: string) => !!diff?.skills.changed.get(id)?.has(f);
+  const hlQ = (f: string) => !!diff?.requirements.has(f);
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
-        <Button variant="ghost" size="sm" className="lg:hidden" onClick={onClose}>
-          <ChevronLeft className="size-4" /> 목록
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button variant="ghost" size="sm" className="lg:hidden" onClick={onClose}>
+            <ChevronLeft className="size-4" /> 목록
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!prevId}
+            onClick={() => prevId && onNavigate(prevId)}
+          >
+            <ChevronLeft className="size-4" /> 이전
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!nextId}
+            onClick={() => nextId && onNavigate(nextId)}
+          >
+            다음 <ChevronRight className="size-4" />
+          </Button>
+        </div>
         <div className="flex flex-1 items-center justify-end gap-2">
+          {prevSnap && (
+            <Button
+              variant={compareOn ? "secondary" : "outline"}
+              size="sm"
+              onClick={() => setCompareOn((v) => !v)}
+            >
+              이전 제출과 비교
+            </Button>
+          )}
           <JobCountBadge count={data.jobCount} />
           <StatusBadge status={STATUS_LABELS[r.status] ?? r.status} />
         </div>
       </div>
+
+      {compareOn && prevSnap && (
+        <p className="rounded-xl border border-warning/40 bg-warning/10 p-3 text-sm">
+          {diff ? (
+            <>
+              {prevSnap.seq}차 제출({formatDate(prevSnap.created_at)}) 대비 변경분을 표시합니다 —{" "}
+              <span className={HL}>노랑</span>=변경, 신규·삭제는 배지로 표시됩니다. 비교 중에는
+              정정이 비활성화됩니다.
+            </>
+          ) : (
+            "비교 데이터를 불러오는 중..."
+          )}
+        </p>
+      )}
+
+      {r.status === "draft" && (
+        <p className="rounded-xl border bg-secondary p-3 text-sm text-muted-foreground">
+          작성 중 응답은 승인·반려할 수 없고 열람·정정만 가능합니다. 정정하면 작성자가 화면을 열어
+          두었던 경우 최신 내용 확인 안내를 받게 됩니다.
+        </p>
+      )}
 
       {data.aiDraft.any && (
         <p className="rounded-xl border border-warning/40 bg-warning/10 p-3 text-sm text-warning">
@@ -475,13 +776,13 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
       <Section title="직무">
         <dl className="grid gap-3 sm:grid-cols-3">
           <Field label="직군">
-            <EditableText responseId={r.id} table="responses" id={r.id} field="job_group" value={r.job_group} />
+            <EditableText responseId={r.id} table="responses" id={r.id} field="job_group" value={r.job_group} highlight={hlR("job_group")} readOnly={ro} />
           </Field>
           <Field label="직렬">
-            <EditableText responseId={r.id} table="responses" id={r.id} field="job_series" value={r.job_series} />
+            <EditableText responseId={r.id} table="responses" id={r.id} field="job_series" value={r.job_series} highlight={hlR("job_series")} readOnly={ro} />
           </Field>
           <Field label="직무명">
-            <EditableText responseId={r.id} table="responses" id={r.id} field="job_name" value={r.job_name} />
+            <EditableText responseId={r.id} table="responses" id={r.id} field="job_name" value={r.job_name} highlight={hlR("job_name")} readOnly={ro} />
           </Field>
         </dl>
       </Section>
@@ -495,6 +796,8 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
             field="definition"
             value={r.definition}
             multiline
+            highlight={hlR("definition")}
+            readOnly={ro}
           />
         </Field>
         <Field label="직무 미션">
@@ -505,6 +808,8 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
             field="mission"
             value={r.mission}
             multiline
+            highlight={hlR("mission")}
+            readOnly={ro}
           />
         </Field>
       </Section>
@@ -514,72 +819,126 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
           <p className="text-muted-foreground">등록된 과업이 없습니다.</p>
         ) : (
           <ul className="space-y-3">
-            {r.response_tasks.map((t, i) => (
-              <li key={t.id} className="rounded-lg border p-3">
-                <div className="flex items-start gap-2">
-                  <span className="mt-0.5 text-xs font-semibold text-muted-foreground">
-                    {i + 1}
-                  </span>
-                  {t.is_key && <Star className="mt-0.5 size-4 shrink-0 fill-warning text-warning" />}
-                  <div className="min-w-0 flex-1">
-                    <EditableText
-                      responseId={r.id}
-                      table="response_tasks"
-                      id={t.id}
-                      field="name"
-                      value={t.name}
-                      multiline
-                    />
-                  </div>
-                </div>
-                <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                  <span className="rounded-full bg-secondary px-2 py-0.5">
-                    중요도 {t.importance ?? "-"}
-                  </span>
-                  <span className="rounded-full bg-secondary px-2 py-0.5">
-                    {t.authority ? AUTHORITY_LABELS[t.authority] : "책임수준 미입력"}
-                  </span>
-                  {t.transferable !== null && (
-                    <span className="rounded-full bg-secondary px-2 py-0.5">
-                      {t.transferable ? "이관 가능" : "이관 불가"}
+            {r.response_tasks.map((t, i) => {
+              const removedActs = diff?.activityRemoved.get(t.id) ?? [];
+              return (
+                <li key={t.id} className="rounded-lg border p-3">
+                  <div className="flex items-start gap-2">
+                    <span className="mt-0.5 text-xs font-semibold text-muted-foreground">
+                      {i + 1}
                     </span>
-                  )}
-                  {t.improve_type && (
-                    <span className="rounded-full bg-primary-soft px-2 py-0.5 text-accent-foreground">
-                      개선: {t.improve_type}
-                    </span>
-                  )}
-                </div>
-                {t.improve_note && (
-                  <div className="mt-2 text-xs text-muted-foreground">
-                    <EditableText
-                      responseId={r.id}
-                      table="response_tasks"
-                      id={t.id}
-                      field="improve_note"
-                      value={t.improve_note}
-                      multiline
-                    />
+                    <div className="min-w-0 flex-1">
+                      <EditableText
+                        responseId={r.id}
+                        table="response_tasks"
+                        id={t.id}
+                        field="name"
+                        value={t.name}
+                        multiline
+                        highlight={hlT(t.id, "name")}
+                        readOnly={ro}
+                      />
+                    </div>
+                    {diff?.tasks.added.has(t.id) && <NewBadge />}
                   </div>
-                )}
-                {t.response_activities.length > 0 && (
-                  <ul className="mt-2 space-y-1 border-t pt-2 text-xs">
-                    {t.response_activities.map((a) => (
-                      <li key={a.id} className="flex gap-2">
-                        <span className="text-muted-foreground">·</span>
-                        <div className="min-w-0 flex-1">
-                          <EditableText
-                            responseId={r.id}
-                            table="response_activities"
-                            id={a.id}
-                            field="name"
-                            value={a.name}
-                          />
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                )}
+                  <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                    <span
+                      className={cn(
+                        "rounded-full px-2 py-0.5",
+                        hlT(t.id, "importance") ? "bg-warning/30" : "bg-secondary",
+                      )}
+                    >
+                      중요도 {t.importance ?? "-"}
+                    </span>
+                    <span
+                      className={cn(
+                        "rounded-full px-2 py-0.5",
+                        hlT(t.id, "authority") ? "bg-warning/30" : "bg-secondary",
+                      )}
+                    >
+                      {t.authority ? AUTHORITY_LABELS[t.authority] : "책임수준 미입력"}
+                    </span>
+                    {t.transferable !== null && (
+                      <span
+                        className={cn(
+                          "rounded-full px-2 py-0.5",
+                          hlT(t.id, "transferable") ? "bg-warning/30" : "bg-secondary",
+                        )}
+                      >
+                        {t.transferable ? "이관 가능" : "이관 불가"}
+                      </span>
+                    )}
+                    {t.improve_type && (
+                      <span
+                        className={cn(
+                          "rounded-full px-2 py-0.5 text-accent-foreground",
+                          hlT(t.id, "improve_type") ? "bg-warning/30" : "bg-primary-soft",
+                        )}
+                      >
+                        개선: {t.improve_type}
+                      </span>
+                    )}
+                  </div>
+                  {t.improve_note && (
+                    <div className="mt-2 text-xs text-muted-foreground">
+                      <EditableText
+                        responseId={r.id}
+                        table="response_tasks"
+                        id={t.id}
+                        field="improve_note"
+                        value={t.improve_note}
+                        multiline
+                        highlight={hlT(t.id, "improve_note")}
+                        readOnly={ro}
+                      />
+                    </div>
+                  )}
+                  {(t.response_activities.length > 0 || removedActs.length > 0) && (
+                    <ul className="mt-2 space-y-1 border-t pt-2 text-xs">
+                      {t.response_activities.map((a) => (
+                        <li key={a.id} className="flex gap-2">
+                          <span className="text-muted-foreground">·</span>
+                          <div className="min-w-0 flex-1">
+                            <EditableText
+                              responseId={r.id}
+                              table="response_activities"
+                              id={a.id}
+                              field="name"
+                              value={a.name}
+                              highlight={diff?.activityChanged.has(a.id) ?? false}
+                              readOnly={ro}
+                            />
+                          </div>
+                          {diff?.activityAdded.has(a.id) && <NewBadge />}
+                        </li>
+                      ))}
+                      {removedActs.map((a, j) => (
+                        <li key={`removed-act-${j}`} className="flex items-center gap-2">
+                          <span className="text-muted-foreground">·</span>
+                          <span className="min-w-0 flex-1 text-muted-foreground line-through">
+                            {norm(a["name"]) || "-"}
+                          </span>
+                          <RemovedBadge />
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {diff && diff.tasks.removed.length > 0 && (
+          <ul className="space-y-2">
+            {diff.tasks.removed.map((t, i) => (
+              <li
+                key={`removed-task-${i}`}
+                className="flex items-center gap-2 rounded-lg border border-dashed p-3"
+              >
+                <span className="min-w-0 flex-1 text-muted-foreground line-through">
+                  {norm(t["name"]) || "-"}
+                </span>
+                <RemovedBadge />
               </li>
             ))}
           </ul>
@@ -601,18 +960,33 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                       id={s.id}
                       field="name"
                       value={s.name}
+                      highlight={hlS(s.id, "name")}
+                      readOnly={ro}
                     />
                   </div>
+                  {diff?.skills.added.has(s.id) && <NewBadge />}
                   {s.ai_draft && <AiDraftBadge />}
                 </div>
                 <div className="mt-1 flex flex-wrap gap-2 text-xs">
                   {s.ksao && (
-                    <span className="rounded-full bg-secondary px-2 py-0.5">
+                    <span
+                      className={cn(
+                        "rounded-full px-2 py-0.5",
+                        hlS(s.id, "ksao") ? "bg-warning/30" : "bg-secondary",
+                      )}
+                    >
                       {ksaoLabel(s.ksao)}
                     </span>
                   )}
                   {s.hard_soft && (
-                    <span className="rounded-full bg-secondary px-2 py-0.5">{s.hard_soft}</span>
+                    <span
+                      className={cn(
+                        "rounded-full px-2 py-0.5",
+                        hlS(s.id, "hard_soft") ? "bg-warning/30" : "bg-secondary",
+                      )}
+                    >
+                      {s.hard_soft}
+                    </span>
                   )}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
@@ -623,8 +997,25 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                     field="description"
                     value={s.description}
                     multiline
+                    highlight={hlS(s.id, "description")}
+                    readOnly={ro}
                   />
                 </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {diff && diff.skills.removed.length > 0 && (
+          <ul className="space-y-2">
+            {diff.skills.removed.map((s, i) => (
+              <li
+                key={`removed-skill-${i}`}
+                className="flex items-center gap-2 rounded-lg border border-dashed p-3"
+              >
+                <span className="min-w-0 flex-1 text-muted-foreground line-through">
+                  {norm(s["name"]) || "-"}
+                </span>
+                <RemovedBadge />
               </li>
             ))}
           </ul>
@@ -637,7 +1028,9 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
           </div>
           {req ? (
             <dl className="mt-2 grid gap-3 sm:grid-cols-2">
-              <Field label="학력">{req.education ?? "-"}</Field>
+              <Field label="학력">
+                <span className={cn(hlQ("education") && HL)}>{req.education ?? "-"}</span>
+              </Field>
               <Field label="숙련 기간">
                 <EditableText
                   responseId={r.id}
@@ -645,6 +1038,8 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                   id={req.id}
                   field="proficiency"
                   value={req.proficiency}
+                  highlight={hlQ("proficiency")}
+                  readOnly={ro}
                 />
               </Field>
               <Field label="필수 전공">
@@ -654,6 +1049,8 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                   id={req.id}
                   field="majors_required"
                   value={req.majors_required}
+                  highlight={hlQ("majors_required")}
+                  readOnly={ro}
                 />
               </Field>
               <Field label="우대 전공">
@@ -663,19 +1060,27 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                   id={req.id}
                   field="majors_preferred"
                   value={req.majors_preferred}
+                  highlight={hlQ("majors_preferred")}
+                  readOnly={ro}
                 />
               </Field>
               <Field label="자격증">
-                {licenses.length === 0
-                  ? "-"
-                  : licenses
-                      .map((l) => [l.name, l.grade, l.kind].filter(Boolean).join(" "))
-                      .join(", ")}
+                <span className={cn(hlQ("licenses") && HL)}>
+                  {licenses.length === 0
+                    ? "-"
+                    : licenses
+                        .map((l) => [l.name, l.grade, l.kind].filter(Boolean).join(" "))
+                        .join(", ")}
+                </span>
               </Field>
               <Field label="어학">
-                {languages.length === 0
-                  ? "-"
-                  : languages.map((l) => [l.language, l.level].filter(Boolean).join(" ")).join(", ")}
+                <span className={cn(hlQ("languages") && HL)}>
+                  {languages.length === 0
+                    ? "-"
+                    : languages
+                        .map((l) => [l.language, l.level].filter(Boolean).join(" "))
+                        .join(", ")}
+                </span>
               </Field>
               <div className="sm:col-span-2">
                 <Field label="교육 이수">
@@ -686,6 +1091,8 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                     field="trainings"
                     value={req.trainings}
                     multiline
+                    highlight={hlQ("trainings")}
+                    readOnly={ro}
                   />
                 </Field>
               </div>
@@ -698,8 +1105,16 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
 
       <Section title="자기평가">
         <dl className="grid gap-3 sm:grid-cols-2">
-          <Field label="업무 포괄 정도">{r.coverage_pct ? `${r.coverage_pct}%` : "-"}</Field>
-          <Field label="온보딩 완료">{r.onboarding_done ? "예" : "아니오"}</Field>
+          <Field label="업무 포괄 정도">
+            <span className={cn(hlR("coverage_pct") && HL)}>
+              {r.coverage_pct ? `${r.coverage_pct}%` : "-"}
+            </span>
+          </Field>
+          <Field label="온보딩 완료">
+            <span className={cn(hlR("onboarding_done") && HL)}>
+              {r.onboarding_done ? "예" : "아니오"}
+            </span>
+          </Field>
           <div className="sm:col-span-2">
             <Field label="누락된 업무">
               <EditableText
@@ -709,6 +1124,8 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                 field="missed_note"
                 value={r.missed_note}
                 multiline
+                highlight={hlR("missed_note")}
+                readOnly={ro}
               />
             </Field>
           </div>
@@ -721,6 +1138,8 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
                 field="pain_note"
                 value={r.pain_note}
                 multiline
+                highlight={hlR("pain_note")}
+                readOnly={ro}
               />
             </Field>
           </div>
@@ -749,7 +1168,7 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
       <div className="sticky bottom-0 flex gap-2 border-t bg-card p-3 shadow-sm">
         <Button
           className="flex-1"
-          disabled={approve.isPending || r.status === "approved"}
+          disabled={approve.isPending || r.status === "approved" || r.status === "draft"}
           onClick={() => {
             if (data.jobCount <= 1) {
               setApproveOpen(true);
@@ -763,7 +1182,7 @@ function ReviewDetail({ responseId, onClose }: { responseId: string; onClose: ()
         <Button
           variant="outline"
           className="flex-1"
-          disabled={reject.isPending || r.status === "rejected"}
+          disabled={reject.isPending || r.status === "rejected" || r.status === "draft"}
           onClick={() => setRejectOpen(true)}
         >
           반려
@@ -1113,10 +1532,7 @@ function JobComparison({ jobNames, companyId }: { jobNames: string[]; companyId:
               <ul className="mt-2 space-y-2">
                 {c.response_tasks.map((t) => (
                   <li key={t.id} className="rounded-lg border p-2 text-xs">
-                    <div className="flex items-start gap-1.5">
-                      {t.is_key && <Star className="mt-0.5 size-3 shrink-0 fill-warning text-warning" />}
-                      <span className="min-w-0 flex-1">{t.name}</span>
-                    </div>
+                    <span className="block min-w-0">{t.name}</span>
                     <div className="mt-1.5 flex flex-wrap gap-1">
                       <span className="rounded-full bg-secondary px-1.5 py-0.5">
                         중요도 {t.importance ?? "-"}

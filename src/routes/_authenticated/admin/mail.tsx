@@ -17,6 +17,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Select,
@@ -37,12 +45,15 @@ import {
   imageToken,
 } from "@/lib/mail-vars";
 import {
+  cancelScheduledBatch,
   countRecipients,
   deleteTemplate,
   listBatches,
   listLogs,
+  listRecipientPreview,
   listTemplates,
   previewTemplate,
+  resendFailedLogs,
   sendTestMail,
   upsertTemplate,
 } from "@/lib/mail.functions";
@@ -482,6 +493,7 @@ function SendTab() {
   const [name, setName] = useState("");
   const [statuses, setStatuses] = useState<string[]>([]);
   const [scheduledAt, setScheduledAt] = useState("");
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const { data: templates } = useQuery({
     queryKey: ["mail-templates"],
@@ -493,6 +505,13 @@ function SendTab() {
   const { data: recipients, isFetching: countingRecipients } = useQuery({
     queryKey: ["mail-recipients", filterCompanyId, statuses],
     queryFn: () => countRecipients({ data: { companyId: filterCompanyId, statuses } }),
+  });
+
+  // 명단은 다이얼로그를 열 때만 불러온다(카운트보다 무거움).
+  const { data: previewList, isFetching: previewLoading } = useQuery({
+    queryKey: ["mail-recipient-preview", filterCompanyId, statuses],
+    queryFn: () => listRecipientPreview({ data: { companyId: filterCompanyId, statuses } }),
+    enabled: confirmOpen,
   });
 
   const sendMutation = useMutation({
@@ -507,6 +526,7 @@ function SendTab() {
         },
       }),
     onSuccess: (result) => {
+      setConfirmOpen(false);
       if (result.scheduled) toast.success("발송이 예약되었습니다.");
       else
         toast.success(
@@ -623,12 +643,63 @@ function SendTab() {
         <div className="flex flex-wrap gap-2">
           <Button
             className="h-11 w-full sm:w-auto"
-            onClick={() => sendMutation.mutate()}
+            onClick={() => setConfirmOpen(true)}
             disabled={!templateId || sendMutation.isPending}
           >
             <Send className="size-4" />
             {sendMutation.isPending ? "처리 중..." : scheduledAt ? "예약 등록" : "즉시 발송"}
           </Button>
+
+          <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+            <DialogContent className="max-w-lg">
+              <DialogHeader>
+                <DialogTitle>발송 전 수신자 확인</DialogTitle>
+                <DialogDescription>
+                  아래 명단으로 {scheduledAt ? "예약" : "즉시 발송"}됩니다. 확인 후 진행해 주세요.
+                </DialogDescription>
+              </DialogHeader>
+
+              {previewLoading ? (
+                <p className="text-sm text-muted-foreground">명단을 불러오는 중...</p>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-sm font-semibold">총 {previewList?.count ?? 0}명</p>
+                  <ul className="max-h-64 space-y-1 overflow-y-auto rounded-lg border bg-background p-2">
+                    {(previewList?.recipients ?? []).map((r, i) => (
+                      <li key={`${r.email}-${i}`} className="flex justify-between gap-3 px-2 py-1 text-sm">
+                        <span className="min-w-0 truncate font-medium">{r.name}</span>
+                        <span className="shrink-0 text-xs text-muted-foreground">{r.email}</span>
+                      </li>
+                    ))}
+                    {previewList?.count === 0 && (
+                      <li className="px-2 py-1 text-sm text-muted-foreground">
+                        조건에 맞는 수신 대상이 없습니다.
+                      </li>
+                    )}
+                  </ul>
+                </div>
+              )}
+
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setConfirmOpen(false)}>
+                  닫기
+                </Button>
+                <Button
+                  onClick={() => sendMutation.mutate()}
+                  disabled={
+                    sendMutation.isPending || previewLoading || (previewList?.count ?? 0) === 0
+                  }
+                >
+                  <Send className="size-4" />
+                  {sendMutation.isPending
+                    ? "처리 중..."
+                    : scheduledAt
+                      ? "예약 등록"
+                      : `${previewList?.count ?? 0}명에게 발송`}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
           <Button
             variant="outline"
             className="h-11 w-full sm:w-auto"
@@ -664,11 +735,21 @@ function SendTab() {
 }
 
 function HistoryTab() {
+  const queryClient = useQueryClient();
   const [openBatchId, setOpenBatchId] = useState<string | null>(null);
 
   const { data: batches, isLoading } = useQuery({
     queryKey: ["mail-batches"],
     queryFn: () => listBatches(),
+  });
+
+  const cancelMutation = useMutation({
+    mutationFn: (batchId: string) => cancelScheduledBatch({ data: { batchId } }),
+    onSuccess: () => {
+      toast.success("예약을 취소했습니다.");
+      void queryClient.invalidateQueries({ queryKey: ["mail-batches"] });
+    },
+    onError: (err) => toast.error(`예약 취소에 실패했습니다: ${errorMessage(err)}`),
   });
 
   if (isLoading) return <p className="text-sm text-muted-foreground">불러오는 중...</p>;
@@ -730,6 +811,23 @@ function HistoryTab() {
             </div>
           </button>
 
+          {b.status === "예약" && (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t px-4 py-2.5">
+              <p className="text-xs text-muted-foreground">
+                아직 발송 전인 예약 건입니다. 취소하면 목록에서 사라지고 취소 기록은 감사 로그에
+                남습니다.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => cancelMutation.mutate(b.id)}
+                disabled={cancelMutation.isPending}
+              >
+                {cancelMutation.isPending ? "취소 중..." : "예약 취소"}
+              </Button>
+            </div>
+          )}
+
           {openBatchId === b.id && <BatchLogs batchId={b.id} />}
         </li>
       ))}
@@ -755,6 +853,18 @@ function BatchLogs({ batchId }: { batchId: string }) {
     onError: (err) => toast.error(`재발송에 실패했습니다: ${errorMessage(err)}`),
   });
 
+  const resendFailedMutation = useMutation({
+    mutationFn: () => resendFailedLogs({ data: { batchId, origin: origin() } }),
+    onSuccess: (result) => {
+      if (result.total === 0) toast.info("재발송할 실패 건이 없습니다(이미 재발송되었습니다).");
+      else
+        toast.success(`실패 ${result.total}건 재발송 — 성공 ${result.ok}건 / 실패 ${result.failed}건`);
+      void queryClient.invalidateQueries({ queryKey: ["mail-logs", batchId] });
+      void queryClient.invalidateQueries({ queryKey: ["mail-batches"] });
+    },
+    onError: (err) => toast.error(`일괄 재발송에 실패했습니다: ${errorMessage(err)}`),
+  });
+
   if (isLoading) {
     return <p className="border-t px-4 py-3 text-sm text-muted-foreground">불러오는 중...</p>;
   }
@@ -768,9 +878,26 @@ function BatchLogs({ batchId }: { batchId: string }) {
     );
   }
 
+  const failedCount = rows.filter((log) => log.status === "실패").length;
+
   return (
-    <ul className="border-t">
-      {rows.map((log) => (
+    <div className="border-t">
+      {failedCount > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b bg-destructive/5 px-4 py-2.5">
+          <p className="text-xs text-muted-foreground">실패 {failedCount}건이 있습니다.</p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => resendFailedMutation.mutate()}
+            disabled={resendFailedMutation.isPending}
+          >
+            <RotateCw className="size-4" />
+            {resendFailedMutation.isPending ? "재발송 중..." : "실패 건 재발송"}
+          </Button>
+        </div>
+      )}
+      <ul>
+        {rows.map((log) => (
         <li
           key={log.id}
           className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3 last:border-b-0"
@@ -809,7 +936,8 @@ function BatchLogs({ batchId }: { batchId: string }) {
             )}
           </div>
         </li>
-      ))}
-    </ul>
+        ))}
+      </ul>
+    </div>
   );
 }

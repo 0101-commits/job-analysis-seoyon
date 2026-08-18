@@ -286,6 +286,61 @@ export const detectPoorResponses = createServerFn({ method: "POST" })
     return { candidates, scanned: responses.length };
   });
 
+/** 제출 전 셀프 AI 점검 결과 한 건 — 어떤 항목이 왜 부실해 보이고 어떻게 보완할지. */
+export type SelfCheckFinding = { item: string; reason: string; suggestion: string };
+
+/**
+ * V15-2: 참여자가 제출 전에 본인 응답을 스스로 점검한다(게이트 아님 — 무시하고 제출 가능).
+ * 관리자 가드가 아니라 본인 소유 검증 — responses 는 RLS 로 본인 것만 보이므로
+ * 사용자 토큰 조회가 성공하면 소유가 확인된 것이다. 데이터 수집은 supabaseAdmin 으로 한다.
+ * 부실 판정 기준은 detectPoorResponses 와 동일. 프롬프트에 이름·사번·이메일은 넣지 않는다.
+ */
+export const selfCheckMyResponse = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ responseId: uuid }).parse(input))
+  .handler(async ({ data, context }): Promise<{ findings: SelfCheckFinding[] }> => {
+    const { data: own } = await context.supabase
+      .from("responses")
+      .select("id")
+      .eq("id", data.responseId)
+      .maybeSingle();
+    if (!own) throw new Error("본인 응답만 점검할 수 있습니다.");
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { callLLMJson } = await import("@/lib/llm.server");
+
+    const { response, taskRows, activityRows } = await collectResponseText(
+      supabaseAdmin,
+      data.responseId,
+    );
+    const payload = {
+      jobName: response.job_name,
+      definition: response.definition,
+      mission: response.mission,
+      tasks: taskRows.map((t) => ({
+        name: t.name,
+        activities: activityRows.filter((a) => a.task_id === t.id).map((a) => a.name),
+      })),
+    };
+
+    const found = await callLLMJson<SelfCheckFinding[]>({
+      system:
+        "너는 직무조사 응답의 품질을 판정하는 심사자다. 부실 판정 기준: " +
+        "①과업명이 명사 한 단어뿐이거나 「업무」「관리」처럼 내용이 없다 ②활동이 과업명과 사실상 같거나 서로 중복된다 " +
+        "③직무 정의·미션이 비었거나 한 줄 상투어다 ④과업이 3개 미만이다 ⑤복사·붙여넣기로 보이는 반복 문구가 있다. " +
+        "기준에 걸리는 항목만 결과에 포함하고, 작성자 본인에게 직접 말하듯 존댓말로 보완 방법을 제안한다. 문제가 없으면 빈 배열을 반환한다.",
+      user:
+        `${JSON.stringify(payload)}\n\n` +
+        'JSON만 출력한다. 형식: [{"item":"항목(예: 과업 2, 직무 정의)","reason":"부실로 본 근거 한 문장","suggestion":"어떻게 보완하면 되는지 한두 문장"}]',
+      maxTokens: 2048,
+    });
+
+    const findings = (Array.isArray(found) ? found : []).filter(
+      (f) => typeof f?.item === "string" && typeof f?.reason === "string",
+    );
+    return { findings };
+  });
+
 export const draftMissingFields = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
@@ -588,7 +643,7 @@ export const applySuggestion = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => z.object({ suggestionId: uuid }).parse(input))
   .handler(async ({ data, context }) => {
-    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    const { requireAdmin, writeAudit, touchResponse } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -652,6 +707,10 @@ export const applySuggestion = createServerFn({ method: "POST" })
         .eq("id", id);
       if (error) throw new Error(error.message);
     }
+
+    // 자식 테이블 반영은 responses.updated_at 트리거를 안 태운다. 부모를 밀어야
+    // 참여자의 다음 저장(save_*_tx 낙관적 락)이 이 반영과의 충돌을 감지한다.
+    if (table !== "responses") await touchResponse(supabaseAdmin, s.response_id);
 
     const { error: markError } = await supabaseAdmin
       .from("ai_suggestions")

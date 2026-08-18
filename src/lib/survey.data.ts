@@ -1,5 +1,8 @@
 // 조사 마법사 데이터 계층 — respondent 본인 데이터는 RLS 로 보호되므로 클라이언트에서 직접 CRUD 한다.
+import { createServerFn } from "@tanstack/react-start";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { supabase } from "@/integrations/supabase/client";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { Database, Json } from "@/integrations/supabase/types";
 import { CUSTOM } from "@/components/survey/RequirementsForm";
 import type { ExampleLibRow } from "@/components/survey/TaskGrid";
@@ -202,7 +205,8 @@ export async function saveTasks(
     importance: t.importance,
     authority: t.authority,
     transferable: t.transferable,
-    is_key: t.isKey,
+    // 주요 과업 별표 UI 폐지 — 컬럼은 존치하되 더 이상 저장하지 않는다(기존 값도 재저장 시 초기화).
+    is_key: false,
     improve_type: t.improveType,
     improve_note: t.improveNote || null,
     activities: t.activities.map((a, ai) => ({ seq: ai, name: a.name })),
@@ -279,6 +283,15 @@ export async function submit(
     })
     .eq("id", responseId);
   if (error) throw error;
+
+  // V15-1: 제출 시점 스냅샷 — 서버 RPC 가 응답 전체를 캡처한다. 부가 기능이므로
+  // 실패해도 제출 자체는 성공으로 둔다(재제출 변경분 하이라이트만 빠진다).
+  // ponytail: snapshot_submission 이 생성 types.ts 에 아직 없어 untyped 캐스팅 — 재생성 시 제거.
+  const { error: snapError } = await (supabase as unknown as SupabaseClient).rpc(
+    "snapshot_submission",
+    { _response_id: responseId },
+  );
+  if (snapError) console.error("snapshot_submission 실패:", snapError.message);
 }
 
 /** 작성 예시 라이브러리 전체 (건수가 작아 한 번에 읽는다) */
@@ -389,3 +402,140 @@ export async function getMyInfoRequests(participantId: string) {
 }
 
 export type MyInfoRequest = Awaited<ReturnType<typeof getMyInfoRequests>>[number];
+
+// ---------- 관리자 변경 인지 배너 (V14-③) ----------
+
+/** 관리자가 내 정보를 바꾼 이벤트 하나 — at 은 audit_logs.created_at, fields 는 바뀐 필드 키. */
+export interface InfoChangeEvent {
+  at: string;
+  fields: string[];
+}
+
+/** 배너에 관련된 audit_logs.action 값 (guard.server writeAudit 호출부에서 실측). */
+const INFO_CHANGE_ACTIONS = ["참여자 수정", "정보 정정 요청 처리완료", "응답 필드 정정"];
+
+/** 배너 노출 대상 기간 — 이보다 오래된 변경은 처음 접속한 사용자에게도 보여 주지 않는다. */
+const INFO_CHANGE_LOOKBACK_MS = 30 * 86_400_000;
+
+/**
+ * 본인 participant 를 대상으로 한 최근 관리자 변경 이력.
+ * audit_logs 는 RLS 상 응답자가 직접 읽을 수 없어 서버함수에서 supabaseAdmin 으로 읽되,
+ * 대상 participant/response id 는 사용자 토큰 클라이언트(RLS)로 찾으므로 본인 것만 나온다.
+ */
+export const getMyInfoChanges = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<InfoChangeEvent[]> => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const [{ data: participant }, { data: response }] = await Promise.all([
+      context.supabase.from("participants").select("id").limit(1).maybeSingle(),
+      context.supabase.from("responses").select("id").limit(1).maybeSingle(),
+    ]);
+    if (!participant) return [];
+
+    // 세 기록 방식의 대상 표기가 제각각이다:
+    //  참여자 수정 → target_id=participant / 정정요청 처리 → detail.participant_id / correctField → detail.response_id
+    const ors = [
+      `target_id.eq.${participant.id}`,
+      `detail->>participant_id.eq.${participant.id}`,
+      ...(response ? [`detail->>response_id.eq.${response.id}`] : []),
+    ].join(",");
+
+    const { data: logs, error } = await supabaseAdmin
+      .from("audit_logs")
+      .select("action, target_type, detail, created_at")
+      .in("action", INFO_CHANGE_ACTIONS)
+      .or(ors)
+      .gte("created_at", new Date(Date.now() - INFO_CHANGE_LOOKBACK_MS).toISOString())
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (error) return [];
+
+    const events: InfoChangeEvent[] = [];
+    for (const log of logs ?? []) {
+      const detail = (log.detail ?? {}) as Record<string, unknown>;
+      let fields: string[] = [];
+      if (log.action === "참여자 수정") {
+        fields = Object.keys((detail["changed"] as Record<string, unknown> | undefined) ?? {});
+      } else if (log.action === "정보 정정 요청 처리완료") {
+        fields = Array.isArray(detail["applied"]) ? (detail["applied"] as string[]) : [];
+      } else if (log.action === "응답 필드 정정" && log.target_type === "responses") {
+        // 과업·스킬 같은 응답 본문 정정은 충돌 다이얼로그가 다루므로 기본정보성 필드만 배너 대상.
+        fields = typeof detail["field"] === "string" ? [detail["field"] as string] : [];
+      }
+      if (fields.length > 0) events.push({ at: log.created_at, fields });
+    }
+    return events;
+  });
+
+// ---------- 업무분장 사전 주입 (V8) ----------
+
+/** 업무분장표에서 뽑은 과업 후보 하나 — 주요업무 1건 + 그에 딸린 세부업무들. */
+export interface DutyTaskCandidate {
+  task: string;
+  activities: string[];
+}
+
+/**
+ * 본인 소속 조직의 업무분장표 행을 과업 후보로 변환해 준다.
+ * duty_charts·org_units 는 로그인 사용자 전원 조회 가능(RLS)이라 사용자 토큰으로 읽는다 —
+ * participants 는 RLS 로 본인 행만 나오므로 남의 조직 분장은 애초에 조회되지 않는다.
+ * ponytail: participants.org_unit_id 가 생성 types.ts 에 없어 untyped 캐스팅 — 재생성 시 제거.
+ */
+export const getMyDutyCandidates = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<DutyTaskCandidate[]> => {
+    const db = context.supabase as unknown as SupabaseClient;
+
+    const { data: p } = await db
+      .from("participants")
+      .select("company_id, org_unit_id, org_text")
+      .limit(1)
+      .maybeSingle();
+    if (!p) return [];
+
+    let orgName = ((p.org_text as string | null) ?? "").trim();
+    if (p.org_unit_id) {
+      const { data: unit } = await db
+        .from("org_units")
+        .select("name")
+        .eq("id", p.org_unit_id)
+        .maybeSingle();
+      if (unit?.name) orgName = (unit.name as string).trim();
+    }
+    if (!orgName) return [];
+
+    const { data: charts } = await db
+      .from("duty_charts")
+      .select("rows")
+      .eq("company_id", p.company_id)
+      .eq("org_name", orgName)
+      .order("uploaded_at", { ascending: false })
+      .limit(1);
+    const rows = (Array.isArray(charts?.[0]?.rows) ? charts[0].rows : []) as Record<
+      string,
+      string
+    >[];
+    if (rows.length === 0) return [];
+
+    // 업로드 엑셀의 열 이름은 자유 형식 — 첫 행 헤더에서 주요업무/세부업무 열을 이름으로 찾는다.
+    const keys = Object.keys(rows[0] ?? {});
+    const taskKey =
+      keys.find((k) => k.includes("주요업무")) ?? keys.find((k) => k.includes("과업")) ?? keys[0];
+    const actKey = keys.find((k) => k.includes("세부"));
+    if (!taskKey) return [];
+
+    // 병합 셀 유래의 빈 주요업무 칸은 직전 과업의 세부업무 연속으로 본다.
+    const byTask = new Map<string, string[]>();
+    let current = "";
+    for (const row of rows) {
+      const task = (row[taskKey] ?? "").trim();
+      if (task) current = task;
+      if (!current) continue;
+      if (!byTask.has(current)) byTask.set(current, []);
+      const act = actKey ? (row[actKey] ?? "").trim() : "";
+      if (act && !byTask.get(current)!.includes(act)) byTask.get(current)!.push(act);
+    }
+
+    return [...byTask.entries()].map(([task, activities]) => ({ task, activities }));
+  });

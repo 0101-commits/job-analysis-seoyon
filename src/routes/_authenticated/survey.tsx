@@ -7,9 +7,10 @@ import {
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
-  HelpCircle,
+  ClipboardList,
   Loader2,
   Send,
+  Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -26,8 +27,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { ExamplesPanel, TaskGrid, TaskHowTo } from "@/components/survey/TaskGrid";
+import { ExamplesPanel, TaskGrid, TaskHowTo, uid } from "@/components/survey/TaskGrid";
+import { selfCheckMyResponse, type SelfCheckFinding } from "@/lib/ai.functions";
+import { InfoChangeBanner } from "@/components/survey/InfoChangeBanner";
 import { SkillGrid, SkillHowTo } from "@/components/survey/SkillGrid";
 import { RequirementsForm } from "@/components/survey/RequirementsForm";
 import { validateSkills, validateTasks } from "@/components/survey/validation";
@@ -40,6 +42,7 @@ import {
   getExamples,
   getJobSuggestions,
   getLatestReject,
+  getMyDutyCandidates,
   getMyInfoRequests,
   getMyParticipant,
   getOrCreateResponse,
@@ -52,6 +55,7 @@ import {
   saveSkills,
   saveTasks,
   submit,
+  type DutyTaskCandidate,
   type InfoChangeField,
   type MyParticipant,
 } from "@/lib/survey.data";
@@ -140,70 +144,6 @@ function StepBar({ step, onSelect }: { step: number; onSelect: (n: number) => vo
         );
       })}
     </ol>
-  );
-}
-
-function HelpPanel({
-  step,
-  tasks,
-  skills,
-}: {
-  step: number;
-  tasks: TaskItem[];
-  skills: SkillItem[];
-}) {
-  const items: string[] = (() => {
-    switch (step) {
-      case 1:
-        return ["성명·사번·소속·직급이 맞는지 확인", "다르면 인사담당자에게 정정 요청"];
-      case 2:
-        return [
-          "직군 = 가장 큰 분류 (예: 사무관리)",
-          "직렬 = 중간 분류 (예: 인사)",
-          "직무 = 실제 담당 업무 단위 (예: 인사기획)",
-        ];
-      case 3:
-        return [
-          "정의는 「무엇을 대상으로 → 어떤 활동을 하여 → 어떤 상태를 만드는가」",
-          "목적(미션)은 회사에 남기는 최종 성과로",
-          "본인 이야기가 아니라 직무 이야기로",
-        ];
-      case 4:
-        return [
-          `과업 5~10개 권장 — 현재 ${tasks.length}개`,
-          `주요 과업 최대 5개 — 현재 ${tasks.filter((t) => t.isKey).length}개`,
-          "과업마다 세부 활동 2~8개",
-          "과업은 「행위 + 목적」 한 문장",
-          "일시적 프로젝트·TF 업무는 제외",
-        ];
-      case 5:
-        return [
-          `스킬 3개 이상 필수, 5개 이상 권장 — 현재 ${skills.length}개`,
-          "스킬마다 어떤 과업에 쓰이는지 연결",
-          "명칭만 쓰지 말고 설명 한 줄 추가",
-          "학력·자격은 '내 스펙'이 아니라 '직무 요건'",
-        ];
-      default:
-        return [
-          "커버리지 자기평가 선택",
-          "빠진 업무가 있다면 마지막에 보완",
-          "제출 후에는 검토 전까지 수정 불가",
-        ];
-    }
-  })();
-
-  return (
-    <div className="space-y-3">
-      <p className="text-xs font-semibold text-muted-foreground">이 단계 체크리스트</p>
-      <ul className="space-y-2 text-sm">
-        {items.map((item) => (
-          <li key={item} className="flex gap-2 text-muted-foreground">
-            <span className="mt-1.5 size-1.5 shrink-0 rounded-full bg-primary" />
-            <span>{item}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
   );
 }
 
@@ -322,11 +262,11 @@ function InfoRequestPanel({
       requested: requested.trim(),
     }));
     if (fields.length === 0) {
-      toast.error("정정할 항목을 하나 이상 선택하세요.");
+      toast.error("정정할 항목을 하나 이상 골라 주세요.");
       return;
     }
     if (fields.some((f) => f.requested === "")) {
-      toast.error("선택한 항목의 올바른 값을 모두 입력하세요.");
+      toast.error("선택한 항목의 올바른 값을 모두 적어 주세요.");
       return;
     }
     setSending(true);
@@ -452,6 +392,114 @@ function InfoRequestPanel({
   );
 }
 
+/**
+ * V8: 업무분장표에서 과업 후보를 골라 4단계 그리드에 프리필한다.
+ * 후보가 0건이면 호출부에서 버튼 자체를 렌더하지 않는다(빈 상태 소음 금지).
+ */
+function DutyImportPanel({
+  candidates,
+  tasks,
+  onAppend,
+}: {
+  candidates: DutyTaskCandidate[];
+  tasks: TaskItem[];
+  onAppend: (items: DutyTaskCandidate[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [picked, setPicked] = useState<Set<number>>(new Set());
+
+  const existing = new Set(tasks.map((t) => t.name.trim()).filter(Boolean));
+
+  const toggle = (i: number, on: boolean) => {
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(i);
+      else next.delete(i);
+      return next;
+    });
+  };
+
+  const apply = () => {
+    onAppend(candidates.filter((_, i) => picked.has(i)));
+    setOpen(false);
+    toast.success(`업무분장 ${picked.size}건을 과업으로 추가했습니다. 내용은 자유롭게 고쳐 주세요.`);
+  };
+
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2 rounded-lg bg-secondary p-3 text-sm text-muted-foreground">
+        <span className="min-w-0 flex-1">
+          소속 조직의 업무분장표가 등록되어 있습니다. 과업 후보로 불러와 시작할 수 있습니다.
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setPicked(new Set());
+            setOpen(true);
+          }}
+        >
+          <ClipboardList className="mr-1 size-4" />
+          업무분장에서 불러오기
+        </Button>
+      </div>
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>업무분장에서 과업 불러오기</DialogTitle>
+            <DialogDescription>
+              가져올 항목을 고르세요. 주요업무는 과업명으로, 세부업무는 세부 활동으로 들어가며
+              불러온 뒤 자유롭게 수정할 수 있습니다.
+            </DialogDescription>
+          </DialogHeader>
+          <ul className="space-y-2">
+            {candidates.map((c, i) => {
+              const dup = existing.has(c.task.trim());
+              return (
+                <li key={c.task} className={cnDuty(dup)}>
+                  <label className="flex items-start gap-3 text-sm">
+                    <Checkbox
+                      checked={picked.has(i)}
+                      disabled={dup}
+                      onCheckedChange={(v) => toggle(i, v === true)}
+                      aria-label={`${c.task} 불러오기`}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="font-medium">{c.task}</span>
+                      {dup ? (
+                        <span className="ml-2 text-xs text-muted-foreground">이미 있는 과업</span>
+                      ) : null}
+                      {c.activities.length ? (
+                        <span className="mt-1 block text-xs text-muted-foreground">
+                          세부: {c.activities.join(" · ")}
+                        </span>
+                      ) : null}
+                    </span>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setOpen(false)}>
+              취소
+            </Button>
+            <Button disabled={picked.size === 0} onClick={apply}>
+              {picked.size > 0 ? `${picked.size}건 불러오기` : "불러오기"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+/** 중복(이미 있는 과업) 행은 흐리게 — 목록이 길어 클래스 분기를 함수로 뺐다. */
+function cnDuty(dup: boolean) {
+  return `rounded-lg border p-3 ${dup ? "opacity-50" : ""}`;
+}
+
 function SurveyPage() {
   const navigate = Route.useNavigate();
   const search = Route.useSearch();
@@ -492,6 +540,13 @@ function SurveyPage() {
   const [conflictOpen, setConflictOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [justSubmitted, setJustSubmitted] = useState(false);
+  /** V15-2: 제출 전 셀프 AI 점검 다이얼로그 상태. 게이트가 아니므로 제출 흐름과 무관하다. */
+  const [aiCheck, setAiCheck] = useState<{
+    open: boolean;
+    loading: boolean;
+    findings: SelfCheckFinding[] | null;
+    error: string | null;
+  }>({ open: false, loading: false, findings: null, error: null });
 
   const hydratedRef = useRef(false);
   /** 서버 값 주입으로 state 가 바뀐 직후 1회는 자동저장을 건너뛴다(방금 읽은 값을 되쓰지 않는다). */
@@ -511,6 +566,14 @@ function SurveyPage() {
   const responseId = data?.response.id ?? null;
   const status = data?.response.status ?? "draft";
   const readOnly = status === "submitted" || status === "approved";
+
+  // V8: 소속 조직 업무분장 후보. 0건이면 4단계 버튼 자체가 안 뜬다.
+  const { data: dutyCandidates } = useQuery({
+    queryKey: ["duty-candidates"],
+    queryFn: () => getMyDutyCandidates(),
+    enabled: !!data && !readOnly,
+    staleTime: Infinity,
+  });
 
   // 단계는 URL 에서 파생한다. 상한을 넘는 값(앞 단계 건너뛰기)은 상한으로 눌러 쓴다.
   // 상한은 렌더 중에 올린다 — effect 로 미루면 첫 렌더의 step 이 1로 굳는다.
@@ -730,8 +793,8 @@ function SurveyPage() {
   const skillCheck = useMemo(() => validateSkills(skills), [skills]);
   const defCheck = useMemo(() => {
     const errors: string[] = [];
-    if (form.definition.trim() === "") errors.push("직무 정의를 입력하세요");
-    if (form.mission.trim() === "") errors.push("직무 목적(미션)을 입력하세요");
+    if (form.definition.trim() === "") errors.push("직무 정의를 적어 주세요");
+    if (form.mission.trim() === "") errors.push("직무 목적(미션)을 적어 주세요");
     return { ok: errors.length === 0, errors, warnings: [] };
   }, [form.definition, form.mission]);
 
@@ -792,6 +855,24 @@ function SurveyPage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  /** V15-2: 화면의 마지막 입력까지 저장한 뒤 본인 응답을 AI 로 점검한다(선택 사항). */
+  async function runAiCheck() {
+    if (!responseId) return;
+    setAiCheck({ open: true, loading: true, findings: null, error: null });
+    try {
+      await flush(stepRef.current);
+      const res = await selfCheckMyResponse({ data: { responseId } });
+      setAiCheck({ open: true, loading: false, findings: res.findings, error: null });
+    } catch {
+      setAiCheck({
+        open: true,
+        loading: false,
+        findings: null,
+        error: "AI 점검을 잠시 사용할 수 없습니다 — 그대로 제출해도 됩니다.",
+      });
+    }
+  }
+
   async function handleSubmit() {
     if (!responseId || readOnly) return;
 
@@ -804,7 +885,7 @@ function SurveyPage() {
     }
     if (!form.coverage) {
       setConfirmOpen(false);
-      toast.error("커버리지 자기평가를 선택해야 제출할 수 있습니다.");
+      toast.error("'내 일을 어느 정도 담았는지'를 선택해야 제출할 수 있습니다.");
       return;
     }
 
@@ -881,7 +962,6 @@ function SurveyPage() {
 
   const { participant, examples, reject, suggestions } = data;
   const stepMeta = STEPS[step - 1] as (typeof STEPS)[number];
-  const help = <HelpPanel step={step} tasks={tasks} skills={skills} />;
   const improveNotes = tasks.filter((t) => t.improveType || t.improveNote.trim());
 
   return (
@@ -918,27 +998,13 @@ function SurveyPage() {
                   지금 저장
                 </Button>
               ) : null}
-              <Sheet>
-                <SheetTrigger asChild>
-                  <Button variant="outline" size="sm" className="lg:hidden">
-                    <HelpCircle className="size-4" />
-                    도움말
-                  </Button>
-                </SheetTrigger>
-                <SheetContent side="bottom" className="max-h-[70vh] overflow-y-auto">
-                  <SheetHeader>
-                    <SheetTitle>{stepMeta.label} 도움말</SheetTitle>
-                  </SheetHeader>
-                  <div className="mt-4">{help}</div>
-                </SheetContent>
-              </Sheet>
             </div>
           </div>
           <StepBar step={step} onSelect={(n) => void goTo(n)} />
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl gap-6 px-4 py-6 sm:px-6 lg:grid lg:grid-cols-[1fr_260px]">
+      <main className="mx-auto max-w-5xl px-4 py-6 sm:px-6">
         <div className="space-y-5">
           {status === "rejected" && reject ? (
             <RejectBanner
@@ -957,6 +1023,7 @@ function SurveyPage() {
             <div className="mt-6">
               {step === 1 ? (
                 <div className="space-y-4">
+                  <InfoChangeBanner />
                   <InfoRequestPanel participant={participant} showPending />
                   <dl className="grid gap-3 sm:grid-cols-2">
                     {[
@@ -979,6 +1046,10 @@ function SurveyPage() {
 
               {step === 2 ? (
                 <div className="space-y-4">
+                  <p className="rounded-lg bg-secondary p-3 text-sm text-muted-foreground">
+                    직군 = 가장 큰 분류 (예: 사무관리) · 직렬 = 중간 분류 (예: 인사) · 직무 = 실제
+                    담당 업무 단위 (예: 인사기획)
+                  </p>
                   <div className="rounded-lg border bg-background p-3">
                     <p className="text-xs text-muted-foreground">회사</p>
                     <p className="mt-1 text-sm font-medium">
@@ -1040,7 +1111,7 @@ function SurveyPage() {
                     <Label htmlFor="definition">직무 정의</Label>
                     <p className="text-xs text-muted-foreground">
                       「무엇을 대상으로 → 어떤 활동을 하여 → 어떤 상태를 만드는가」가 드러나도록 2~3줄로
-                      적어 주세요.
+                      적어 주세요. 본인 이야기가 아니라 직무 이야기로 적습니다.
                     </p>
                     <Textarea
                       id="definition"
@@ -1070,7 +1141,29 @@ function SurveyPage() {
 
               {step === 4 ? (
                 <div className="space-y-5">
-                  <TaskHowTo />
+                  <TaskHowTo taskCount={tasks.length} />
+                  {!readOnly && (dutyCandidates?.length ?? 0) > 0 ? (
+                    <DutyImportPanel
+                      candidates={dutyCandidates ?? []}
+                      tasks={tasks}
+                      onAppend={(items) =>
+                        setTasks((prev) => [
+                          ...prev,
+                          ...items.map((c) => ({
+                            id: uid(),
+                            name: c.task,
+                            importance: null,
+                            authority: null,
+                            transferable: null,
+                            isKey: false,
+                            improveType: null,
+                            improveNote: "",
+                            activities: c.activities.map((a) => ({ id: uid(), name: a })),
+                          })),
+                        ])
+                      }
+                    />
+                  ) : null}
                   <ExamplesPanel
                     examples={examples.filter((e) => e.field === "task" || e.field === "activity")}
                     jobGroup={form.jobGroup}
@@ -1119,7 +1212,7 @@ function SurveyPage() {
                     </TabsTrigger>
                   </TabsList>
                   <TabsContent value="skills" className="mt-4 space-y-5">
-                    <SkillHowTo />
+                    <SkillHowTo skillCount={skills.length} />
                     <ExamplesPanel
                       examples={examples.filter((e) => e.field === "skill")}
                       jobGroup={form.jobGroup}
@@ -1208,6 +1301,24 @@ function SurveyPage() {
                       onChange={(e) => setForm({ ...form, missedNote: e.target.value })}
                     />
                   </div>
+
+                  {!readOnly ? (
+                    <div className="flex flex-wrap items-center gap-2 rounded-lg bg-secondary p-3 text-sm text-muted-foreground">
+                      <span className="min-w-0 flex-1">
+                        제출 전에 AI 가 작성 내용을 한 번 훑어볼 수 있습니다. 선택 사항이며 점검
+                        없이 그대로 제출해도 됩니다.
+                      </span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={aiCheck.loading}
+                        onClick={() => void runAiCheck()}
+                      >
+                        <Sparkles className="mr-1 size-4" />
+                        제출 전 AI 점검 (선택)
+                      </Button>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>
@@ -1227,7 +1338,9 @@ function SurveyPage() {
 
             {activeCheck && activeCheck.warnings.length ? (
               <div className="mt-3 rounded-lg border border-warning/40 bg-warning/5 p-4">
-                <p className="text-sm font-semibold text-warning">확인해 보세요 (이동은 가능합니다)</p>
+                <p className="text-sm font-semibold text-warning">
+                  권장 사항 — 반영하지 않아도 다음 단계로 넘어갈 수 있습니다
+                </p>
                 <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
                   {activeCheck.warnings.map((msg) => (
                     <li key={msg}>{msg}</li>
@@ -1265,27 +1378,74 @@ function SurveyPage() {
           </div>
           {step === STEPS.length && !readOnly && !form.coverage ? (
             <p className="text-center text-xs text-muted-foreground">
-              커버리지 자기평가를 선택하면 제출할 수 있습니다.
+              &lsquo;내 일을 어느 정도 담았는지&rsquo;를 선택하면 제출할 수 있습니다.
             </p>
           ) : null}
         </div>
-
-        <aside className="hidden lg:block">
-          <div className="sticky top-28 rounded-xl border bg-card p-4 shadow-sm">{help}</div>
-        </aside>
       </main>
 
       <Dialog open={conflictOpen} onOpenChange={setConflictOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>다른 곳에서 내용이 바뀌었습니다</DialogTitle>
+            <DialogTitle>관리자가 이 응답을 수정했습니다</DialogTitle>
             <DialogDescription>
-              관리자가 이 응답을 수정했습니다. 최신 내용을 불러옵니다. 방금 입력하던 내용은 최신
-              내용으로 대체됩니다.
+              방금 입력분은 사라지고 최신 내용으로 바뀝니다. 확인을 누르면 최신 내용을 불러옵니다.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button onClick={() => void reloadFromServer()}>확인</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={aiCheck.open}
+        onOpenChange={(v) => setAiCheck((prev) => ({ ...prev, open: v }))}
+      >
+        <DialogContent className="max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>제출 전 AI 점검</DialogTitle>
+            <DialogDescription>
+              참고용 제안입니다. 반영 여부는 자유이며 이대로 제출해도 됩니다.
+            </DialogDescription>
+          </DialogHeader>
+          {aiCheck.loading ? (
+            <p className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              작성 내용을 점검하는 중입니다...
+            </p>
+          ) : aiCheck.error ? (
+            <p className="rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm">
+              {aiCheck.error}
+            </p>
+          ) : aiCheck.findings && aiCheck.findings.length > 0 ? (
+            <ul className="space-y-2">
+              {aiCheck.findings.map((f) => (
+                <li key={`${f.item}-${f.reason}`} className="rounded-lg border bg-background p-3">
+                  <p className="text-sm font-semibold">{f.item}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">{f.reason}</p>
+                  {f.suggestion ? (
+                    <p className="mt-1 text-sm">
+                      <span className="font-medium text-primary">제안 </span>
+                      {f.suggestion}
+                    </p>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="flex items-center gap-2 rounded-lg border bg-background p-3 text-sm">
+              <CheckCircle2 className="size-4 shrink-0 text-success" />
+              특별한 보완점을 찾지 못했습니다. 그대로 제출하셔도 좋습니다.
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setAiCheck((prev) => ({ ...prev, open: false }))}
+            >
+              닫기
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1295,13 +1455,12 @@ function SurveyPage() {
           <DialogHeader>
             <DialogTitle>업무조사를 제출할까요?</DialogTitle>
             <DialogDescription>
-              제출 후에는 관리자 검토 전까지 수정할 수 없습니다. 작성 내용을 다시 확인하셨다면 제출해
-              주세요.
+              제출하면 수정할 수 없습니다. 관리자가 보완을 요청하면 다시 열립니다.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setConfirmOpen(false)} disabled={sending}>
-              더 검토할게요
+              계속 작성하기
             </Button>
             <Button onClick={() => void handleSubmit()} disabled={sending}>
               {sending ? "제출 중..." : "제출하기"}

@@ -18,7 +18,7 @@ export interface TaskItem {
   importance: number | null; // 1~5
   authority: Authority | null;
   transferable: boolean | null;
-  isKey: boolean; // 주요 Task (최대 5)
+  isKey: boolean; // (폐지) 주요 Task 별표 — UI 제거됨. DB is_key 컬럼 호환용으로만 남고 저장 시 항상 false.
   improveType: ImproveType | null;
   improveNote: string;
   activities: ActivityItem[]; // 2~8 권장

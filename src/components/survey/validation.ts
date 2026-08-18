@@ -77,40 +77,37 @@ export function validateTasks(tasks: TaskItem[]): TaskValidation {
   tasks.forEach((task, index) => {
     const name = label(task, index);
     if (task.name.trim() === "") {
-      errors.push(`${index + 1}번째 과업의 이름을 입력하세요`);
+      errors.push(`${index + 1}번째 과업의 이름을 「행위 + 목적」 한 문장으로 적어 주세요`);
     }
     if (task.activities.length === 0) {
-      errors.push(`${name} 과업에 세부 활동을 1개 이상 추가하세요`);
+      errors.push(`${name} 과업의 실제 수행 단계인 세부 활동을 1개 이상 추가해 주세요`);
     }
     task.activities.forEach((act, ai) => {
       if (act.name.trim() === "") {
-        errors.push(`${name} 과업의 ${ai + 1}번째 세부 활동 이름을 입력하세요`);
+        errors.push(`${name} 과업의 ${ai + 1}번째 세부 활동 이름을 적어 주세요`);
       }
     });
     if (task.activities.length === 1) {
-      warnings.push(`${name} 과업의 세부 활동이 1개입니다 — 2~8개로 나누는 것을 권장`);
+      warnings.push(`${name} 과업의 세부 활동이 1개입니다 — 2~8개로 나눠 주세요 (권장)`);
     }
     if (task.importance === null) {
-      errors.push(`${name} 과업의 중요도를 선택하세요`);
+      errors.push(`${name} 과업의 중요도(1~5)를 골라 주세요`);
     }
     if (task.authority === null) {
-      errors.push(`${name} 과업의 책임수준을 선택하세요`);
+      errors.push(`${name} 과업의 책임수준(D/R/O/S)을 골라 주세요`);
     }
     if (task.transferable === null) {
-      errors.push(`${name} 과업의 이관 가능 여부를 선택하세요`);
+      errors.push(`${name} 과업의 이관 가능 여부(예/아니오)를 골라 주세요`);
     }
   });
 
-  const keyCount = tasks.filter((t) => t.isKey).length;
-  if (keyCount > 5) {
-    errors.push(`주요 과업은 최대 5개까지만 선택할 수 있습니다(현재 ${keyCount}개)`);
-  }
-
   for (const pair of findSimilarPairs(tasks)) {
-    warnings.push(`'${pair.nameA}'와 '${pair.nameB}'가 비슷합니다 — 하나로 묶는 것을 권장`);
+    warnings.push(
+      `'${pair.nameA}'와 '${pair.nameB}'가 비슷해 보입니다 — 같은 일이라면 하나로 합쳐 주세요 (권장)`,
+    );
   }
   if (tasks.length > 10) {
-    warnings.push("과업이 많습니다 — 유사 항목은 묶는 것을 권장");
+    warnings.push("과업이 10개를 넘으면 비슷한 것끼리 합쳐 주세요 (권장)");
   }
 
   return { ok: errors.length === 0, errors, warnings };
@@ -125,13 +122,13 @@ export function validateSkills(skills: SkillItem[]): TaskValidation {
   skills.forEach((skill, index) => {
     const name = skill.name.trim() === "" ? `${index + 1}번째 스킬` : `'${skill.name.trim()}'`;
     if (skill.name.trim() === "") {
-      errors.push(`${index + 1}번째 스킬의 이름을 입력하세요`);
+      errors.push(`${index + 1}번째 스킬의 이름을 적어 주세요`);
     }
     if (skill.ksao === null) {
-      errors.push(`${name}의 구분(지식/기술/능력)을 선택하세요`);
+      errors.push(`${name}의 스킬 구분(지식/기술/태도)을 골라 주세요`);
     }
     if (skill.description.trim() === "") {
-      errors.push(`${name}의 한 줄 설명을 입력하세요`);
+      errors.push(`${name}이 어떤 상황에서 쓰이는 능력인지 한 줄 설명을 적어 주세요`);
     }
   });
 

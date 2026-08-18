@@ -22,13 +22,19 @@ const HARD_SOFT: { value: HardSoft; hint: string }[] = [
 ];
 
 /** ⑤단계 안내 — 작성 순서 + 지식·기술·태도, Hard/Soft 정의 전체. */
-export function SkillHowTo() {
+export function SkillHowTo({ skillCount }: { skillCount?: number | undefined }) {
   return (
     <HowToBox
+      note={
+        skillCount === undefined
+          ? undefined
+          : `스킬 3개 이상 필수, 5개 이상 권장 — 현재 ${skillCount}개`
+      }
       steps={[
         "이 직무를 제대로 하려면 필요한 지식·기술·태도를 3개 이상 적습니다(5개 이상 권장).",
         "각 스킬이 지식·기술·태도 중 무엇인지, Hard 인지 Soft 인지 고릅니다.",
         "그 스킬이 쓰이는 과업을 연결합니다. 특정 과업과 무관하면 「직무 공통 스킬」을 고릅니다.",
+        "자격요건 탭의 학력·자격은 '내 스펙'이 아니라 '이 직무에 필요한 기준'으로 적습니다.",
       ]}
       sections={[
         {
@@ -211,7 +217,7 @@ export function SkillGrid({ value, onChange, tasks, disabled = false }: SkillGri
                 </div>
                 {tasks.length === 0 ? (
                   <p className="text-xs text-muted-foreground">
-                    이전 단계에서 과업을 먼저 작성해 주세요.
+                    4단계에서 과업을 먼저 작성해 주세요.
                   </p>
                 ) : (
                   <ul className="grid gap-2 sm:grid-cols-2">

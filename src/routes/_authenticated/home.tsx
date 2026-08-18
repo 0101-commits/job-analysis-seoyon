@@ -6,6 +6,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/StatusBadge";
 import { getLatestReject } from "@/lib/survey.data";
+import { InfoChangeBanner } from "@/components/survey/InfoChangeBanner";
 import {
   AiSuggestionCards,
   type AiSuggestionItem,
@@ -140,7 +141,7 @@ function RespondentHome() {
             rejectStep && surveyTarget === "/survey"
               ? `${rejectStep}단계부터 보완하기`
               : "반려됨 — 수정하러 가기",
-          surveyMessage: "관리자 검토 의견이 등록되었습니다. 내용을 보완해 다시 제출해 주세요.",
+          surveyMessage: "제출한 응답이 반려되었습니다. 아래 사유를 확인하고 보완해 주세요.",
           surveyAction: surveyTarget,
         };
       case "draft":
@@ -182,6 +183,7 @@ function RespondentHome() {
       </header>
 
       <main className="mx-auto max-w-4xl space-y-6 px-4 py-8 sm:px-6 sm:py-10">
+        <InfoChangeBanner />
         <section className="rounded-xl border bg-card p-5 shadow-sm sm:p-7">
           <p className="text-sm text-muted-foreground">
             {isLoading ? "불러오는 중..." : (data?.companies?.name ?? "계열사 미지정")}
@@ -281,7 +283,7 @@ function RespondentHome() {
                 내게 온 검토 요청 {pendingSuggestions.length}건
               </h3>
               <p className="mt-1 text-sm text-muted-foreground">
-                AI가 제안한 내용입니다. 수락·수정·거절 중 하나를 선택해 주세요.
+                관리자가 AI로 보완한 제안입니다. 수락하면 내 응답에 반영됩니다.
               </p>
             </div>
             <AiSuggestionCards suggestions={pendingSuggestions} onDecide={handleDecide} />

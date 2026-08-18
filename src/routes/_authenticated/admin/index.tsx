@@ -1,48 +1,42 @@
-import { useMemo, useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
+import { useEffect, useMemo, useState } from "react";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
-import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { StatusBadge } from "@/components/StatusBadge";
 import { ACCOUNT_STATUS_LABELS } from "@/lib/auth";
-import { fetchAll } from "@/lib/paginate";
+import {
+  checkIntegrity,
+  getLaunchReadiness,
+  getOrgOverview,
+  type OrgOverview,
+  type OverviewParticipant,
+  type OverviewUnit,
+} from "@/lib/dashboard.functions";
 
 export const Route = createFileRoute("/_authenticated/admin/")({
   head: () => ({
     meta: [
       { title: "대시보드 | 서연 그룹 업무조사" },
-      { name: "description", content: "계열사별 조사 진행 현황을 한눈에 확인합니다." },
+      { name: "description", content: "조직별 조사 진행 현황을 한눈에 확인합니다." },
       { property: "og:title", content: "대시보드 | 서연 그룹 업무조사" },
-      { property: "og:description", content: "계열사별 조사 진행 현황을 한눈에 확인합니다." },
+      { property: "og:description", content: "조직별 조사 진행 현황을 한눈에 확인합니다." },
     ],
   }),
   component: DashboardPage,
 });
 
 const DONE_STATUSES = ["제출", "승인"];
-/** 이 일수 이상 움직임이 없는 미제출자를 미진행자로 본다. */
-const STALE_DAYS = 7;
+/** 조직 미배정 참여자를 묶는 가상 노드 id. */
+const UNASSIGNED = "__unassigned__";
 
-type ParticipantRow = {
-  id: string;
-  name: string;
-  emp_no: string;
-  org_text: string | null;
-  account_status: string;
-  role: string;
-  company_id: string;
-  invited_at: string | null;
-  last_seen_at: string | null;
-  companies: { name: string } | null;
-};
+async function authHeaders() {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) throw new Error("세션이 만료되었습니다. 다시 로그인해 주세요.");
+  return { Authorization: `Bearer ${token}` };
+}
 
 function daysSince(value: string | null) {
   if (!value) return null;
@@ -60,54 +54,133 @@ function formatDateTime(value: string | null) {
   return new Date(value).toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" });
 }
 
+type Tracked = OverviewParticipant & {
+  done: boolean;
+  stale: boolean;
+  elapsed: number | null;
+  lastActivity: string | null;
+};
+
+type Rollup = { total: number; done: number; stale: number };
+
+/** 스코프 필터 → 조직 트리 인덱스 → 하위 합산 롤업까지, 화면이 쓰는 파생 모델 전부. */
+function buildModel(overview: OrgOverview, companyId: string) {
+  const inScope = (cid: string) => companyId === "all" || cid === companyId;
+  const staleDaysBy = new Map(overview.settings.map((s) => [s.company_id, s.stale_days]));
+
+  const units = overview.units.filter((u) => inScope(u.company_id));
+  const unitById = new Map(units.map((u) => [u.id, u]));
+  const children = new Map<string | null, OverviewUnit[]>();
+  for (const u of units) {
+    const key = u.parent_id && unitById.has(u.parent_id) ? u.parent_id : null;
+    const list = children.get(key);
+    if (list) list.push(u);
+    else children.set(key, [u]);
+  }
+  for (const list of children.values()) {
+    list.sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name, "ko"));
+  }
+
+  const scoped = overview.participants.filter((p) => inScope(p.company_id));
+  const respondents: Tracked[] = scoped
+    .filter((p) => p.role === "respondent")
+    .map((p) => {
+      const lastActivity = p.last_seen_at ?? p.invited_at;
+      const elapsed = daysSince(lastActivity);
+      const done = DONE_STATUSES.includes(p.account_status);
+      const staleDays = staleDaysBy.get(p.company_id) ?? 7;
+      return {
+        ...p,
+        lastActivity,
+        elapsed,
+        done,
+        stale: !done && (elapsed === null || elapsed >= staleDays),
+      };
+    });
+
+  // 조직이 삭제돼 링크가 끊긴(dangling) 인원도 미배정으로 묶는다.
+  const membersByUnit = new Map<string, Tracked[]>();
+  for (const p of respondents) {
+    const key = p.org_unit_id && unitById.has(p.org_unit_id) ? p.org_unit_id : UNASSIGNED;
+    const list = membersByUnit.get(key);
+    if (list) list.push(p);
+    else membersByUnit.set(key, [p]);
+  }
+  for (const list of membersByUnit.values()) {
+    list.sort((a, b) => a.emp_no.localeCompare(b.emp_no));
+  }
+
+  const rollup = new Map<string, Rollup>();
+  const compute = (id: string): Rollup => {
+    const own = membersByUnit.get(id) ?? [];
+    const acc: Rollup = {
+      total: own.length,
+      done: own.filter((m) => m.done).length,
+      stale: own.filter((m) => m.stale).length,
+    };
+    for (const child of children.get(id) ?? []) {
+      const c = compute(child.id);
+      acc.total += c.total;
+      acc.done += c.done;
+      acc.stale += c.stale;
+    }
+    rollup.set(id, acc);
+    return acc;
+  };
+  for (const root of children.get(null) ?? []) compute(root.id);
+
+  const unassigned = membersByUnit.get(UNASSIGNED) ?? [];
+  rollup.set(UNASSIGNED, {
+    total: unassigned.length,
+    done: unassigned.filter((m) => m.done).length,
+    stale: unassigned.filter((m) => m.stale).length,
+  });
+
+  return { scoped, respondents, units, unitById, children, membersByUnit, rollup, staleDaysBy };
+}
+
 function DashboardPage() {
   const { companyId } = useCompanyScope();
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [staleOnly, setStaleOnly] = useState(false);
+  /** 드릴다운 경로(조직 id 나열). 마지막 요소가 현재 보고 있는 조직이다. */
+  const [path, setPath] = useState<string[]>([]);
+  const [showIntegrity, setShowIntegrity] = useState(false);
+  useEffect(() => setPath([]), [companyId]);
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["dashboard", companyId],
-    queryFn: async () => {
-      // 전사 스코프에서는 1000명을 넘길 수 있어 페이지를 이어 받는다.
-      return fetchAll<ParticipantRow>(async (from, to) => {
-        let query = supabase
-          .from("participants")
-          .select(
-            "id, name, emp_no, org_text, account_status, role, company_id, invited_at, last_seen_at, companies(name)",
-          )
-          // emp_no 는 계열사끼리 겹칠 수 있다. id 로 순서를 확정해야 페이지가 어긋나지 않는다.
-          .order("emp_no")
-          .order("id")
-          .range(from, to);
-        if (companyId !== "all") query = query.eq("company_id", companyId);
-        const { data, error } = await query;
-        return { data: (data ?? []) as ParticipantRow[], error };
-      });
-    },
+  const { data: overview, isLoading } = useQuery({
+    queryKey: ["dashboard-overview"],
+    queryFn: async () => getOrgOverview({ headers: await authHeaders() }),
+  });
+  const { data: integrity } = useQuery({
+    queryKey: ["dashboard-integrity"],
+    queryFn: async () => checkIntegrity({ headers: await authHeaders() }),
+  });
+  const { data: readiness } = useQuery({
+    queryKey: ["dashboard-readiness"],
+    queryFn: async () => getLaunchReadiness({ headers: await authHeaders() }),
   });
 
-  const { data: settings } = useQuery({
-    queryKey: ["dashboard-deadlines"],
-    queryFn: async () => {
-      const { data, error } = await supabase.from("survey_settings").select("company_id, deadline");
-      if (error) throw error;
-      return data ?? [];
-    },
-  });
+  const model = useMemo(
+    () => (overview ? buildModel(overview, companyId) : null),
+    [overview, companyId],
+  );
+  const companyName = useMemo(
+    () => new Map((overview?.companies ?? []).map((c) => [c.id, c.name])),
+    [overview],
+  );
 
-  const rows = useMemo(() => data ?? [], [data]);
-  const respondents = useMemo(() => rows.filter((r) => r.role === "respondent"), [rows]);
-  const submitted = respondents.filter((r) => DONE_STATUSES.includes(r.account_status)).length;
+  const respondents = model?.respondents ?? [];
+  const submitted = respondents.filter((r) => r.done).length;
   const rate = respondents.length ? Math.round((submitted / respondents.length) * 100) : 0;
+  const staleList = respondents.filter((r) => r.stale);
 
   // 스코프가 전체면 가장 이른 마감일을 기준으로 보여준다.
   const deadline = useMemo(() => {
-    const scoped = (settings ?? []).filter(
+    const scoped = (overview?.settings ?? []).filter(
       (s) => companyId === "all" || s.company_id === companyId,
     );
     const dates = scoped.map((s) => s.deadline).filter((d): d is string => Boolean(d));
     return dates.length ? dates.sort()[0] : null;
-  }, [settings, companyId]);
+  }, [overview, companyId]);
   const dday = deadline ? daysUntil(deadline) : null;
 
   const cards = [
@@ -121,45 +194,114 @@ function DashboardPage() {
     },
   ];
 
-  /** 계열사별 제출률 (응답자 기준) */
-  const byCompany = useMemo(() => {
-    const map = new Map<string, { name: string; total: number; done: number }>();
-    for (const r of respondents) {
-      const key = r.company_id;
-      const entry = map.get(key) ?? { name: r.companies?.name ?? "미지정", total: 0, done: 0 };
-      entry.total += 1;
-      if (DONE_STATUSES.includes(r.account_status)) entry.done += 1;
-      map.set(key, entry);
-    }
-    return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, "ko"));
-  }, [respondents]);
+  // ── 드릴다운 현재 위치 ──
+  const currentId = path.length > 0 ? (path[path.length - 1] ?? null) : null;
+  const levelNodes =
+    !model || currentId === UNASSIGNED
+      ? []
+      : (model.children.get(currentId) ?? []);
+  const memberList = !model
+    ? []
+    : currentId === null
+      ? [] // 최상위 화면에는 개인 목록을 두지 않는다.
+      : (model.membersByUnit.get(currentId) ?? []);
+  const atRoot = currentId === null;
+  const crumbs = [
+    { id: null as string | null, label: "전체" },
+    ...path.map((id) => ({
+      id: id as string | null,
+      label: id === UNASSIGNED ? "미배정" : (model?.unitById.get(id)?.name ?? "?"),
+    })),
+  ];
 
-  /** 개인별 상태 — 최종 활동 시각과 경과일을 함께 본다. */
-  const tracked = useMemo(
-    () =>
-      respondents.map((r) => {
-        const lastActivity = r.last_seen_at ?? r.invited_at;
-        const elapsed = daysSince(lastActivity);
-        const stale =
-          !DONE_STATUSES.includes(r.account_status) && (elapsed === null || elapsed >= STALE_DAYS);
-        return { ...r, lastActivity, elapsed, stale };
-      }),
-    [respondents],
-  );
+  const staleLabel =
+    companyId !== "all"
+      ? `${model?.staleDaysBy.get(companyId) ?? 7}일 이상 무활동`
+      : "계열사별 기준일 이상 무활동";
 
-  const filtered = tracked.filter(
-    (r) => (statusFilter === "all" || r.account_status === statusFilter) && (!staleOnly || r.stale),
-  );
-  const staleCount = tracked.filter((r) => r.stale).length;
+  const failedChecks = (integrity?.checks ?? []).filter((c) => c.count > 0);
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-xl font-bold sm:text-2xl">대시보드</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          계열사별 조사 진행 현황을 한눈에 확인합니다.
+          조직별 조사 진행 현황을 한눈에 확인합니다.
         </p>
       </div>
+
+      {/* 정합성 점검: 문제가 있을 때만 보이는 카드 */}
+      {integrity && integrity.total > 0 && (
+        <div className="rounded-xl border border-destructive/40 bg-destructive/5 shadow-sm">
+          <button
+            type="button"
+            className="flex w-full items-center justify-between gap-3 p-4 text-left sm:px-5"
+            onClick={() => setShowIntegrity((v) => !v)}
+          >
+            <div>
+              <p className="text-sm font-semibold text-destructive">
+                확인 필요 {integrity.total}건
+              </p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                데이터 정합성 점검에서 확인이 필요한 항목이 있습니다. 눌러서 펼치기
+              </p>
+            </div>
+            <span className="text-xs text-muted-foreground">{showIntegrity ? "접기" : "펼치기"}</span>
+          </button>
+          {showIntegrity && (
+            <ul className="space-y-3 border-t border-destructive/20 p-4 sm:px-5">
+              {failedChecks.map((c) => (
+                <li key={c.key} className="rounded-lg border bg-card p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-medium">
+                      {c.label} <span className="text-destructive">{c.count}건</span>
+                    </p>
+                    <a href={c.link} className="text-xs font-medium text-primary underline">
+                      {c.linkLabel} →
+                    </a>
+                  </div>
+                  {c.items.length > 0 && (
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      {c.items.join(", ")}
+                      {c.count > c.items.length && ` 외 ${c.count - c.items.length}건`}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* 개시 준비 점검: 전부 통과면 한 줄로 접는다 */}
+      {readiness &&
+        (readiness.ready ? (
+          <p className="rounded-xl border bg-card px-4 py-3 text-sm text-muted-foreground shadow-sm">
+            ✓ 개시 준비 점검 6항목을 모두 통과했습니다.
+          </p>
+        ) : (
+          <div className="rounded-xl border bg-card p-4 shadow-sm sm:p-6">
+            <h2 className="text-base font-semibold">개시 준비 점검</h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              조사 개시 전에 갖춰야 할 항목을 자동 판정합니다.
+            </p>
+            <ul className="mt-3 grid gap-2 sm:grid-cols-2">
+              {readiness.items.map((item) => (
+                <li key={item.key} className="flex items-start gap-2 text-sm">
+                  <span className={item.ok ? "text-primary" : "text-destructive"}>
+                    {item.ok ? "✓" : "✗"}
+                  </span>
+                  <span>
+                    {item.label}
+                    {item.hint && (
+                      <span className="block text-xs text-muted-foreground">{item.hint}</span>
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
 
       <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4">
         {cards.map((c) => (
@@ -178,6 +320,7 @@ function DashboardPage() {
         </p>
         <ul className="mt-4 space-y-2">
           {ACCOUNT_STATUS_LABELS.map((status) => {
+            const rows = model?.scoped ?? [];
             const count = rows.filter((r) => r.account_status === status).length;
             const pct = rows.length ? Math.round((count / rows.length) * 100) : 0;
             return (
@@ -195,136 +338,225 @@ function DashboardPage() {
         </ul>
       </div>
 
-      <div className="rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-        <h2 className="text-base font-semibold">계열사별 제출률</h2>
-        {byCompany.length === 0 ? (
-          <p className="mt-3 text-sm text-muted-foreground">표시할 계열사가 없습니다.</p>
-        ) : (
-          <ul className="mt-4 space-y-3">
-            {byCompany.map((c) => {
-              const pct = c.total ? Math.round((c.done / c.total) * 100) : 0;
-              return (
-                <li key={c.name}>
-                  <div className="flex items-baseline justify-between gap-2 text-sm">
-                    <span className="font-medium">{c.name}</span>
-                    <span className="text-muted-foreground">
-                      {c.done}/{c.total}명 · {pct}%
-                    </span>
-                  </div>
-                  <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-secondary">
-                    <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </div>
-
+      {/* 조직별 현황 보드: 카드 클릭으로 드릴다운, 말단에서 개인 목록 */}
       <div className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="text-base font-semibold">개인별 상태</h2>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {STALE_DAYS}일 이상 움직임이 없는 미제출자 {staleCount}명
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-3">
-            <Select value={statusFilter} onValueChange={setStatusFilter}>
-              <SelectTrigger className="w-[150px]" aria-label="상태 필터">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">전체 상태</SelectItem>
-                {ACCOUNT_STATUS_LABELS.map((s) => (
-                  <SelectItem key={s} value={s}>
-                    {s}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={staleOnly}
-                onCheckedChange={(checked) => setStaleOnly(checked === true)}
-                aria-label={`${STALE_DAYS}일 이상 미진행자만 보기`}
-              />
-              {STALE_DAYS}일 이상 미진행자
-            </label>
-          </div>
+        <div>
+          <h2 className="text-base font-semibold">조직별 현황</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            수치는 하위 조직을 합산한 값입니다. 카드를 누르면 하위 조직과 인원으로 들어갑니다.
+          </p>
         </div>
+
+        <nav className="flex flex-wrap items-center gap-1 text-sm" aria-label="조직 경로">
+          {crumbs.map((crumb, i) => {
+            const last = i === crumbs.length - 1;
+            return (
+              <span key={`${crumb.id ?? "root"}-${i}`} className="flex items-center gap-1">
+                {i > 0 && <span className="text-muted-foreground">/</span>}
+                {last ? (
+                  <span className="font-medium">{crumb.label}</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="text-primary underline-offset-2 hover:underline"
+                    onClick={() => setPath(path.slice(0, i))}
+                  >
+                    {crumb.label}
+                  </button>
+                )}
+              </span>
+            );
+          })}
+        </nav>
 
         {isLoading ? (
           <p className="text-sm text-muted-foreground">불러오는 중...</p>
-        ) : filtered.length === 0 ? (
-          <p className="text-sm text-muted-foreground">조건에 맞는 인원이 없습니다.</p>
         ) : (
           <>
-            {/* 모바일: 카드 스택 */}
-            <ul className="space-y-3 md:hidden">
-              {filtered.map((r) => (
-                <li key={r.id} className="rounded-lg border p-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="font-medium">
-                        {r.name}
-                        <span className="ml-2 text-xs font-normal text-muted-foreground">
-                          {r.emp_no}
-                        </span>
-                      </p>
-                      <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                        {r.companies?.name} · {r.org_text ?? "-"}
-                      </p>
-                    </div>
-                    <StatusBadge status={r.account_status} />
-                  </div>
-                  <p className="mt-2 text-xs text-muted-foreground">
-                    최종 활동 {formatDateTime(r.lastActivity)} ·{" "}
-                    {r.elapsed === null ? "기록 없음" : `${r.elapsed}일 경과`}
-                    {r.stale && <span className="ml-1 font-medium text-destructive">정체</span>}
-                  </p>
-                </li>
-              ))}
-            </ul>
-
-            {/* 데스크톱: 표 */}
-            <div className="hidden overflow-x-auto rounded-lg border md:block">
-              <table className="w-full text-sm">
-                <thead className="bg-secondary text-left text-xs text-muted-foreground">
-                  <tr>
-                    <th className="px-4 py-3 font-medium">사번</th>
-                    <th className="px-4 py-3 font-medium">이름</th>
-                    <th className="px-4 py-3 font-medium">계열사</th>
-                    <th className="px-4 py-3 font-medium">소속</th>
-                    <th className="px-4 py-3 font-medium">상태</th>
-                    <th className="px-4 py-3 font-medium">최종 활동</th>
-                    <th className="px-4 py-3 font-medium">경과일</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filtered.map((r) => (
-                    <tr key={r.id} className={r.stale ? "border-t bg-destructive/5" : "border-t"}>
-                      <td className="px-4 py-3 text-muted-foreground">{r.emp_no}</td>
-                      <td className="px-4 py-3 font-medium">{r.name}</td>
-                      <td className="px-4 py-3">{r.companies?.name}</td>
-                      <td className="px-4 py-3 text-muted-foreground">{r.org_text ?? "-"}</td>
-                      <td className="px-4 py-3">
-                        <StatusBadge status={r.account_status} />
-                      </td>
-                      <td className="px-4 py-3 text-muted-foreground">
-                        {formatDateTime(r.lastActivity)}
-                      </td>
-                      <td
-                        className={r.stale ? "px-4 py-3 font-medium text-destructive" : "px-4 py-3"}
+            {(levelNodes.length > 0 || (atRoot && (model?.rollup.get(UNASSIGNED)?.total ?? 0) > 0)) && (
+              <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {levelNodes.map((unit) => {
+                  const stats = model?.rollup.get(unit.id) ?? { total: 0, done: 0, stale: 0 };
+                  const pct = stats.total ? Math.round((stats.done / stats.total) * 100) : 0;
+                  return (
+                    <li key={unit.id}>
+                      <button
+                        type="button"
+                        className="w-full rounded-lg border p-3 text-left transition-colors hover:bg-secondary/50"
+                        onClick={() => setPath([...path, unit.id])}
                       >
-                        {r.elapsed === null ? "-" : `${r.elapsed}일`}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                        <div className="flex items-baseline justify-between gap-2">
+                          <p className="min-w-0 truncate font-medium">
+                            {unit.name}
+                            {unit.level && (
+                              <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+                                {unit.level}
+                              </span>
+                            )}
+                          </p>
+                          <span className="shrink-0 text-sm font-semibold">{pct}%</span>
+                        </div>
+                        {atRoot && companyId === "all" && (
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            {companyName.get(unit.company_id) ?? ""}
+                          </p>
+                        )}
+                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-secondary">
+                          <div
+                            className="h-full rounded-full bg-primary"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          대상 {stats.total}명 · 제출 {stats.done}명
+                          {stats.stale > 0 && (
+                            <span className="ml-1 font-medium text-destructive">
+                              · 미진행 {stats.stale}명
+                            </span>
+                          )}
+                        </p>
+                      </button>
+                    </li>
+                  );
+                })}
+                {atRoot && (model?.rollup.get(UNASSIGNED)?.total ?? 0) > 0 && (
+                  <li>
+                    <button
+                      type="button"
+                      className="w-full rounded-lg border border-dashed p-3 text-left transition-colors hover:bg-secondary/50"
+                      onClick={() => setPath([UNASSIGNED])}
+                    >
+                      {(() => {
+                        const stats = model!.rollup.get(UNASSIGNED)!;
+                        const pct = stats.total ? Math.round((stats.done / stats.total) * 100) : 0;
+                        return (
+                          <>
+                            <div className="flex items-baseline justify-between gap-2">
+                              <p className="font-medium text-muted-foreground">미배정</p>
+                              <span className="shrink-0 text-sm font-semibold">{pct}%</span>
+                            </div>
+                            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-secondary">
+                              <div
+                                className="h-full rounded-full bg-primary"
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                            <p className="mt-2 text-xs text-muted-foreground">
+                              대상 {stats.total}명 · 제출 {stats.done}명
+                              {stats.stale > 0 && (
+                                <span className="ml-1 font-medium text-destructive">
+                                  · 미진행 {stats.stale}명
+                                </span>
+                              )}
+                            </p>
+                          </>
+                        );
+                      })()}
+                    </button>
+                  </li>
+                )}
+              </ul>
+            )}
+
+            {atRoot && levelNodes.length === 0 && (model?.rollup.get(UNASSIGNED)?.total ?? 0) === 0 && (
+              <p className="text-sm text-muted-foreground">
+                표시할 조직이 없습니다. 마스터 관리에서 조직도를 업로드하세요.
+              </p>
+            )}
+
+            {/* 현재 조직 직속 인원 (말단이면 이 목록만 남는다) */}
+            {!atRoot &&
+              (memberList.length === 0 && levelNodes.length === 0 ? (
+                <p className="text-sm text-muted-foreground">이 조직에 배정된 인원이 없습니다.</p>
+              ) : (
+                memberList.length > 0 && (
+                  <div className="overflow-x-auto rounded-lg border">
+                    <table className="w-full text-sm">
+                      <thead className="bg-secondary text-left text-xs text-muted-foreground">
+                        <tr>
+                          <th className="px-4 py-3 font-medium">사번</th>
+                          <th className="px-4 py-3 font-medium">이름</th>
+                          <th className="px-4 py-3 font-medium">상태</th>
+                          <th className="px-4 py-3 font-medium">최근 활동</th>
+                          <th className="px-4 py-3 font-medium">경과일</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {memberList.map((r) => (
+                          <tr
+                            key={r.id}
+                            className={r.stale ? "border-t bg-destructive/5" : "border-t"}
+                          >
+                            <td className="px-4 py-3 text-muted-foreground">{r.emp_no}</td>
+                            <td className="px-4 py-3 font-medium">{r.name}</td>
+                            <td className="px-4 py-3">
+                              <StatusBadge status={r.account_status} />
+                            </td>
+                            <td className="px-4 py-3 text-muted-foreground">
+                              {formatDateTime(r.lastActivity)}
+                            </td>
+                            <td
+                              className={
+                                r.stale ? "px-4 py-3 font-medium text-destructive" : "px-4 py-3"
+                              }
+                            >
+                              {r.elapsed === null ? "-" : `${r.elapsed}일`}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              ))}
           </>
+        )}
+      </div>
+
+      {/* 미진행자: 리마인더 발송 진입점 */}
+      <div className="space-y-3 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold">미진행자 {staleList.length}명</h2>
+            <p className="mt-1 text-xs text-muted-foreground">{staleLabel} 미제출자입니다.</p>
+          </div>
+          {staleList.length > 0 && (
+            <Button asChild size="sm">
+              <Link to="/admin/mail">리마인더 보내기</Link>
+            </Button>
+          )}
+        </div>
+        {staleList.length === 0 ? (
+          <p className="text-sm text-muted-foreground">미진행자가 없습니다.</p>
+        ) : (
+          <ul className="divide-y rounded-lg border">
+            {staleList.map((r) => (
+              <li key={r.id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium">
+                    {r.name}
+                    <span className="ml-2 text-xs font-normal text-muted-foreground">
+                      {r.emp_no}
+                    </span>
+                  </p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {companyName.get(r.company_id)}
+                    {r.org_unit_id && model?.unitById.get(r.org_unit_id)
+                      ? ` · ${model.unitById.get(r.org_unit_id)!.name}`
+                      : r.org_text
+                        ? ` · ${r.org_text}`
+                        : ""}
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <StatusBadge status={r.account_status} />
+                  <span className="text-xs text-muted-foreground">
+                    {r.elapsed === null ? "기록 없음" : `${r.elapsed}일 경과`}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
     </div>

@@ -210,7 +210,19 @@ const rosterFields = {
   org_text: optionalText,
   grade: optionalText,
   role_level: optionalText,
+  orgUnitId: z.string().uuid().nullable().optional(),
 };
+
+/** 조직 선택값 검증: 다른 계열사 조직을 참여자에 붙이는 실수를 막는다. */
+async function assertOrgUnitInCompany(admin: SupabaseClient, orgUnitId: string, companyId: string) {
+  const { data } = await admin
+    .from("org_units")
+    .select("company_id")
+    .eq("id", orgUnitId)
+    .maybeSingle();
+  if (!data) throw new Error("선택한 조직을 찾을 수 없습니다.");
+  if (data.company_id !== companyId) throw new Error("다른 계열사의 조직은 지정할 수 없습니다.");
+}
 
 export const createParticipant = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -239,6 +251,8 @@ export const createParticipant = createServerFn({ method: "POST" })
       .maybeSingle();
     if (dup) throw new Error(`같은 계열사에 사번 ${data.emp_no}(${dup.name})가 이미 있습니다.`);
 
+    if (data.orgUnitId) await assertOrgUnitInCompany(supabaseAdmin, data.orgUnitId, data.companyId);
+
     const { data: created, error } = await supabaseAdmin
       .from("participants")
       .insert({
@@ -250,6 +264,7 @@ export const createParticipant = createServerFn({ method: "POST" })
         org_text: data.org_text ?? null,
         grade: data.grade ?? null,
         role_level: data.role_level ?? null,
+        org_unit_id: data.orgUnitId ?? null,
       })
       .select("id")
       .single();
@@ -277,7 +292,9 @@ export const updateParticipant = createServerFn({ method: "POST" })
 
     const { data: before } = await supabaseAdmin
       .from("participants")
-      .select("id, emp_no, name, email, birth_date, org_text, grade, role_level, user_id")
+      .select(
+        "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, org_unit_id, user_id",
+      )
       .eq("id", data.participantId)
       .maybeSingle();
     if (!before) throw new Error("참여자를 찾을 수 없습니다.");
@@ -285,6 +302,9 @@ export const updateParticipant = createServerFn({ method: "POST" })
     const email = data.email || null;
     const emailChanged = (before.email ?? null) !== email;
     if (email && emailChanged) await assertEmailAllowed(supabaseAdmin, email);
+    if (data.orgUnitId) {
+      await assertOrgUnitInCompany(supabaseAdmin, data.orgUnitId, before.company_id);
+    }
 
     const patch = {
       name: data.name,
@@ -293,6 +313,8 @@ export const updateParticipant = createServerFn({ method: "POST" })
       org_text: data.org_text ?? null,
       grade: data.grade ?? null,
       role_level: data.role_level ?? null,
+      // undefined 는 「보내지 않음」— 기존 조직 연결을 보존한다. null 은 명시적 해제.
+      ...(data.orgUnitId !== undefined ? { org_unit_id: data.orgUnitId } : {}),
     };
     const { error } = await supabaseAdmin
       .from("participants")
@@ -451,18 +473,124 @@ export const upsertParticipants = createServerFn({ method: "POST" })
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-    const { error } = await supabaseAdmin
+    const { data: upserted, error } = await supabaseAdmin
       .from("participants")
-      .upsert(data.rows, { onConflict: "company_id,emp_no" });
+      .upsert(data.rows, { onConflict: "company_id,emp_no" })
+      .select("id, company_id, org_text");
     if (error) throw new Error(error.message);
+
+    // 소속 표기(org_text)가 조직명과 정확일치(trim)하면 org_unit_id 를 자동으로 채운다.
+    // 미매칭은 오류가 아니다 — 기존 연결을 건드리지 않고 그대로 둔다.
+    const companyIds = [...new Set(data.rows.map((r) => r.company_id))];
+    const { data: units } = await supabaseAdmin
+      .from("org_units")
+      .select("id, company_id, name")
+      .in("company_id", companyIds);
+    const unitByKey = new Map((units ?? []).map((u) => [`${u.company_id}|${u.name.trim()}`, u.id]));
+
+    const idsByUnit = new Map<string, string[]>();
+    for (const row of upserted ?? []) {
+      const orgText = (row.org_text ?? "").trim();
+      const unitId = orgText ? unitByKey.get(`${row.company_id}|${orgText}`) : undefined;
+      if (!unitId) continue;
+      const list = idsByUnit.get(unitId);
+      if (list) list.push(row.id);
+      else idsByUnit.set(unitId, [row.id]);
+    }
+    let orgMatched = 0;
+    for (const [unitId, ids] of idsByUnit) {
+      const { error: linkError } = await supabaseAdmin
+        .from("participants")
+        .update({ org_unit_id: unitId })
+        .in("id", ids);
+      if (!linkError) orgMatched += ids.length;
+    }
 
     await writeAudit(supabaseAdmin, {
       actor_id: context.userId,
       action: "명부 반영",
       target_type: "participants",
-      detail: { rows: data.rows.length },
+      detail: { rows: data.rows.length, orgMatched },
     });
-    return { count: data.rows.length };
+    return { count: data.rows.length, orgMatched };
+  });
+
+/**
+ * org_unit_id 가 비어 있는 참여자의 org_text 를 같은 계열사 org_units.name 과
+ * 정확일치(trim)로 대조해 일괄 연결한다. 결과 리포트에 미매칭 목록을 담아 준다.
+ */
+export const matchParticipantOrgUnits = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ companyId: z.string().uuid().nullable().optional() }).parse(input ?? {}),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { fetchAll } = await import("@/lib/paginate");
+
+    type Target = {
+      id: string;
+      company_id: string;
+      name: string;
+      emp_no: string;
+      org_text: string | null;
+    };
+    // 대상이 1000명을 넘을 수 있어 전량 조회한다.
+    const targets = await fetchAll<Target>((from, to) => {
+      let q = supabaseAdmin
+        .from("participants")
+        .select("id, company_id, name, emp_no, org_text")
+        .is("org_unit_id", null)
+        .order("id")
+        .range(from, to);
+      if (data.companyId) q = q.eq("company_id", data.companyId);
+      return q;
+    });
+
+    const companyIds = [...new Set(targets.map((t) => t.company_id))];
+    const { data: units } = companyIds.length
+      ? await supabaseAdmin
+          .from("org_units")
+          .select("id, company_id, name")
+          .in("company_id", companyIds)
+      : { data: [] };
+    const unitByKey = new Map((units ?? []).map((u) => [`${u.company_id}|${u.name.trim()}`, u.id]));
+
+    const idsByUnit = new Map<string, string[]>();
+    const unmatchedList: { name: string; emp_no: string; org_text: string | null }[] = [];
+    for (const t of targets) {
+      const orgText = (t.org_text ?? "").trim();
+      const unitId = orgText ? unitByKey.get(`${t.company_id}|${orgText}`) : undefined;
+      if (unitId) {
+        const list = idsByUnit.get(unitId);
+        if (list) list.push(t.id);
+        else idsByUnit.set(unitId, [t.id]);
+      } else {
+        unmatchedList.push({ name: t.name, emp_no: t.emp_no, org_text: t.org_text });
+      }
+    }
+
+    let matched = 0;
+    for (const [unitId, ids] of idsByUnit) {
+      const { error } = await supabaseAdmin
+        .from("participants")
+        .update({ org_unit_id: unitId })
+        .in("id", ids);
+      if (error) throw new Error(error.message);
+      matched += ids.length;
+    }
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "참여자 조직 일괄 매칭",
+      target_type: "participants",
+      detail: { matched, unmatched: unmatchedList.length, companyId: data.companyId ?? null },
+    });
+
+    // ponytail: 미매칭 목록은 300건까지만 내려보낸다. 그 이상은 화면에서 어차피 못 읽는다.
+    return { matched, unmatched: unmatchedList.length, unmatchedList: unmatchedList.slice(0, 300) };
   });
 
 /** 선택 참여자에게 태그를 붙이거나 뗀다. text[] 는 부분 갱신이 안 되므로 행별로 다시 쓴다. */
@@ -505,6 +633,59 @@ export const setParticipantTags = createServerFn({ method: "POST" })
       action: data.mode === "add" ? "태그 부여" : "태그 제거",
       target_type: "participants",
       detail: { tags: data.tags, changed },
+    });
+    return { changed };
+  });
+
+/** 선택 참여자에게 조직을 일괄 배정한다. 조직의 계열사와 다른 계열사 참여자가 섞이면 거부. */
+export const assignParticipantOrg = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        participantIds: z.array(z.string().uuid()).min(1).max(2000),
+        orgUnitId: z.string().uuid(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: unit } = await supabaseAdmin
+      .from("org_units")
+      .select("company_id, name")
+      .eq("id", data.orgUnitId)
+      .maybeSingle();
+    if (!unit) throw new Error("선택한 조직을 찾을 수 없습니다.");
+
+    const { data: mismatch } = await supabaseAdmin
+      .from("participants")
+      .select("name, emp_no")
+      .in("id", data.participantIds)
+      .neq("company_id", unit.company_id)
+      .limit(1);
+    const outsider = mismatch?.[0];
+    if (outsider) {
+      throw new Error(
+        `${outsider.name}(${outsider.emp_no})는 다른 계열사 소속이라 이 조직을 배정할 수 없습니다.`,
+      );
+    }
+
+    const { data: updated, error } = await supabaseAdmin
+      .from("participants")
+      .update({ org_unit_id: data.orgUnitId })
+      .in("id", data.participantIds)
+      .select("id");
+    if (error) throw new Error(error.message);
+    const changed = updated?.length ?? 0;
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "조직 일괄 배정",
+      target_type: "participants",
+      detail: { orgUnitId: data.orgUnitId, orgName: unit.name, changed },
     });
     return { changed };
   });

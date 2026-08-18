@@ -2,8 +2,7 @@
 // 예시 패널·안내 박스는 여기서 export 만 하고, 어떤 예시를 보여줄지는 위저드가 정한다(참여자 직군을 알기 때문).
 import { useMemo, useState } from "react";
 import type { ComponentProps } from "react";
-import { ChevronDown, ChevronUp, Info, Plus, Star, Trash2, TriangleAlert } from "lucide-react";
-import { toast } from "sonner";
+import { ChevronDown, ChevronUp, Info, Plus, Trash2, TriangleAlert } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -29,9 +28,7 @@ import type {
   TaskGridProps,
   TaskItem,
 } from "./types";
-import { duplicateTaskIds } from "./validation";
-
-const MAX_KEY_TASKS = 5;
+import { findSimilarPairs } from "./validation";
 
 /**
  * 신규 행 id. crypto.randomUUID 는 보안 컨텍스트(https/localhost)에서만 존재하므로
@@ -46,11 +43,11 @@ export const uid = (): string =>
   });
 
 const IMPORTANCE_HINTS: Record<number, string> = {
-  1: "보조적 — 없어도 직무 성과에 큰 영향이 없음",
-  2: "낮음 — 가끔 필요한 보완적 과업",
-  3: "보통 — 일상적으로 수행하는 표준 과업",
-  4: "높음 — 빠지면 성과에 눈에 띄는 손실",
-  5: "직무 성과를 좌우 — 이 과업의 품질이 곧 직무의 성패",
+  1: "정형화된 업무 — 사전 경험이 거의 필요 없음",
+  2: "익숙해지면 누구나 할 수 있는 보완적 업무",
+  3: "일정 경험이 필요한, 일상적으로 수행하는 표준 과업",
+  4: "전문적 판단이 필요 — 빠지면 성과에 눈에 띄는 손실",
+  5: "조직 성과에 결정적 영향 — 이 과업의 품질이 곧 직무의 성패",
 };
 
 const AUTHORITY_OPTIONS: { value: Authority; label: string; hint: string }[] = [
@@ -68,8 +65,6 @@ const IMPROVE_TYPES: { value: ImproveType; desc: string }[] = [
   { value: "타부서이관", desc: "다른 부서가 맡는 편이 자연스러운 과업" },
   { value: "강화", desc: "지금보다 더 많은 시간·자원을 들여야 하는 과업" },
 ];
-
-const KEY_TASK_HINT = `주요 과업 — 이 직무를 대표하는 과업. 빠지면 직무가 성립하지 않는 것으로 최대 ${MAX_KEY_TASKS}개만 고릅니다.`;
 
 /**
  * ⓘ 아이콘 + 설명. 터치 기기에서 뜨지 않는 hover 툴팁 대신 탭/클릭으로 여는 Popover 를 쓴다.
@@ -236,13 +231,16 @@ export function ExamplesPanel({
   );
 }
 
-/** 「이렇게 작성하세요」 접이식 안내. 작성 순서 + 평가 항목 정의를 한곳에 모은다. */
+/** 「이렇게 작성하세요」 접이식 안내. 작성 순서 + 평가 항목 정의 + 진행 카운터를 한곳에 모은다. */
 export function HowToBox({
   steps,
   sections,
+  note,
 }: {
   steps: string[];
   sections: { title: string; rows: [string, string][] }[];
+  /** 접혀 있어도 보이는 진행 카운터 한 줄 (예: "과업 5~10개 권장 — 현재 4개") */
+  note?: string | undefined;
 }) {
   const [open, setOpen] = useState(true);
   return (
@@ -256,7 +254,12 @@ export function HowToBox({
           type="button"
           className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left"
         >
-          <span className="text-sm font-semibold">이렇게 작성하세요</span>
+          <span className="min-w-0 text-sm font-semibold">
+            이렇게 작성하세요
+            {note ? (
+              <span className="ml-2 font-normal text-muted-foreground">{note}</span>
+            ) : null}
+          </span>
           <ChevronDown
             className={cn("size-4 shrink-0 transition-transform", open && "rotate-180")}
           />
@@ -294,23 +297,31 @@ export function HowToBox({
 }
 
 /** ④단계 안내 — 작성 순서 + 중요도·책임수준·이관가능·개선유형 정의 전체. */
-export function TaskHowTo() {
+export function TaskHowTo({ taskCount }: { taskCount?: number | undefined }) {
   return (
     <HowToBox
+      note={taskCount === undefined ? undefined : `과업 5~10개 권장 — 현재 ${taskCount}개`}
       steps={[
-        "담당 과업을 5~10개로 나누어 「행위 + 목적」 한 문장으로 적습니다.",
-        "과업마다 실제 수행 단계인 세부 활동을 2~8개 적습니다.",
-        `중요도·책임수준·이관 가능을 고르고, 직무를 대표하는 과업 최대 ${MAX_KEY_TASKS}개에 ★를 답니다.`,
+        "계획 → 실행 → 모니터링·피드백의 시간 흐름으로 하는 일을 나열해 보세요.",
+        "담당 과업을 5~10개로 나누어 「행위 + 목적」 한 문장으로 적습니다. 성격이나 걸리는 시간이 다르면 별도 과업으로 나눠 적어 주세요.",
+        "과업마다 실제 수행 단계인 세부 활동을 2~8개 적습니다. 일시적 프로젝트·TF 업무는 제외합니다.",
+        "중요도·책임수준·이관 가능을 고릅니다.",
       ]}
       sections={[
         {
           title: "중요도 (1~5)",
-          rows: [1, 2, 3, 4, 5].map(
-            (n) => [`${n}점`, IMPORTANCE_HINTS[n] ?? ""] as [string, string],
-          ),
+          rows: [
+            [
+              "평가 요령",
+              "대표적인 업무 3~5개를 먼저 평가하고, 나머지는 그와 비교해 평가하세요",
+            ] as [string, string],
+            ...[1, 2, 3, 4, 5].map(
+              (n) => [`${n}점`, IMPORTANCE_HINTS[n] ?? ""] as [string, string],
+            ),
+          ],
         },
         {
-          title: "책임수준 (복수 해당 시 최상위 하나만)",
+          title: "책임수준 (여러 개에 해당하면 가장 높은 단계 하나만)",
           rows: AUTHORITY_OPTIONS.map((o) => [o.label, o.hint] as [string, string]),
         },
         {
@@ -318,7 +329,6 @@ export function TaskHowTo() {
           rows: [
             ["예", "다른 사람이 맡아도 이 직무가 그대로 성립하는 과업"],
             ["아니오", "이 직무에서 떼어내면 직무 자체가 성립하지 않는 과업"],
-            ["주요 과업 ★", KEY_TASK_HINT],
           ],
         },
         {
@@ -331,8 +341,15 @@ export function TaskHowTo() {
 }
 
 export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: TaskGridProps) {
-  const dupIds = useMemo(() => duplicateTaskIds(value), [value]);
-  const keyCount = value.filter((t) => t.isKey).length;
+  // 과업 id → 그 과업이 속한 첫 유사 쌍. 배지에 실제 과업명 두 개를 그대로 보여 준다.
+  const dupPairs = useMemo(() => {
+    const map = new Map<string, { nameA: string; nameB: string }>();
+    for (const pair of findSimilarPairs(value)) {
+      if (!map.has(pair.a)) map.set(pair.a, pair);
+      if (!map.has(pair.b)) map.set(pair.b, pair);
+    }
+    return map;
+  }, [value]);
 
   const patch = (id: string, part: Partial<TaskItem>) => {
     onChange(value.map((t) => (t.id === id ? { ...t, ...part } : t)));
@@ -372,14 +389,6 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
     onChange(next);
   };
 
-  const toggleKey = (task: TaskItem) => {
-    if (!task.isKey && keyCount >= MAX_KEY_TASKS) {
-      toast.error(`주요 과업은 최대 ${MAX_KEY_TASKS}개까지 선택할 수 있습니다.`);
-      return;
-    }
-    patch(task.id, { isKey: !task.isKey });
-  };
-
   const setActivities = (task: TaskItem, activities: ActivityItem[]) =>
     patch(task.id, { activities });
 
@@ -403,27 +412,19 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
                   placeholder="예: 월간 생산실적을 집계하여 경영회의 보고자료를 작성한다"
                   aria-label={`${index + 1}번째 과업명`}
                 />
-                {dupIds.has(task.id) ? (
-                  <Badge variant="outline" className="gap-1 border-amber-400 text-amber-700">
-                    <TriangleAlert className="size-3" />
-                    비슷한 과업이 있습니다 — 묶어보세요
+                {dupPairs.has(task.id) ? (
+                  <Badge
+                    variant="outline"
+                    className="h-auto gap-1 whitespace-normal border-amber-400 text-left text-amber-700"
+                  >
+                    <TriangleAlert className="size-3 shrink-0" />
+                    &lsquo;{dupPairs.get(task.id)?.nameA}&rsquo;와 &lsquo;
+                    {dupPairs.get(task.id)?.nameB}&rsquo;가 비슷해 보입니다. 같은 일이라면 하나로
+                    합쳐 주세요 (다른 일이면 그대로 두어도 됩니다)
                   </Badge>
                 ) : null}
               </div>
               <div className="flex shrink-0 items-center gap-1">
-                <Hint text={KEY_TASK_HINT} />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  disabled={disabled}
-                  onClick={() => toggleKey(task)}
-                  title={KEY_TASK_HINT}
-                  aria-label="주요 과업 표시"
-                  aria-pressed={task.isKey}
-                >
-                  <Star className={cn("size-4", task.isKey && "fill-amber-400 text-amber-500")} />
-                </Button>
                 <Button
                   type="button"
                   variant="ghost"
@@ -513,7 +514,9 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
                     </button>
                   ))}
                 </div>
-                <p className="text-[11px] text-muted-foreground">복수 해당 시 최상위</p>
+                <p className="text-[11px] text-muted-foreground">
+                  여러 개에 해당하면 가장 높은 단계 하나를 고르세요
+                </p>
               </div>
 
               <div className="space-y-2">
