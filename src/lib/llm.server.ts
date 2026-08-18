@@ -25,11 +25,13 @@ type BoundFetcher = { fetch: (input: string, init?: RequestInit) => Promise<Resp
  * 로컬 dev 등 바인딩이 없는 환경은 일반 fetch 로 폴백한다.
  */
 function proxyFetch(url: string, init: RequestInit): Promise<Response> {
-  const env = (globalThis as Record<string, unknown>)["__CF_ENV__"] as
-    | Record<string, unknown>
-    | undefined;
+  const g = globalThis as Record<string, unknown>;
+  // nitro cloudflare 프리셋이 매 요청 globalThis.__env__ = env 를 수행한다. 우리 server.ts 스태시는 보조.
+  const env = (g["__env__"] ?? g["__CF_ENV__"]) as Record<string, unknown> | undefined;
   const bound = env?.["ELIZAX_PROXY"] as BoundFetcher | undefined;
-  return typeof bound?.fetch === "function" ? bound.fetch(url, init) : fetch(url, init);
+  return typeof bound?.fetch === "function"
+    ? bound.fetch(url, init)
+    : fetch(url, init);
 }
 
 export async function callLLM({
