@@ -31,7 +31,7 @@ export const Route = createFileRoute("/_authenticated/admin/")({
     meta: [
       { title: "진행 현황 | 서연 그룹 업무조사" },
       { name: "description", content: "소속별 조사 진행 현황을 한눈에 확인합니다." },
-      { property: "og:title", content: "대시보드 | 서연 그룹 업무조사" },
+      { property: "og:title", content: "진행 현황 | 서연 그룹 업무조사" },
       { property: "og:description", content: "소속별 조사 진행 현황을 한눈에 확인합니다." },
     ],
   }),
@@ -415,7 +415,7 @@ function DashboardPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-bold sm:text-2xl">대시보드</h1>
+        <h1 className="text-xl font-bold sm:text-2xl">진행 현황</h1>
         <p className="mt-1 text-sm text-muted-foreground">
           {scopeLabel} · 대상 {total}명 · 기준 {asOf}
         </p>

@@ -1004,7 +1004,7 @@ function SettingsPage() {
           <TabsContent value="survey" className="mt-4 space-y-5">
             <TabIntro>
               이 탭에서는 <strong>계열사마다 언제까지 받을지와 독려 안내를 언제 보낼지</strong>{" "}
-              정합니다. 미진행 기준일은 대시보드에서 '움직이지 않는 사람'을 세는 기준입니다.
+              정합니다. 미진행 기준일은 진행 현황 화면에서 '움직이지 않는 사람'을 세는 기준입니다.
             </TabIntro>
 
             <SectionNav sections={surveySections} />
@@ -1073,7 +1073,7 @@ function SettingsPage() {
                           미진행 기준일 (일)
                           <FieldHint
                             term="미진행 기준일"
-                            text="마지막 접속·안내 이후 이 일수가 지나도록 제출하지 않으면 대시보드에서 '미진행'으로 셉니다. 짧게 잡을수록 미진행 인원이 늘어납니다."
+                            text="마지막 접속·안내 이후 이 일수가 지나도록 제출하지 않으면 진행 현황 화면에서 '미진행'으로 셉니다. 짧게 잡을수록 미진행 인원이 늘어납니다."
                           />
                         </span>
                         <Input
