@@ -25,6 +25,7 @@ import { Route as AuthenticatedAdminMasterRouteImport } from './routes/_authenti
 import { Route as AuthenticatedAdminParticipantsRouteImport } from './routes/_authenticated/admin/participants'
 import { Route as AuthenticatedAdminReviewRouteImport } from './routes/_authenticated/admin/review'
 import { Route as AuthenticatedAdminSettingsRouteImport } from './routes/_authenticated/admin/settings'
+import { Route as AuthenticatedAdminWavesRouteImport } from './routes/_authenticated/admin/waves'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -111,6 +112,11 @@ const AuthenticatedAdminSettingsRoute =
     path: '/settings',
     getParentRoute: () => AuthenticatedAdminRouteRoute,
   } as any)
+const AuthenticatedAdminWavesRoute = AuthenticatedAdminWavesRouteImport.update({
+  id: '/waves',
+  path: '/waves',
+  getParentRoute: () => AuthenticatedAdminRouteRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -127,6 +133,7 @@ export interface FileRoutesByFullPath {
   '/admin/participants': typeof AuthenticatedAdminParticipantsRoute
   '/admin/review': typeof AuthenticatedAdminReviewRoute
   '/admin/settings': typeof AuthenticatedAdminSettingsRoute
+  '/admin/waves': typeof AuthenticatedAdminWavesRoute
   '/admin/': typeof AuthenticatedAdminIndexRoute
 }
 export interface FileRoutesByTo {
@@ -143,6 +150,7 @@ export interface FileRoutesByTo {
   '/admin/participants': typeof AuthenticatedAdminParticipantsRoute
   '/admin/review': typeof AuthenticatedAdminReviewRoute
   '/admin/settings': typeof AuthenticatedAdminSettingsRoute
+  '/admin/waves': typeof AuthenticatedAdminWavesRoute
   '/admin': typeof AuthenticatedAdminIndexRoute
 }
 export interface FileRoutesById {
@@ -162,6 +170,7 @@ export interface FileRoutesById {
   '/_authenticated/admin/participants': typeof AuthenticatedAdminParticipantsRoute
   '/_authenticated/admin/review': typeof AuthenticatedAdminReviewRoute
   '/_authenticated/admin/settings': typeof AuthenticatedAdminSettingsRoute
+  '/_authenticated/admin/waves': typeof AuthenticatedAdminWavesRoute
   '/_authenticated/admin/': typeof AuthenticatedAdminIndexRoute
 }
 export interface FileRouteTypes {
@@ -181,6 +190,7 @@ export interface FileRouteTypes {
     | '/admin/participants'
     | '/admin/review'
     | '/admin/settings'
+    | '/admin/waves'
     | '/admin/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -197,6 +207,7 @@ export interface FileRouteTypes {
     | '/admin/participants'
     | '/admin/review'
     | '/admin/settings'
+    | '/admin/waves'
     | '/admin'
   id:
     | '__root__'
@@ -215,6 +226,7 @@ export interface FileRouteTypes {
     | '/_authenticated/admin/participants'
     | '/_authenticated/admin/review'
     | '/_authenticated/admin/settings'
+    | '/_authenticated/admin/waves'
     | '/_authenticated/admin/'
   fileRoutesById: FileRoutesById
 }
@@ -338,6 +350,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedAdminSettingsRouteImport
       parentRoute: typeof AuthenticatedAdminRouteRoute
     }
+    '/_authenticated/admin/waves': {
+      id: '/_authenticated/admin/waves'
+      path: '/waves'
+      fullPath: '/admin/waves'
+      preLoaderRoute: typeof AuthenticatedAdminWavesRouteImport
+      parentRoute: typeof AuthenticatedAdminRouteRoute
+    }
   }
 }
 
@@ -349,6 +368,7 @@ interface AuthenticatedAdminRouteRouteChildren {
   AuthenticatedAdminParticipantsRoute: typeof AuthenticatedAdminParticipantsRoute
   AuthenticatedAdminReviewRoute: typeof AuthenticatedAdminReviewRoute
   AuthenticatedAdminSettingsRoute: typeof AuthenticatedAdminSettingsRoute
+  AuthenticatedAdminWavesRoute: typeof AuthenticatedAdminWavesRoute
   AuthenticatedAdminIndexRoute: typeof AuthenticatedAdminIndexRoute
 }
 
@@ -361,6 +381,7 @@ const AuthenticatedAdminRouteRouteChildren: AuthenticatedAdminRouteRouteChildren
     AuthenticatedAdminParticipantsRoute: AuthenticatedAdminParticipantsRoute,
     AuthenticatedAdminReviewRoute: AuthenticatedAdminReviewRoute,
     AuthenticatedAdminSettingsRoute: AuthenticatedAdminSettingsRoute,
+    AuthenticatedAdminWavesRoute: AuthenticatedAdminWavesRoute,
     AuthenticatedAdminIndexRoute: AuthenticatedAdminIndexRoute,
   }
 

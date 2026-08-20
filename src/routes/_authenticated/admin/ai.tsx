@@ -20,10 +20,12 @@ import {
   aiProxyStatus,
   applyMerge,
   detectPoorResponses,
+  getAiLedger,
   listPendingSuggestions,
   pingProxy,
   suggestMerges,
 } from "@/lib/ai.functions";
+import { draftDutyCharts, draftJobCatalog } from "@/lib/master.functions";
 
 /**
  * AI 일괄 점검 — 여러 건을 한 번에 훑는 자리.
@@ -135,11 +137,20 @@ function AiPage() {
 
       <SectionNav
         sections={[
+          { id: "sweep-ledger", label: "AI 사용 현황" },
           { id: "sweep-pending", label: "미결 AI 제안", count: pendingGroups.length },
           { id: "sweep-poor", label: "부실 응답 스윕" },
           { id: "sweep-merge", label: "표기 통일" },
         ]}
       />
+
+      <section id="sweep-ledger" className="scroll-mt-20 space-y-3">
+        <h2 className="text-base font-semibold">AI 사용 현황</h2>
+        <p className="text-sm text-muted-foreground">
+          AI 가 무엇을 얼마나 바꿨고 어디서 실패했는지 봅니다.
+        </p>
+        <AiLedgerPanel />
+      </section>
 
       <section id="sweep-pending" className="scroll-mt-20 space-y-3">
         <h2 className="text-base font-semibold">미결 AI 제안</h2>
@@ -198,6 +209,182 @@ function AiPage() {
 }
 
 type ProxyErrorSetter = (message: string | null) => void;
+
+/**
+ * F17: AI 사용 원장 — AI 가 무엇을 얼마나 바꿨고 어디서 실패했는지 한 자리에서 본다.
+ * 실패 목록의 재실행은 대상을 정확히 지정해 다시 만들 수 있는 기능(직무분류 가안·업무분장
+ * 가안)에만 버튼이 붙는다. 그 외 기능(예: 직무기술서 초안)은 대상 키를 기록에서 되짚을 수
+ * 없어 각자의 화면에서 다시 생성해야 한다.
+ */
+function AiLedgerPanel() {
+  const ledgerQuery = useQuery({ queryKey: ["ai-ledger"], queryFn: () => getAiLedger() });
+
+  const retryCatalog = useMutation({
+    mutationFn: (group: string) => draftJobCatalog({ data: { groups: [group] } }),
+    onSuccess: (res, group) => {
+      if (res.failedGroups.includes(group)) {
+        toast.error(`「${group}」 재생성에 다시 실패했습니다.`);
+      } else {
+        toast.success(`「${group}」 직군을 다시 생성했습니다.`);
+      }
+      void ledgerQuery.refetch();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const retryDuty = useMutation({
+    mutationFn: (orgId: string) => draftDutyCharts({ data: { orgIds: [orgId] } }),
+    onSuccess: (res, orgId) => {
+      if (res.failedOrgs.some((o) => o.orgId === orgId)) {
+        toast.error("업무분장 가안 재생성에 다시 실패했습니다.");
+      } else {
+        toast.success("업무분장 가안을 다시 생성했습니다.");
+      }
+      void ledgerQuery.refetch();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  if (ledgerQuery.isLoading) {
+    return <p className="text-sm text-muted-foreground">불러오는 중...</p>;
+  }
+  if (ledgerQuery.isError) {
+    return (
+      <p className="rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+        조회 실패 — {errorMessage(ledgerQuery.error)}
+      </p>
+    );
+  }
+  const ledger = ledgerQuery.data;
+  if (!ledger) return null;
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-xl border bg-card p-4">
+        <h3 className="text-sm font-semibold">기능별 사용 현황</h3>
+        <p className="mt-1 text-xs text-muted-foreground">최근 {ledger.sampleSize}건 기준 집계</p>
+        {ledger.features.length === 0 ? (
+          <p className="mt-2 text-sm text-muted-foreground">아직 AI 를 호출한 기록이 없습니다.</p>
+        ) : (
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full min-w-[560px] text-sm">
+              <thead>
+                <tr className="text-left text-xs text-muted-foreground">
+                  <th className="pb-2 pr-4 font-medium">기능</th>
+                  <th className="pb-2 pr-4 font-medium">호출 수</th>
+                  <th className="pb-2 pr-4 font-medium">성공</th>
+                  <th className="pb-2 pr-4 font-medium">실패</th>
+                  <th className="pb-2 pr-4 font-medium">평균 소요 시간</th>
+                  <th className="pb-2 font-medium">마지막 성공</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ledger.features.map((f) => (
+                  <tr key={f.feature} className="border-t">
+                    <td className="py-2 pr-4 font-medium">{f.feature}</td>
+                    <td className="py-2 pr-4">{f.total}</td>
+                    <td className="py-2 pr-4 text-success">{f.success}</td>
+                    <td className="py-2 pr-4 text-destructive">{f.failed}</td>
+                    <td className="py-2 pr-4">
+                      {f.avgDurationMs != null ? `${(f.avgDurationMs / 1000).toFixed(1)}초` : "-"}
+                    </td>
+                    <td className="py-2">
+                      {f.lastSuccessAt ? new Date(f.lastSuccessAt).toLocaleString("ko-KR") : "없음"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-xl border bg-card p-4">
+        <h3 className="text-sm font-semibold">제안 채택률</h3>
+        {ledger.adoption.length === 0 ? (
+          <p className="mt-2 text-sm text-muted-foreground">아직 생성된 AI 제안이 없습니다.</p>
+        ) : (
+          <ul className="mt-3 space-y-2">
+            {ledger.adoption.map((a) => (
+              <li
+                key={a.kind}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-secondary p-3 text-sm"
+              >
+                <span className="font-medium">{a.kind}</span>
+                <span className="text-muted-foreground">
+                  수락 {a.accepted} · 수정 {a.edited} · 거절 {a.rejected} · 대기 {a.pending}
+                  {a.acceptedRate != null ? ` — 채택률 ${a.acceptedRate}%` : ""}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div className="rounded-xl border bg-card p-4">
+        <h3 className="text-sm font-semibold">응답 대비 AI 개입 비중</h3>
+        <p className="mt-2 text-sm text-muted-foreground">
+          전체 응답 {ledger.involvement.totalResponses}건 중 AI 제안이 반영된 응답{" "}
+          {ledger.involvement.respondedWithAi}건
+          {ledger.involvement.ratio != null ? ` (${ledger.involvement.ratio}%)` : ""}
+        </p>
+      </div>
+
+      <div className="rounded-xl border bg-card p-4">
+        <h3 className="text-sm font-semibold">최근 실패 {ledger.failures.length}건</h3>
+        {ledger.failures.length === 0 ? (
+          <p className="mt-2 text-sm text-muted-foreground">최근 실패한 AI 호출이 없습니다.</p>
+        ) : (
+          <ul className="mt-3 space-y-2">
+            {ledger.failures.map((f) => (
+              <li
+                key={f.id}
+                className="rounded-lg border border-destructive/20 bg-destructive/5 p-3 text-sm"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="font-medium">
+                      {f.feature}
+                      {f.target && (
+                        <span className="ml-1 font-normal text-muted-foreground">— {f.target}</span>
+                      )}
+                    </p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {new Date(f.createdAt).toLocaleString("ko-KR")}
+                    </p>
+                  </div>
+                  {f.retry?.kind === "jobCatalog" && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={retryCatalog.isPending}
+                      onClick={() => retryCatalog.mutate(f.retry!.value)}
+                    >
+                      {retryCatalog.isPending && <Loader2 className="size-4 animate-spin" />}
+                      이 직군만 다시 생성
+                    </Button>
+                  )}
+                  {f.retry?.kind === "dutyChart" && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={retryDuty.isPending}
+                      onClick={() => retryDuty.mutate(f.retry!.value)}
+                    >
+                      {retryDuty.isPending && <Loader2 className="size-4 animate-spin" />}
+                      이 조직만 다시 생성
+                    </Button>
+                  )}
+                </div>
+                <p className="mt-2 text-destructive">{f.errorMessage ?? "사유가 남아 있지 않습니다."}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
 
 /* 부실 응답 스윕 — 결과의 각 건은 검토 화면으로 넘긴다. */
 

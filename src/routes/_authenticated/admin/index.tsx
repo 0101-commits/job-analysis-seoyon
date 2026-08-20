@@ -15,6 +15,7 @@ import {
   orgSubtreeIds,
   useOrgLens,
 } from "@/components/admin/OrgTreeFilter";
+import { WaveFilter, useWaveLens, type WaveOption } from "@/components/admin/WaveFilter";
 import {
   checkIntegrity,
   getDashboardSignals,
@@ -25,6 +26,7 @@ import {
   type OverviewParticipant,
   type OverviewUnit,
 } from "@/lib/dashboard.functions";
+import { listWaves, type Wave } from "@/lib/wave.functions";
 
 export const Route = createFileRoute("/_authenticated/admin/")({
   head: () => ({
@@ -70,6 +72,12 @@ function mailLink(orgId: string, statuses: string[]) {
 }
 
 const REVIEW_LINK = "/admin/review?status=submitted";
+/**
+ * 문의함·재확인 화면은 아직 만들어지지 않았다(각각 다른 담당). 그 화면이 생기면 이
+ * 규약대로 탭을 열게 맞춰 달라고 최종 보고에 남긴다.
+ */
+const INQUIRY_LINK = "/admin/review?tab=inquiry";
+const RECHECK_LINK = "/admin/master?tab=recheck";
 
 /** 개시 준비 항목별로 가야 할 화면 — 못 채운 항목은 카드로 남기고 그 화면으로 보낸다. */
 const READINESS_LINKS: Record<string, { label: string; href: string }> = {
@@ -138,8 +146,13 @@ function rollupOf(members: Tracked[]): Rollup {
   };
 }
 
-/** 계열사 스코프 + 소속 렌즈 → 조직 트리 → 하위 합산까지, 화면이 쓰는 파생 모델 전부. */
-function buildModel(overview: OrgOverview, companyId: string, orgId: string | null) {
+/** 계열사 스코프 + 소속 렌즈 + 차수 렌즈 → 조직 트리 → 하위 합산까지, 화면이 쓰는 파생 모델 전부. */
+function buildModel(
+  overview: OrgOverview,
+  companyId: string,
+  orgId: string | null,
+  waveId: string | null,
+) {
   const inScope = (cid: string) => companyId === "all" || cid === companyId;
   const staleDaysBy = new Map(overview.settings.map((s) => [s.company_id, s.stale_days]));
 
@@ -163,6 +176,8 @@ function buildModel(overview: OrgOverview, companyId: string, orgId: string | nu
   const respondents: Tracked[] = overview.participants
     .filter((p) => p.role === "respondent" && inScope(p.company_id))
     .filter((p) => !allowed || (p.org_unit_id !== null && allowed.has(p.org_unit_id)))
+    // 차수 렌즈 — 「전체」(waveId=null)면 그대로, 아니면 이 차수에 지금 배정된 사람만.
+    .filter((p) => !waveId || p.wave_id === waveId)
     .map((p) => {
       const lastActivity = p.last_seen_at ?? p.invited_at;
       const elapsed = daysSince(lastActivity);
@@ -230,6 +245,7 @@ function periodStart(key: PeriodKey): Date | null {
 function DashboardPage() {
   const { companyId } = useCompanyScope();
   const { selectedOrgId, setSelectedOrgId } = useOrgLens();
+  const { selectedWaveId, setSelectedWaveId } = useWaveLens();
   const [period, setPeriod] = useState<PeriodKey>("all");
   const [copyState, setCopyState] = useState<"idle" | "ok" | "fail">("idle");
 
@@ -254,17 +270,39 @@ function DashboardPage() {
     queryKey: ["dashboard-readiness"],
     queryFn: async () => getLaunchReadiness({ headers: await authHeaders() }),
   });
+  // 차수는 계열사별로 조회하는 함수라, 「전체 계열사」면 회사마다 불러 모은다.
+  const companyIds = useMemo(() => (overview?.companies ?? []).map((c) => c.id), [overview]);
+  const { data: waves } = useQuery({
+    queryKey: ["dashboard-waves", companyId, companyIds.join(",")],
+    queryFn: async () => {
+      const headers = await authHeaders();
+      const ids = companyId === "all" ? companyIds : [companyId];
+      const lists = await Promise.all(
+        ids.map((id) => listWaves({ data: { companyId: id }, headers })),
+      );
+      return lists.flat();
+    },
+    enabled: companyIds.length > 0,
+  });
 
   // 소속 렌즈는 화면 간에 공유되므로, 계열사를 바꿔 트리에서 사라진 선택은 무시한다.
   const reference = useMemo(
-    () => (overview ? buildModel(overview, companyId, null) : null),
-    [overview, companyId],
+    () => (overview ? buildModel(overview, companyId, null, selectedWaveId) : null),
+    [overview, companyId, selectedWaveId],
   );
   const orgId = selectedOrgId && reference?.unitById.has(selectedOrgId) ? selectedOrgId : null;
+  // 차수 렌즈도 같은 이유로 공유된다 — 계열사를 바꿔 목록에서 사라진 차수 선택은 무시한다.
+  const waveId =
+    selectedWaveId && (waves ?? []).some((w) => w.id === selectedWaveId) ? selectedWaveId : null;
   const model = useMemo(
-    () => (overview ? buildModel(overview, companyId, orgId) : null),
-    [overview, companyId, orgId],
+    () => (overview ? buildModel(overview, companyId, orgId, waveId) : null),
+    [overview, companyId, orgId, waveId],
   );
+  const waveOptions: WaveOption[] = useMemo(
+    () => (waves ?? []).map((w: Wave) => ({ id: w.id, name: w.name, status: w.status })),
+    [waves],
+  );
+  const selectedWave = (waves ?? []).find((w) => w.id === waveId) ?? null;
 
   const companyName = useMemo(
     () => new Map((overview?.companies ?? []).map((c) => [c.id, c.name])),
@@ -278,17 +316,25 @@ function DashboardPage() {
     return out;
   }, [reference]);
 
-  // 스코프가 전체면 가장 이른 마감일을 기준으로 본다.
+  // 차수를 선택했으면 그 차수의 마감을 기준으로 본다. 「전체」면 가장 이른 계열사 마감일.
   const deadline = useMemo(() => {
+    if (selectedWave) return selectedWave.deadline;
     const scoped = (overview?.settings ?? []).filter(
       (s) => companyId === "all" || s.company_id === companyId,
     );
     const dates = scoped.map((s) => s.deadline).filter((d): d is string => Boolean(d));
     return dates.length ? (dates.sort()[0] ?? null) : null;
-  }, [overview, companyId]);
+  }, [overview, companyId, selectedWave]);
   const dday = deadline ? daysUntil(deadline) : null;
+  const ddayLabel = selectedWave ? `${selectedWave.name} 마감` : "제출 마감";
   const ddayText =
-    dday === null ? "제출 마감 미설정" : dday < 0 ? "마감일이 지났습니다" : `제출 마감까지 D-${dday}`;
+    selectedWave && selectedWave.status === "마감"
+      ? `${selectedWave.name}은 마감되었습니다`
+      : dday === null
+        ? `${ddayLabel} 미설정`
+        : dday < 0
+          ? "마감일이 지났습니다"
+          : `${ddayLabel}까지 D-${dday}`;
 
   const respondents = model?.respondents ?? [];
   const total = respondents.length;
@@ -298,7 +344,10 @@ function DashboardPage() {
   const scopeLabel = [
     companyId === "all" ? "전체 계열사" : (companyName.get(companyId) ?? "선택 계열사"),
     orgPathLabel(model?.units ?? [], orgId),
-  ].join(" · ");
+    selectedWave?.name ?? null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   // ── 응답 원천을 현재 스코프의 참여자에 붙인다 ──
   const scoped = useMemo(
@@ -414,11 +463,19 @@ function DashboardPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-bold sm:text-2xl">진행 현황</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {scopeLabel} · 대상 {total}명 · 기준 {asOf}
-        </p>
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-bold sm:text-2xl">진행 현황</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {scopeLabel} · 대상 {total}명 · 기준 {asOf}
+          </p>
+        </div>
+        {waveOptions.length > 0 ? (
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-muted-foreground">조사 차수</span>
+            <WaveFilter waves={waveOptions} selectedId={waveId} onSelect={setSelectedWaveId} />
+          </div>
+        ) : null}
       </div>
 
       <SectionNav sections={sections} />
@@ -533,7 +590,8 @@ function DashboardPage() {
                               tone="attention"
                               signal={`개시 준비 항목 「${item.label}」${josa(item.label, "이/가")} 아직 충족되지 않았습니다`}
                               evidence={[
-                                item.hint ?? "이 항목을 채우지 않으면 진행 중 문제가 생길 수 있습니다.",
+                                item.hint ??
+                                  "이 항목을 채우지 않으면 진행 중 문제가 생길 수 있습니다.",
                                 `조사는 이미 시작되었습니다(안내를 받은 참여자 ${total - funnel[0]!.count}명).`,
                               ]}
                               asOf={asOf}
@@ -770,6 +828,10 @@ type ScopedSignals = {
   failedMails: DashboardSignals["failedMails"];
   /** 검토 적체 판정에 쓴 기준일(스코프 안에서 가장 짧은 값). */
   threshold: number;
+  /** F6 접수된 문의 — 현재 스코프 참여자의 것만. */
+  openInquiries: DashboardSignals["openInquiries"];
+  /** F10 변경 재확인 미확인 응답 — 현재 스코프 참여자의 것만. */
+  recheckResponses: DashboardSignals["recheckResponses"];
 };
 
 function scopeSignals(
@@ -780,7 +842,16 @@ function scopeSignals(
   const thresholds = respondents.map((r) => r.threshold);
   const threshold = thresholds.length ? Math.min(...thresholds) : 7;
   if (!signals) {
-    return { responses: [], waiting: 0, backlog: [], aiBlocked: 0, failedMails: [], threshold };
+    return {
+      responses: [],
+      waiting: 0,
+      backlog: [],
+      aiBlocked: 0,
+      failedMails: [],
+      threshold,
+      openInquiries: [],
+      recheckResponses: [],
+    };
   }
 
   const responses = signals.responses.filter((r) => byParticipant.has(r.participant_id));
@@ -803,6 +874,8 @@ function scopeSignals(
       (m) => m.participant_id !== null && byParticipant.has(m.participant_id),
     ),
     threshold,
+    openInquiries: signals.openInquiries.filter((q) => byParticipant.has(q.participant_id)),
+    recheckResponses: signals.recheckResponses.filter((r) => byParticipant.has(r.participant_id)),
   };
 }
 
@@ -824,7 +897,14 @@ function buildSignalCards(args: {
   asOf: string;
   ddayText: string;
   companyId: string;
-  integrityChecks: { key: string; label: string; count: number; items: string[]; link: string; linkLabel: string }[];
+  integrityChecks: {
+    key: string;
+    label: string;
+    count: number;
+    items: string[];
+    link: string;
+    linkLabel: string;
+  }[];
   reviewTurnaroundDays: number | null;
   onSelectOrg: (id: string | null) => void;
 }): Card[] {
@@ -880,8 +960,7 @@ function buildSignalCards(args: {
   if (scoped.backlog.length > 0) {
     const days = scoped.backlog.map((b) => b.days);
     const worst = Math.max(...days);
-    const thresholdLabel =
-      args.companyId === "all" ? "계열사별 기준일" : `${scoped.threshold}일`;
+    const thresholdLabel = args.companyId === "all" ? "계열사별 기준일" : `${scoped.threshold}일`;
     cards.push({
       key: "review-backlog",
       tone: "attention",
@@ -908,7 +987,9 @@ function buildSignalCards(args: {
       tone: "attention",
       signal: `${check.label} ${check.count}건을 확인해야 합니다`,
       evidence: [
-        sample ? `예: ${sample}${check.count > 5 ? ` 외 ${check.count - 5}건` : ""}` : "대상 목록은 이동한 화면에서 확인할 수 있습니다.",
+        sample
+          ? `예: ${sample}${check.count > 5 ? ` 외 ${check.count - 5}건` : ""}`
+          : "대상 목록은 이동한 화면에서 확인할 수 있습니다.",
         `정합성 점검 ${integrityChecks.length}항목 중 이 항목에서 발견되었습니다.`,
         "이 점검은 계열사·소속 선택과 무관하게 전사 기준으로 셉니다.",
       ],
@@ -954,6 +1035,46 @@ function buildSignalCards(args: {
         { label: "메일 화면에서 재발송", href: "/admin/mail" },
         { label: "명부 확인", href: "/admin/participants", variant: "outline" },
       ],
+    });
+  }
+
+  // ⑹ 접수된 문의 — 같은 유형이 몰리면 개별 답변보다 공지가 나을 수 있다는 것까지 알려 준다.
+  if (scoped.openInquiries.length > 0) {
+    const tally = new Map<string, number>();
+    for (const q of scoped.openInquiries) tally.set(q.category, (tally.get(q.category) ?? 0) + 1);
+    const top = [...tally.entries()].sort((a, b) => b[1] - a[1])[0] ?? null;
+    const emphasize = (top?.[1] ?? 0) >= 5;
+    cards.push({
+      key: "inquiries-open",
+      tone: emphasize ? "attention" : "neutral",
+      signal: `접수된 문의 ${scoped.openInquiries.length}건이 답변을 기다리고 있습니다`,
+      evidence: [
+        top
+          ? `가장 많은 유형은 「${top[0]}」 ${top[1]}건입니다.`
+          : "아직 한 유형에 몰려 있지는 않습니다.",
+        emphasize
+          ? "같은 유형이 5건 이상이면 공지·안내문으로 한 번에 안내하는 편이 낫습니다."
+          : "지금은 개별 답변으로 충분한 수준입니다.",
+      ],
+      asOf,
+      scope: `대상 ${model.respondents.length}명 중 문의 ${scoped.openInquiries.length}건`,
+      actions: [{ label: "검토 화면 문의함에서 답변", href: INQUIRY_LINK }],
+    });
+  }
+
+  // ⑺ 변경 재확인 미확인 — 조직·직무 변경 등으로 다시 확인이 필요하다고 표시된 응답.
+  if (scoped.recheckResponses.length > 0) {
+    cards.push({
+      key: "recheck-open",
+      tone: "attention",
+      signal: `변경 재확인이 필요한 응답이 ${scoped.recheckResponses.length}건 있습니다`,
+      evidence: [
+        "조직·직무 변경 등으로 다시 확인이 필요하다고 표시된 응답입니다.",
+        "참여자가 확인하거나 관리자가 정정하면 이 목록에서 빠집니다.",
+      ],
+      asOf,
+      scope: `대상 ${model.respondents.length}명 중 재확인 대기 ${scoped.recheckResponses.length}건`,
+      actions: [{ label: "마스터 화면에서 확인", href: RECHECK_LINK }],
     });
   }
 

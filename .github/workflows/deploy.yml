@@ -55,10 +55,14 @@ jobs:
             if (process.env.RESEND_API_KEY) j.vars.RESEND_API_KEY = process.env.RESEND_API_KEY;
             if (process.env.RESEND_FROM) j.vars.RESEND_FROM = process.env.RESEND_FROM;
             if (process.env.ELIZAX_PROXY_URL) j.vars.ELIZAX_PROXY_URL = process.env.ELIZAX_PROXY_URL;
+            // 정기 실행(POST /api/cron) 인증 토큰. cron.yml 이 같은 값을 헤더로 보낸다.
+            if (process.env.CRON_TOKEN) j.vars.CRON_TOKEN = process.env.CRON_TOKEN;
             // 같은 계정 workers.dev 간 fetch(오류 1042) 우회 — elizax-proxy 서비스 바인딩
             j.services = [{ binding: "ELIZAX_PROXY", service: "elizax-proxy" }];
             // 자동 백업/리마인더/예약 발송용 cron (UTC 21:00·09:00 = KST 06:00·18:00).
-            // CF 무료 플랜은 계정당 cron 5개 상한 — ENABLE_CRON=1 시크릿이 있을 때만 등록.
+            // 기본 실행 경로는 GitHub Actions(.github/workflows/cron.yml → POST /api/cron)다.
+            // CF 무료 플랜은 계정당 cron 5개 상한이라, 여유가 있는 계정에서 ENABLE_CRON=1 을
+            // 넣었을 때만 CF cron 도 함께 등록한다(둘 다 같은 실행기를 부른다).
             if (process.env.ENABLE_CRON === "1") j.triggers = { crons: ["0 21,9 * * *"] };
             fs.writeFileSync(p, JSON.stringify(j, null, 2));
             console.log("injected vars:", Object.keys(j.vars).join(", "));
@@ -71,6 +75,7 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM: ${{ secrets.RESEND_FROM }}
           ELIZAX_PROXY_URL: ${{ secrets.ELIZAX_PROXY_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
           ENABLE_CRON: ${{ secrets.ENABLE_CRON }}
 
       - name: Deploy to Cloudflare Workers

@@ -1,0 +1,39 @@
+name: 정기 실행 (예약 발송 · 독려 · 백업 · 리포트)
+
+# Cloudflare 무료 플랜은 계정당 cron 5개 상한을 이미 채웠다. 그래서 정기 실행은 CF cron 이
+# 아니라 여기서 배포된 앱의 /api/cron 을 두드리는 방식으로 돈다.
+# 필요한 시크릿: APP_URL(예 https://example.workers.dev), CRON_TOKEN(앱 런타임과 같은 값)
+on:
+  schedule:
+    # UTC 21:00 / 09:00 = KST 06:00 / 18:00
+    - cron: "0 21 * * *"
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "실행할 작업 (all / scheduled-mail / reminders / backup / report / cleanup)"
+        required: false
+        default: "all"
+
+concurrency:
+  group: cron
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 정기 실행 호출
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+          JOB: ${{ github.event.inputs.job || 'all' }}
+        run: |
+          if [ -z "$APP_URL" ] || [ -z "$CRON_TOKEN" ]; then
+            echo "APP_URL 또는 CRON_TOKEN 시크릿이 없습니다."
+            exit 1
+          fi
+          # --fail-with-body: 작업이 하나라도 실패하면 앱이 500 을 주고 이 단계가 빨갛게 뜬다.
+          curl --fail-with-body -sS -X POST \
+            -H "x-cron-token: $CRON_TOKEN" \
+            "${APP_URL%/}/api/cron?job=$JOB"

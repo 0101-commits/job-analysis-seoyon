@@ -38,10 +38,8 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { EmptyState } from "@/components/EmptyState";
 import { SignalCard } from "@/components/SignalCard";
 import { useCompanyScope } from "@/components/CompanyContext";
-import {
-  MailPreviewGallery,
-  useMailApprovals,
-} from "@/components/admin/MailPreviewGallery";
+import { MailPreviewGallery, useMailApprovals } from "@/components/admin/MailPreviewGallery";
+import { MailHealthCard } from "@/components/admin/MailHealthCard";
 import {
   OrgTreeFilter,
   orgPathLabel,
@@ -200,18 +198,8 @@ function MailPage() {
         </p>
       </div>
 
-      {mode?.simulation && (
-        <div className="flex items-start gap-3 rounded-xl border border-warning/40 bg-warning/10 p-4">
-          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" />
-          <div className="text-sm">
-            <p className="font-semibold text-warning">{COPY.simulationMode}</p>
-            <p className="mt-1 text-muted-foreground">
-              메일 발송 키가 등록되지 않아 실제 메일은 나가지 않고 발송 기록만 남습니다. 실제로
-              보내려면 운영 설정에서 발송 키를 등록해야 합니다.
-            </p>
-          </div>
-        </div>
-      )}
+      {/* 연습/실발송 여부, 발신 도메인 인증, 오늘 남은 여유를 한 장에서 확인한다 (기획 F1). */}
+      <MailHealthCard />
 
       <Tabs value={tab} onValueChange={(v) => goTab(v as MailTab)}>
         <TabsList className="w-full sm:w-auto">
@@ -637,7 +625,9 @@ function SendTab({
   const [templateId, setTemplateId] = useState("");
   const [name, setName] = useState("");
   const [statuses, setStatuses] = useState<string[]>(() =>
-    splitList(search.status).filter((s) => (ACCOUNT_STATUS_LABELS as readonly string[]).includes(s)),
+    splitList(search.status).filter((s) =>
+      (ACCOUNT_STATUS_LABELS as readonly string[]).includes(s),
+    ),
   );
   const [scheduledAt, setScheduledAt] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -734,9 +724,7 @@ function SendTab({
   const nothingToRemind = isReminder && included.length > 0 && reminderTargets.length === 0;
 
   const overLimit = included.length > sendLimit;
-  const asOfLabel = targets?.asOf
-    ? targets.asOf.slice(0, 16).replace("T", " ")
-    : "";
+  const asOfLabel = targets?.asOf ? targets.asOf.slice(0, 16).replace("T", " ") : "";
 
   /**
    * 즉시 발송은 확인한 명단을 그대로 고정해서 보낸다(화면과 실제 발송이 어긋나지 않게).
@@ -763,7 +751,8 @@ function SendTab({
     onSuccess: (result) => {
       setConfirmOpen(false);
       setBulkAck(false);
-      if (result.scheduled) toast.success("발송이 예약되었습니다. 이력 탭에서 확인·취소할 수 있습니다.");
+      if (result.scheduled)
+        toast.success("발송이 예약되었습니다. 이력 탭에서 확인·취소할 수 있습니다.");
       else
         toast.success(
           `발송 완료 — 성공 ${result.sent ?? 0}건 / 실패 ${result.failed ?? 0}건${
@@ -1113,8 +1102,8 @@ function SendTab({
                       className="mt-0.5"
                     />
                     <span>
-                      상한 {sendLimit}통을 넘는 {included.length}통입니다. 한 번에 많이 보내면
-                      메일 서버가 일부를 거절할 수 있습니다 — 그래도 보내겠습니다.
+                      상한 {sendLimit}통을 넘는 {included.length}통입니다. 한 번에 많이 보내면 메일
+                      서버가 일부를 거절할 수 있습니다 — 그래도 보내겠습니다.
                     </span>
                   </label>
                 )}
@@ -1260,7 +1249,21 @@ function HistoryTab() {
                   <dt className="text-muted-foreground">실패</dt>
                   <dd className="font-semibold text-destructive">{b.failed_count}</dd>
                 </div>
+                {b.bounced_count > 0 && (
+                  <div className="flex gap-1">
+                    <dt className="text-muted-foreground">반송</dt>
+                    <dd className="font-semibold text-warning">{b.bounced_count}</dd>
+                  </div>
+                )}
               </dl>
+              {b.held_count > 0 && (
+                <p className="mt-2 text-xs font-medium text-warning">
+                  하루 발송 상한
+                  {b.held_cap ? ` ${b.held_cap.toLocaleString()}건` : ""}을 넘어 {b.held_count}건을
+                  보내지 않고 남겼습니다. 다음 날 같은 대상으로 다시 보내거나 운영 설정에서 상한을
+                  올리세요.
+                </p>
+              )}
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <StatusBadge status={b.status} />
@@ -1319,14 +1322,24 @@ function failureHelp(message: string | null) {
   return "원인이 기록되지 않았습니다. [재발송]을 눌러 다시 시도해 보세요.";
 }
 
-type LogBucket = "all" | "성공" | "실패" | "접속";
+/** 반송 사유 — 발송 서비스가 준 통지 문구를 그대로 보여 주고 다음 행동을 붙인다. */
+function bounceHelp(reason: string | null) {
+  const head = reason?.trim() ? reason.trim() : "되돌아온 이유가 기록되지 않았습니다.";
+  return `${head} 참여자 관리에서 주소를 확인·수정한 뒤 [재발송]을 누르세요.`;
+}
+
+type LogBucket = "all" | "성공" | "실패" | "반송" | "접속";
 
 const BUCKET_LABELS: Record<LogBucket, string> = {
   all: "전체",
   성공: "성공",
   실패: "실패",
+  반송: "반송",
   접속: "발송 후 접속",
 };
+
+/** 수신자에게 닿지 못한 상태. 재발송 대상이 된다. */
+const UNREACHED_STATUSES = ["실패", "반송"];
 
 function BatchLogs({ batchId }: { batchId: string }) {
   const queryClient = useQueryClient();
@@ -1350,9 +1363,15 @@ function BatchLogs({ batchId }: { batchId: string }) {
   const resendFailedMutation = useMutation({
     mutationFn: () => resendFailedLogs({ data: { batchId, origin: origin() } }),
     onSuccess: (result) => {
-      if (result.total === 0) toast.info("재발송할 실패 건이 없습니다(이미 재발송되었습니다).");
+      if (result.total === 0) toast.info("재발송할 건이 없습니다(이미 재발송되었습니다).");
+      else if (result.stopped)
+        toast.warning(
+          `${result.ok + result.failed}건까지만 보냈습니다 — ${result.stopped.reason} (남은 ${result.stopped.remainingTargets}건)`,
+        );
       else
-        toast.success(`실패 ${result.total}건 재발송 — 성공 ${result.ok}건 / 실패 ${result.failed}건`);
+        toast.success(
+          `닿지 못한 ${result.total}건 재발송 — 성공 ${result.ok}건 / 실패 ${result.failed}건`,
+        );
       void queryClient.invalidateQueries({ queryKey: ["mail-logs", batchId] });
       void queryClient.invalidateQueries({ queryKey: ["mail-batches"] });
     },
@@ -1363,7 +1382,7 @@ function BatchLogs({ batchId }: { batchId: string }) {
     return <p className="border-t px-4 py-3 text-sm text-muted-foreground">불러오는 중...</p>;
   }
 
-  const rows = logs ?? [];
+  const rows = logs?.rows ?? [];
   if (!rows.length) {
     return (
       <p className="border-t px-4 py-3 text-sm text-muted-foreground">
@@ -1375,21 +1394,28 @@ function BatchLogs({ batchId }: { batchId: string }) {
   /** 메일 열람 자체는 추적하지 않는다. 보낸 뒤 실제 접속했는지로 도달을 판단한다. */
   function accessedAfterSend(log: (typeof rows)[number]) {
     const seen = log.participants?.last_seen_at;
-    return log.status !== "실패" && Boolean(seen) && Date.parse(seen as string) > Date.parse(log.sent_at);
+    return (
+      !UNREACHED_STATUSES.includes(log.status) &&
+      Boolean(seen) &&
+      Date.parse(seen as string) > Date.parse(log.sent_at)
+    );
   }
 
   const counts = {
     all: rows.length,
-    성공: rows.filter((l) => l.status !== "실패").length,
+    성공: rows.filter((l) => !UNREACHED_STATUSES.includes(l.status)).length,
     실패: rows.filter((l) => l.status === "실패").length,
+    반송: rows.filter((l) => l.status === "반송").length,
     접속: rows.filter(accessedAfterSend).length,
   };
+  const unreached = counts.실패 + counts.반송;
 
   const visible = rows.filter((log) => {
     if (bucket === "all") return true;
     if (bucket === "실패") return log.status === "실패";
+    if (bucket === "반송") return log.status === "반송";
     if (bucket === "접속") return accessedAfterSend(log);
-    return log.status !== "실패";
+    return !UNREACHED_STATUSES.includes(log.status);
   });
 
   return (
@@ -1411,7 +1437,7 @@ function BatchLogs({ batchId }: { batchId: string }) {
             </button>
           ))}
         </div>
-        {counts.실패 > 0 && (
+        {unreached > 0 && (
           <Button
             variant="outline"
             size="sm"
@@ -1419,7 +1445,7 @@ function BatchLogs({ batchId }: { batchId: string }) {
             disabled={resendFailedMutation.isPending}
           >
             <RotateCw className="size-4" />
-            {resendFailedMutation.isPending ? "재발송 중..." : "실패 건 재발송"}
+            {resendFailedMutation.isPending ? "재발송 중..." : `닿지 못한 ${unreached}건 재발송`}
           </Button>
         )}
       </div>
@@ -1428,6 +1454,13 @@ function BatchLogs({ batchId }: { batchId: string }) {
         <p className="border-b px-4 py-2 text-xs text-muted-foreground">
           메일을 열었는지는 추적하지 않습니다. 발송 시각 뒤에 시스템에 접속한 기록이 있는 사람만
           셉니다.
+        </p>
+      )}
+
+      {bucket === "반송" && (
+        <p className="border-b px-4 py-2 text-xs text-muted-foreground">
+          한 번 나갔지만 받는 쪽에서 되돌려보낸 건입니다. 없는 주소·꽉 찬 메일함·수신 거부가
+          대부분이며, 주소를 고치지 않고 재발송하면 다시 되돌아옵니다.
         </p>
       )}
 
@@ -1461,9 +1494,18 @@ function BatchLogs({ batchId }: { batchId: string }) {
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   {log.sent_at.slice(0, 16).replace("T", " ")}
                   {accessedAfterSend(log) ? " · 발송 후 접속함" : ""}
+                  {log.bounced_at
+                    ? ` · ${log.bounced_at.slice(0, 16).replace("T", " ")} 되돌아옴`
+                    : ""}
+                  {log.retry_count > 0 ? ` · 자동 재시도 ${log.retry_count}회` : ""}
                 </p>
                 {log.status === "실패" && (
                   <p className="mt-1 text-xs text-destructive">{failureHelp(log.error_message)}</p>
+                )}
+                {log.status === "반송" && (
+                  <p className="mt-1 text-xs text-warning">
+                    {bounceHelp(log.participants?.mail_bounce_reason ?? log.error_message)}
+                  </p>
                 )}
               </div>
               <div className="flex items-center gap-2">
@@ -1473,7 +1515,9 @@ function BatchLogs({ batchId }: { batchId: string }) {
                       ? "bg-success/15 text-success"
                       : log.status === "실패"
                         ? "bg-destructive/10 text-destructive"
-                        : "bg-muted text-muted-foreground"
+                        : log.status === "반송"
+                          ? "bg-warning/15 text-warning"
+                          : "bg-muted text-muted-foreground"
                   }`}
                 >
                   {log.status === "시뮬레이션" ? "실제 발송 안 함" : log.status}
@@ -1483,7 +1527,7 @@ function BatchLogs({ batchId }: { batchId: string }) {
                     <Eye className="size-3" /> 접속
                   </span>
                 )}
-                {log.status === "실패" && (
+                {UNREACHED_STATUSES.includes(log.status) && (
                   <Button
                     variant="outline"
                     size="sm"

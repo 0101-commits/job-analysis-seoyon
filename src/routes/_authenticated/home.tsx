@@ -8,14 +8,13 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { SignalCard, type SignalAction } from "@/components/SignalCard";
 import { getLatestReject, loadFull } from "@/lib/survey.data";
 import { decideMySuggestion } from "@/lib/ai.functions";
+import { SURVEY_STEP_LABELS, findFocusFields, focusLabel, focusSearch } from "@/lib/survey.focus";
+import { NoticeStack } from "@/components/survey/NoticeStack";
+import { InquiryPanel } from "@/components/survey/InquiryPanel";
 import {
-  SURVEY_STEP_LABELS,
-  findFocusFields,
-  focusLabel,
-  focusSearch,
-} from "@/lib/survey.focus";
-import { InfoChangeBanner } from "@/components/survey/InfoChangeBanner";
-import { SubmissionSummary, type SubmissionSummaryProps } from "@/components/survey/SubmissionSummary";
+  SubmissionSummary,
+  type SubmissionSummaryProps,
+} from "@/components/survey/SubmissionSummary";
 import {
   AiSuggestionCards,
   type AiSuggestionItem,
@@ -272,7 +271,7 @@ function RespondentHome() {
       </header>
 
       <main className="mx-auto max-w-4xl space-y-6 px-4 py-8 sm:px-6 sm:py-10">
-        <InfoChangeBanner />
+        <NoticeStack />
 
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
@@ -404,13 +403,12 @@ function RespondentHome() {
           </section>
         )}
 
+        <InquiryPanel />
+
         {/* 안내는 한 번 보고 끝이 아니다 — 언제든 다시 열 수 있어야 한다 (P10). */}
         <p className="text-sm text-muted-foreground">
           작성 방법이 헷갈리면{" "}
-          <Link
-            to="/onboarding"
-            className="font-medium text-primary underline underline-offset-2"
-          >
+          <Link to="/onboarding" className="font-medium text-primary underline underline-offset-2">
             조사 안내 5장 다시 보기
           </Link>
         </p>

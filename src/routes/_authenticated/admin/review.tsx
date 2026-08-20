@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -25,6 +25,9 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { EmptyState } from "@/components/EmptyState";
 import { SectionNav, CollapsibleSection } from "@/components/SectionNav";
 import { ReviewWorkbench, type CenterView } from "@/components/admin/ReviewWorkbench";
+import { ReviewQualityPanel } from "@/components/admin/ReviewQualityPanel";
+import { InterviewPanel } from "@/components/admin/InterviewPanel";
+import { InquiryInbox, inquiryAlerts, useInquiries } from "@/components/admin/InquiryInbox";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { handleInfoRequest, listInfoRequests, listReviewQueue } from "@/lib/review.functions";
 import { infoFieldLabel } from "@/lib/survey.data";
@@ -41,14 +44,20 @@ import { infoFieldLabel } from "@/lib/survey.data";
  *   &view=detail|diff|job          가운데 패널: 원문 / 이전 제출과 비교 / 같은 직무 비교
  *   &job=<직무명>                  view=job 일 때 비교 대상 직무
  *   &req=요청|처리완료|반려|all    정보 수정 요청 구획 상태 필터 (기본 요청)
+ *   &sort=risk|submitted           검토 대기 목록 정렬 (기본 risk = 주의 필요한 순)
+ *   ?tab=inquiry                   문의함 구획을 펼친 상태로 열고 그 위치로 이동 (진행 현황 딥링크 수신)
  */
 
 const QUEUE_STATUSES = ["submitted", "draft", "rejected", "approved", "all"] as const;
 const VIEWS = ["detail", "diff", "job"] as const;
 const REQ_STATUSES = ["요청", "처리완료", "반려", "all"] as const;
+const SORTS = ["risk", "submitted"] as const;
+const TABS = ["inquiry"] as const;
 
 type QueueStatus = (typeof QUEUE_STATUSES)[number];
 type ReqStatus = (typeof REQ_STATUSES)[number];
+type QueueSort = (typeof SORTS)[number];
+type Tab = (typeof TABS)[number];
 
 interface ReviewSearch {
   response?: string;
@@ -57,6 +66,8 @@ interface ReviewSearch {
   view?: CenterView;
   job?: string;
   req?: ReqStatus;
+  sort?: QueueSort;
+  tab?: Tab;
 }
 
 /** 상태 변경 요청 — undefined 는 "이 키를 URL 에서 지운다"는 뜻이다. */
@@ -84,6 +95,10 @@ export const Route = createFileRoute("/_authenticated/admin/review")({
     if (typeof job === "string" && job.length > 0) out.job = job;
     const req = pick(search["req"], REQ_STATUSES);
     if (req) out.req = req;
+    const sort = pick(search["sort"], SORTS);
+    if (sort) out.sort = sort;
+    const tab = pick(search["tab"], TABS);
+    if (tab) out.tab = tab;
     return out;
   },
   head: () => ({
@@ -115,6 +130,7 @@ function ReviewPage() {
   const jobQuery = search.q ?? "";
   const view = search.view ?? "detail";
   const reqStatus = search.req ?? "요청";
+  const sort = search.sort ?? "risk";
   const selectedId = search.response ?? null;
 
   /** 화면 상태 변경은 전부 URL 갱신으로 처리한다. 빈 값은 키째 지운다. */
@@ -133,24 +149,36 @@ function ReviewPage() {
   }
 
   const { data, isLoading } = useQuery({
-    queryKey: ["review-queue", scope, status, jobQuery],
+    queryKey: ["review-queue", scope, status, jobQuery, sort],
     queryFn: () =>
       listReviewQueue({
         data: {
           companyId: scope,
           status: status === "all" ? null : status,
           jobName: jobQuery.trim() || undefined,
+          sort,
         },
       }),
   });
 
   const rows = data?.rows ?? [];
   const jobNames = Object.keys(data?.jobCounts ?? {}).sort((a, b) => a.localeCompare(b));
+  const attention = rows.filter((r) => r.grade === "주의").length;
 
   const { data: infoData, isLoading: infoLoading } = useQuery({
     queryKey: ["info-requests", reqStatus],
     queryFn: () => listInfoRequests({ data: { status: reqStatus === "all" ? null : reqStatus } }),
   });
+
+  // 문의는 구획이 접혀 있어도 건수·주의 표시를 띄워야 하므로 화면 쪽에서 읽는다.
+  const inquiryQuery = useInquiries();
+  const inquiry = inquiryAlerts(inquiryQuery.data);
+
+  // 진행 현황의 「접수된 문의 N건」 카드가 ?tab=inquiry 로 이 화면을 연다.
+  const inquiryTab = search.tab === "inquiry";
+  useEffect(() => {
+    if (inquiryTab) document.getElementById("inquiries")?.scrollIntoView({ block: "start" });
+  }, [inquiryTab]);
 
   return (
     <div className="space-y-5">
@@ -164,6 +192,13 @@ function ReviewPage() {
       <SectionNav
         sections={[
           { id: "workbench", label: "검토 대기", count: rows.length },
+          { id: "quality", label: "점검 결과", count: attention },
+          { id: "interviews", label: "인터뷰 관리" },
+          {
+            id: "inquiries",
+            label: inquiry.heavy.length > 0 ? "문의함 (주의)" : "문의함",
+            count: inquiry.pending,
+          },
           { id: "info-requests", label: "정보 수정 요청", count: infoData?.pending ?? 0 },
         ]}
       />
@@ -184,8 +219,69 @@ function ReviewPage() {
           onCompareJobChange={(v) => setSearch({ job: v ?? undefined })}
           jobNames={jobNames}
           companyId={scope}
+          sort={sort}
+          onSortChange={(v) => setSearch({ sort: v === "risk" ? undefined : (v as QueueSort) })}
         />
       </section>
+
+      <CollapsibleSection
+        storageKey="review-page"
+        id="quality"
+        title="점검 결과 · 일괄 승인 후보"
+        subtitle="규칙으로 응답을 확인해 주의가 필요한 건을 목록 위로 올리고, 양호한 건은 묶어서 승인합니다."
+        aside={
+          attention > 0 ? (
+            <span className="rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground">
+              주의 {attention}
+            </span>
+          ) : null
+        }
+      >
+        <ReviewQualityPanel
+          rows={rows}
+          unchecked={data?.unchecked ?? 0}
+          companyId={scope}
+          onSelect={(id) => setSearch({ response: id })}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        storageKey="review-page"
+        id="interviews"
+        title="인터뷰 관리"
+        subtitle="응답자가 1명인 직무는 인터뷰 기록이 있어야 승인됩니다. 2~4명인 직무는 심층 검토 대상입니다."
+        defaultCollapsed
+      >
+        <InterviewPanel companyId={scope} onSelect={(id) => setSearch({ response: id })} />
+      </CollapsibleSection>
+
+      {/*
+        딥링크(?tab=inquiry)로 들어오면 펼친 채로 보여야 한다. 접힘 상태는 화면 단위 localStorage 에
+        저장돼 밖에서 열 수 없으므로, 딥링크일 때만 저장 키를 갈라 접힘 기록을 타지 않게 한다.
+        ponytail: 저장 키 분리로 해결 — CollapsibleSection 에 열림 제어 prop 이 생기면 그걸로 바꾼다.
+      */}
+      <CollapsibleSection
+        storageKey={inquiryTab ? "review-page-inquiry-link" : "review-page"}
+        id="inquiries"
+        title="문의함"
+        subtitle="참여자가 보낸 문의를 확인하고 답변합니다."
+        defaultCollapsed={!inquiryTab}
+        aside={
+          inquiry.pending > 0 ? (
+            <span
+              className={
+                inquiry.heavy.length > 0
+                  ? "rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground"
+                  : "rounded-full bg-secondary px-2 py-0.5 text-[11px] font-semibold text-muted-foreground"
+              }
+            >
+              {inquiry.heavy.length > 0 ? `주의 ${inquiry.pending}` : inquiry.pending}
+            </span>
+          ) : null
+        }
+      >
+        <InquiryInbox query={inquiryQuery} />
+      </CollapsibleSection>
 
       <CollapsibleSection
         storageKey="review-page"

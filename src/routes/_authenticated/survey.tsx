@@ -29,7 +29,9 @@ import {
 } from "@/components/ui/dialog";
 import { HowToBox, TaskGrid, TaskHowTo, uid } from "@/components/survey/TaskGrid";
 import { selfCheckMyResponse, type SelfCheckFinding } from "@/lib/ai.functions";
-import { InfoChangeBanner } from "@/components/survey/InfoChangeBanner";
+import { NoticeStack } from "@/components/survey/NoticeStack";
+import { InquiryComposer } from "@/components/survey/InquiryComposer";
+import type { InquiryCategory } from "@/lib/inquiry.functions";
 import { SkillGrid, SkillHowTo } from "@/components/survey/SkillGrid";
 import { RequirementsForm } from "@/components/survey/RequirementsForm";
 import { ExamplePopover } from "@/components/survey/ExamplePopover";
@@ -555,6 +557,12 @@ function SurveyPage() {
   const [gateTried, setGateTried] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [conflictOpen, setConflictOpen] = useState(false);
+  /** 맥락별 [문의하기] 진입점(기본정보 없음, 항목 이해 안 됨 등)이 공유하는 다이얼로그 상태. */
+  const [inquiry, setInquiry] = useState<{ open: boolean; category: InquiryCategory }>({
+    open: false,
+    category: "기타",
+  });
+  const openInquiry = (category: InquiryCategory) => setInquiry({ open: true, category });
   const [sending, setSending] = useState(false);
   const [justSubmitted, setJustSubmitted] = useState(false);
   /** V15-2: 제출 전 셀프 AI 점검 다이얼로그 상태. 게이트가 아니므로 제출 흐름과 무관하다. */
@@ -1058,6 +1066,8 @@ function SurveyPage() {
       {/* 넓은 화면에서는 입력이 좁아지지 않도록 폭을 늘려 오른쪽에 점검 패널을 세운다 (기획 C1·C3). */}
       <main className="mx-auto max-w-5xl px-4 py-6 pb-24 sm:px-6 lg:grid lg:max-w-7xl lg:grid-cols-[minmax(0,1fr)_19rem] lg:gap-6 lg:pb-6">
         <div className="space-y-5">
+          <NoticeStack />
+
           {status === "rejected" && reject ? (
             <RejectBanner
               responseId={data.response.id}
@@ -1084,7 +1094,6 @@ function SurveyPage() {
                       "요청을 보낸 뒤에도 작성은 계속할 수 있습니다.",
                     ]}
                   />
-                  <InfoChangeBanner />
                   <InfoRequestPanel participant={participant} showPending />
                   <dl className="grid gap-3 sm:grid-cols-2">
                     {(
@@ -1180,6 +1189,14 @@ function SurveyPage() {
                     아직 표준 분류가 없다면 평소 쓰는 이름으로 적어 주세요. 나중에 표준 분류와
                     연결됩니다.
                   </p>
+                  <Button
+                    type="button"
+                    variant="link"
+                    className="h-auto p-0 text-sm"
+                    onClick={() => openInquiry("직무없음")}
+                  >
+                    내 직무가 목록에 없나요? 문의하기
+                  </Button>
                   <InfoRequestPanel participant={participant} />
                 </div>
               ) : null}
@@ -1259,6 +1276,14 @@ function SurveyPage() {
               {step === 4 ? (
                 <div className="space-y-5">
                   <TaskHowTo taskCount={tasks.length} />
+                  <Button
+                    type="button"
+                    variant="link"
+                    className="h-auto p-0 text-sm"
+                    onClick={() => openInquiry("항목이해")}
+                  >
+                    이 항목이 무슨 뜻인지 모르겠나요? 문의하기
+                  </Button>
                   {!readOnly && (dutyCandidates?.length ?? 0) > 0 ? (
                     <DutyImportPanel
                       candidates={dutyCandidates ?? []}
@@ -1326,6 +1351,14 @@ function SurveyPage() {
                   </TabsList>
                   <TabsContent value="skills" className="mt-4 space-y-5">
                     <SkillHowTo skillCount={skills.length} />
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="h-auto p-0 text-sm"
+                      onClick={() => openInquiry("항목이해")}
+                    >
+                      이 항목이 무슨 뜻인지 모르겠나요? 문의하기
+                    </Button>
                     <SkillGrid
                       value={skills}
                       onChange={setSkills}
@@ -1611,6 +1644,12 @@ function SurveyPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <InquiryComposer
+        open={inquiry.open}
+        onOpenChange={(v) => setInquiry((prev) => ({ ...prev, open: v }))}
+        defaultCategory={inquiry.category}
+      />
     </div>
   );
 }

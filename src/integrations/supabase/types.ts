@@ -14,6 +14,411 @@ export type Database = {
   }
   public: {
     Tables: {
+      ai_calls: {
+        Row: {
+          actor_id: string | null
+          created_at: string
+          duration_ms: number | null
+          error_message: string | null
+          feature: string
+          id: string
+          model: string | null
+          output_chars: number | null
+          prompt_chars: number | null
+          status: string
+          target: string | null
+        }
+        Insert: {
+          actor_id?: string | null
+          created_at?: string
+          duration_ms?: number | null
+          error_message?: string | null
+          feature: string
+          id?: string
+          model?: string | null
+          output_chars?: number | null
+          prompt_chars?: number | null
+          status?: string
+          target?: string | null
+        }
+        Update: {
+          actor_id?: string | null
+          created_at?: string
+          duration_ms?: number | null
+          error_message?: string | null
+          feature?: string
+          id?: string
+          model?: string | null
+          output_chars?: number | null
+          prompt_chars?: number | null
+          status?: string
+          target?: string | null
+        }
+        Relationships: []
+      }
+      backups: {
+        Row: {
+          created_at: string
+          created_by: string | null
+          id: string
+          kind: string
+          note: string | null
+          path: string
+          row_counts: Json
+          size_bytes: number | null
+        }
+        Insert: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          kind?: string
+          note?: string | null
+          path: string
+          row_counts?: Json
+          size_bytes?: number | null
+        }
+        Update: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          kind?: string
+          note?: string | null
+          path?: string
+          row_counts?: Json
+          size_bytes?: number | null
+        }
+        Relationships: []
+      }
+      cron_runs: {
+        Row: {
+          detail: Json
+          duration_ms: number | null
+          error_message: string | null
+          finished_at: string | null
+          id: string
+          job: string
+          started_at: string
+          status: string
+        }
+        Insert: {
+          detail?: Json
+          duration_ms?: number | null
+          error_message?: string | null
+          finished_at?: string | null
+          id?: string
+          job: string
+          started_at?: string
+          status?: string
+        }
+        Update: {
+          detail?: Json
+          duration_ms?: number | null
+          error_message?: string | null
+          finished_at?: string | null
+          id?: string
+          job?: string
+          started_at?: string
+          status?: string
+        }
+        Relationships: []
+      }
+      inquiries: {
+        Row: {
+          answer: string | null
+          answer_seen_at: string | null
+          answered_at: string | null
+          answered_by: string | null
+          body: string
+          category: string
+          created_at: string
+          id: string
+          participant_id: string
+          status: string
+        }
+        Insert: {
+          answer?: string | null
+          answer_seen_at?: string | null
+          answered_at?: string | null
+          answered_by?: string | null
+          body: string
+          category?: string
+          created_at?: string
+          id?: string
+          participant_id: string
+          status?: string
+        }
+        Update: {
+          answer?: string | null
+          answer_seen_at?: string | null
+          answered_at?: string | null
+          answered_by?: string | null
+          body?: string
+          category?: string
+          created_at?: string
+          id?: string
+          participant_id?: string
+          status?: string
+        }
+        Relationships: []
+      }
+      interviews: {
+        Row: {
+          created_at: string
+          created_by: string | null
+          id: string
+          interviewer: string | null
+          memo: string | null
+          participant_id: string | null
+          response_id: string
+          scheduled_at: string | null
+          status: string
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          interviewer?: string | null
+          memo?: string | null
+          participant_id?: string | null
+          response_id: string
+          scheduled_at?: string | null
+          status?: string
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          interviewer?: string | null
+          memo?: string | null
+          participant_id?: string | null
+          response_id?: string
+          scheduled_at?: string | null
+          status?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      job_description_versions: {
+        Row: {
+          created_at: string
+          created_by: string | null
+          id: string
+          job_description_id: string
+          note: string | null
+          seq: number
+          snapshot: Json
+        }
+        Insert: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          job_description_id: string
+          note?: string | null
+          seq?: number
+          snapshot: Json
+        }
+        Update: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          job_description_id?: string
+          note?: string | null
+          seq?: number
+          snapshot?: Json
+        }
+        Relationships: []
+      }
+      job_descriptions: {
+        Row: {
+          attitudes: Json
+          catalog_version_id: string | null
+          company_id: string
+          confirmed_at: string | null
+          confirmed_by: string | null
+          created_at: string
+          definition: string | null
+          edited_fields: string[]
+          generated_at: string | null
+          id: string
+          job_group: string | null
+          job_name: string
+          job_series: string | null
+          knowledge: Json
+          mission: string | null
+          requirements: Json
+          response_count: number
+          skills: Json
+          sources: Json
+          status: string
+          tasks: Json
+          updated_at: string
+        }
+        Insert: {
+          attitudes?: Json
+          catalog_version_id?: string | null
+          company_id: string
+          confirmed_at?: string | null
+          confirmed_by?: string | null
+          created_at?: string
+          definition?: string | null
+          edited_fields?: string[]
+          generated_at?: string | null
+          id?: string
+          job_group?: string | null
+          job_name: string
+          job_series?: string | null
+          knowledge?: Json
+          mission?: string | null
+          requirements?: Json
+          response_count?: number
+          skills?: Json
+          sources?: Json
+          status?: string
+          tasks?: Json
+          updated_at?: string
+        }
+        Update: {
+          attitudes?: Json
+          catalog_version_id?: string | null
+          company_id?: string
+          confirmed_at?: string | null
+          confirmed_by?: string | null
+          created_at?: string
+          definition?: string | null
+          edited_fields?: string[]
+          generated_at?: string | null
+          id?: string
+          job_group?: string | null
+          job_name?: string
+          job_series?: string | null
+          knowledge?: Json
+          mission?: string | null
+          requirements?: Json
+          response_count?: number
+          skills?: Json
+          sources?: Json
+          status?: string
+          tasks?: Json
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      reminder_rule_runs: {
+        Row: {
+          created_at: string
+          id: string
+          rule_id: string
+          run_date: string
+          sent_count: number
+          skipped_count: number
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          rule_id: string
+          run_date?: string
+          sent_count?: number
+          skipped_count?: number
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          rule_id?: string
+          run_date?: string
+          sent_count?: number
+          skipped_count?: number
+        }
+        Relationships: []
+      }
+      reminder_rules: {
+        Row: {
+          company_id: string | null
+          created_at: string
+          daily_cap: number
+          days: number
+          enabled: boolean
+          id: string
+          last_run_at: string | null
+          last_sent_count: number | null
+          name: string
+          template_id: string | null
+          trigger: string
+          updated_at: string
+        }
+        Insert: {
+          company_id?: string | null
+          created_at?: string
+          daily_cap?: number
+          days?: number
+          enabled?: boolean
+          id?: string
+          last_run_at?: string | null
+          last_sent_count?: number | null
+          name: string
+          template_id?: string | null
+          trigger: string
+          updated_at?: string
+        }
+        Update: {
+          company_id?: string | null
+          created_at?: string
+          daily_cap?: number
+          days?: number
+          enabled?: boolean
+          id?: string
+          last_run_at?: string | null
+          last_sent_count?: number | null
+          name?: string
+          template_id?: string | null
+          trigger?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      survey_waves: {
+        Row: {
+          company_id: string
+          created_at: string
+          deadline: string | null
+          id: string
+          kind: string
+          name: string
+          note: string | null
+          reminder_days: number[]
+          seq: number
+          status: string
+          updated_at: string
+        }
+        Insert: {
+          company_id: string
+          created_at?: string
+          deadline?: string | null
+          id?: string
+          kind?: string
+          name: string
+          note?: string | null
+          reminder_days?: number[]
+          seq?: number
+          status?: string
+          updated_at?: string
+        }
+        Update: {
+          company_id?: string
+          created_at?: string
+          deadline?: string | null
+          id?: string
+          kind?: string
+          name?: string
+          note?: string | null
+          reminder_days?: number[]
+          seq?: number
+          status?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       ai_suggestions: {
         Row: {
           ai_suggested_value: string | null
@@ -346,6 +751,9 @@ export type Database = {
           template_id: string | null
           to_email: string
           to_name: string | null
+          bounced_at: string | null
+          retry_count: number
+          provider_event: Json | null
         }
         Insert: {
           batch_id?: string | null
@@ -360,6 +768,9 @@ export type Database = {
           template_id?: string | null
           to_email: string
           to_name?: string | null
+          bounced_at?: string | null
+          retry_count?: number
+          provider_event?: Json | null
         }
         Update: {
           batch_id?: string | null
@@ -374,6 +785,9 @@ export type Database = {
           template_id?: string | null
           to_email?: string
           to_name?: string | null
+          bounced_at?: string | null
+          retry_count?: number
+          provider_event?: Json | null
         }
         Relationships: [
           {
@@ -500,6 +914,9 @@ export type Database = {
           tags: string[]
           updated_at: string
           user_id: string | null
+          mail_bounced_at: string | null
+          mail_bounce_reason: string | null
+          wave_id: string | null
         }
         Insert: {
           account_status?: Database["public"]["Enums"]["account_status"]
@@ -526,6 +943,9 @@ export type Database = {
           tags?: string[]
           updated_at?: string
           user_id?: string | null
+          mail_bounced_at?: string | null
+          mail_bounce_reason?: string | null
+          wave_id?: string | null
         }
         Update: {
           account_status?: Database["public"]["Enums"]["account_status"]
@@ -552,6 +972,9 @@ export type Database = {
           tags?: string[]
           updated_at?: string
           user_id?: string | null
+          mail_bounced_at?: string | null
+          mail_bounce_reason?: string | null
+          wave_id?: string | null
         }
         Relationships: [
           {
@@ -751,6 +1174,14 @@ export type Database = {
           status: string
           submitted_at: string | null
           updated_at: string
+          wave_id: string | null
+          recheck_required: boolean
+          recheck_reason: string | null
+          recheck_notified_at: string | null
+          recheck_cleared_at: string | null
+          quality_score: number | null
+          quality_flags: Json
+          quality_checked_at: string | null
         }
         Insert: {
           company_id: string
@@ -772,6 +1203,14 @@ export type Database = {
           status?: string
           submitted_at?: string | null
           updated_at?: string
+          wave_id?: string | null
+          recheck_required?: boolean
+          recheck_reason?: string | null
+          recheck_notified_at?: string | null
+          recheck_cleared_at?: string | null
+          quality_score?: number | null
+          quality_flags?: Json
+          quality_checked_at?: string | null
         }
         Update: {
           company_id?: string
@@ -793,6 +1232,14 @@ export type Database = {
           status?: string
           submitted_at?: string | null
           updated_at?: string
+          wave_id?: string | null
+          recheck_required?: boolean
+          recheck_reason?: string | null
+          recheck_notified_at?: string | null
+          recheck_cleared_at?: string | null
+          quality_score?: number | null
+          quality_flags?: Json
+          quality_checked_at?: string | null
         }
         Relationships: [
           {
@@ -894,6 +1341,11 @@ export type Database = {
           password_rule: string
           role_levels: string[]
           updated_at: string
+          report_enabled: boolean
+          report_weekday: number
+          report_recipients: string[]
+          backup_retention_days: number
+          mail_daily_cap: number
         }
         Insert: {
           created_at?: string
@@ -901,6 +1353,11 @@ export type Database = {
           password_rule?: string
           role_levels?: string[]
           updated_at?: string
+          report_enabled?: boolean
+          report_weekday?: number
+          report_recipients?: string[]
+          backup_retention_days?: number
+          mail_daily_cap?: number
         }
         Update: {
           created_at?: string
@@ -908,6 +1365,11 @@ export type Database = {
           password_rule?: string
           role_levels?: string[]
           updated_at?: string
+          report_enabled?: boolean
+          report_weekday?: number
+          report_recipients?: string[]
+          backup_retention_days?: number
+          mail_daily_cap?: number
         }
         Relationships: []
       }
@@ -937,6 +1399,10 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      snapshot_job_description: {
+        Args: { _id: string; _note?: string }
+        Returns: number
+      }
       decide_suggestion: {
         Args: {
           _decision: string

@@ -6,6 +6,7 @@ import {
   ClipboardCheck,
   Database,
   Download,
+  Layers,
   LayoutDashboard,
   LogOut,
   Mail,
@@ -58,6 +59,7 @@ const NAV: NavGroup[] = [
     items: [
       { to: "/admin/master", label: "조직·직무 기준정보", icon: Database },
       { to: "/admin/participants", label: "참여자 명부", icon: Users },
+      { to: "/admin/waves", label: "차수 관리", icon: Layers },
       { to: "/admin/settings", label: "조사 설정", icon: Settings },
     ],
   },

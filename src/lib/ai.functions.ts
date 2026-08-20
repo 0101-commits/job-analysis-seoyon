@@ -109,11 +109,13 @@ export const pingProxy = createServerFn({ method: "POST" })
   .handler(async ({ context }) => {
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
-    const { callLLM } = await import("@/lib/llm.server");
+    const { callLLM, AI_FEATURES } = await import("@/lib/llm.server");
     const text = await callLLM({
       system: "연결 확인용 호출이다. 다른 말 없이 pong 만 출력한다.",
       user: "ping",
       maxTokens: 16,
+      feature: AI_FEATURES.PING,
+      actorId: context.userId,
     });
     return { ok: true, reply: text.trim().slice(0, 40) };
   });
@@ -157,7 +159,7 @@ export const scanTypos = createServerFn({ method: "POST" })
     const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { callLLMJson } = await import("@/lib/llm.server");
+    const { callLLMJson, AI_FEATURES } = await import("@/lib/llm.server");
 
     const { items } = await collectResponseText(supabaseAdmin, data.responseId);
     if (items.length === 0) return { inserted: 0, suggestions: [] };
@@ -173,6 +175,9 @@ export const scanTypos = createServerFn({ method: "POST" })
         `${JSON.stringify(items, null, 0)}\n\n` +
         'JSON만 출력한다. 형식: [{"target":"원문의 target 값 그대로","original":"고칠 원문 전체","suggested":"수정한 원문 전체","reason":"한 문장 사유"}]',
       maxTokens: 2048,
+      feature: AI_FEATURES.TYPO_SCAN,
+      target: data.responseId,
+      actorId: context.userId,
     });
 
     const byTarget = new Map(items.map((i) => [i.target, i]));
@@ -224,7 +229,7 @@ export const detectPoorResponses = createServerFn({ method: "POST" })
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { callLLMJson } = await import("@/lib/llm.server");
+    const { callLLMJson, AI_FEATURES } = await import("@/lib/llm.server");
 
     let q = supabaseAdmin
       .from("responses")
@@ -273,6 +278,9 @@ export const detectPoorResponses = createServerFn({ method: "POST" })
         `${JSON.stringify(payload)}\n\n` +
         'JSON만 출력한다. 형식: [{"responseId":"...","issues":["근거 한 문장"],"rejectDraft":"응답자에게 보낼 반려 사유 초안(존댓말 2~3문장, 무엇을 어떻게 고쳐야 하는지 구체적으로)"}]',
       maxTokens: 2048,
+      feature: AI_FEATURES.POOR_SWEEP,
+      target: `스윕 ${responses.length}건${data.companyId ? "" : " (전사)"}`,
+      actorId: context.userId,
     });
 
     const byId = new Map(responses.map((r) => [r.id, r]));
@@ -313,7 +321,7 @@ export const selfCheckMyResponse = createServerFn({ method: "POST" })
     if (!own) throw new Error("본인 응답만 점검할 수 있습니다.");
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { callLLMJson } = await import("@/lib/llm.server");
+    const { callLLMJson, AI_FEATURES } = await import("@/lib/llm.server");
 
     const { response, taskRows, activityRows } = await collectResponseText(
       supabaseAdmin,
@@ -335,6 +343,9 @@ export const selfCheckMyResponse = createServerFn({ method: "POST" })
         `${JSON.stringify(payload)}\n\n` +
         'JSON만 출력한다. 형식: [{"item":"항목(예: 과업 2, 직무 정의)","reason":"부실로 본 근거 한 문장","suggestion":"어떻게 보완하면 되는지 한두 문장"}]',
       maxTokens: 2048,
+      feature: AI_FEATURES.SELF_CHECK,
+      target: data.responseId,
+      actorId: context.userId,
     });
 
     const findings = (Array.isArray(found) ? found : []).filter(
@@ -359,7 +370,7 @@ export const checkResponseQuality = createServerFn({ method: "POST" })
       const { requireAdmin } = await import("@/lib/guard.server");
       await requireAdmin(context.supabase, context.userId);
       const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-      const { callLLMJson } = await import("@/lib/llm.server");
+      const { callLLMJson, AI_FEATURES } = await import("@/lib/llm.server");
 
       const { response, taskRows, activityRows } = await collectResponseText(
         supabaseAdmin,
@@ -385,6 +396,9 @@ export const checkResponseQuality = createServerFn({ method: "POST" })
           `${JSON.stringify(payload)}\n\n` +
           'JSON만 출력한다. 형식: {"issues":["근거 한 문장"],"rejectDraft":"응답자에게 보낼 반려 사유 초안(존댓말 2~3문장, 무엇을 어떻게 고쳐야 하는지 구체적으로)","step":되돌릴 작성 단계 번호(3=정의·목적, 4=과업·활동, 5=스킬·요건)}',
         maxTokens: 1024,
+        feature: AI_FEATURES.SINGLE_CHECK,
+        target: data.responseId,
+        actorId: context.userId,
       });
 
       const issues = Array.isArray(verdict?.issues)
@@ -567,7 +581,7 @@ export const draftMissingFields = createServerFn({ method: "POST" })
     const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { callLLMJson } = await import("@/lib/llm.server");
+    const { callLLMJson, AI_FEATURES } = await import("@/lib/llm.server");
 
     const { response, taskRows, activityRows, skillRows } = await collectResponseText(
       supabaseAdmin,
@@ -605,6 +619,9 @@ export const draftMissingFields = createServerFn({ method: "POST" })
           `이미 등록된 스킬(중복 금지): ${JSON.stringify(skillRows.map((s) => s.name))}\n\n` +
           'JSON만 출력한다. 형식: [{"name":"스킬명","ksao":"K|S|A","hard_soft":"Hard|Soft","description":"한 문장 설명"}]',
         maxTokens: 1500,
+        feature: AI_FEATURES.MISSING_FIELDS,
+        target: `${data.responseId}:skills`,
+        actorId: context.userId,
       });
 
       rows = (Array.isArray(drafts) ? drafts : [])
@@ -644,6 +661,9 @@ export const draftMissingFields = createServerFn({ method: "POST" })
           "항목 뜻 — majors_required: 필수 전공, majors_preferred: 우대 전공, trainings: 필요 교육·훈련, proficiency: 숙련까지 필요한 경력 수준\n\n" +
           'JSON만 출력한다. 형식: {"항목키":"초안 문장"}',
         maxTokens: 1200,
+        feature: AI_FEATURES.MISSING_FIELDS,
+        target: `${data.responseId}:requirements`,
+        actorId: context.userId,
       });
 
       rows = missing
@@ -693,7 +713,7 @@ export const suggestMerges = createServerFn({ method: "POST" })
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { callLLMJson } = await import("@/lib/llm.server");
+    const { callLLMJson, AI_FEATURES } = await import("@/lib/llm.server");
 
     let names: string[] = [];
     if (data.field === "job_name") {
@@ -722,6 +742,9 @@ export const suggestMerges = createServerFn({ method: "POST" })
         `표기 목록: ${JSON.stringify(distinct)}\n\n` +
         'JSON만 출력한다. 형식: [{"canonical":"대표 표기(목록 안의 값)","variants":["같은 묶음의 다른 표기들"]}] — variants 는 2개 이상 묶인 경우에만 포함하고 canonical 도 variants 에 넣는다.',
       maxTokens: 2048,
+      feature: AI_FEATURES.MERGE_SUGGEST,
+      target: data.field,
+      actorId: context.userId,
     });
 
     const valid = (Array.isArray(clusters) ? clusters : [])
@@ -1038,4 +1061,205 @@ export const decideMySuggestion = createServerFn({ method: "POST" })
     if (error) throw new Error(error.message);
 
     return { applied: true, target: s.target };
+  });
+
+/* ─────────────────── F17: AI 사용 원장 ─────────────────── */
+
+export type AiLedgerFeatureRow = {
+  feature: string;
+  total: number;
+  success: number;
+  failed: number;
+  avgDurationMs: number | null;
+  lastSuccessAt: string | null;
+};
+
+export type AiLedgerFailureRow = {
+  id: string;
+  feature: string;
+  target: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  /** 대상만 지정해 다시 생성할 수 있는 경우에만 채워진다. */
+  retry: { kind: "jobCatalog" | "dutyChart"; value: string } | null;
+};
+
+export type AiLedgerAdoptionRow = {
+  kind: string;
+  pending: number;
+  accepted: number;
+  edited: number;
+  rejected: number;
+  total: number;
+  acceptedRate: number | null;
+};
+
+export type AiLedger = {
+  /** 이번 집계가 훑은 최근 호출 건수(집계 상한에 걸렸는지 판단용). */
+  sampleSize: number;
+  features: AiLedgerFeatureRow[];
+  failures: AiLedgerFailureRow[];
+  adoption: AiLedgerAdoptionRow[];
+  involvement: { respondedWithAi: number; totalResponses: number; ratio: number | null };
+};
+
+// ponytail: 집계 함수 없이 최근 N건을 훑어 JS 로 합산한다 — 이 조사 규모에 충분한 가장
+// 단순한 방법이다. 호출량이 훨씬 커지면(수만 건) SQL 집계로 옮길 것.
+const LEDGER_CALL_LIMIT = 5000;
+const LEDGER_FAILURE_LIMIT = 100;
+
+export const getAiLedger = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<AiLedger> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { AI_FEATURES } = await import("@/lib/llm.server");
+
+    const [callsRes, failRes, suggestionsRes, appliedRes, totalRes] = await Promise.all([
+      supabaseAdmin
+        .from("ai_calls")
+        .select("feature, status, duration_ms, created_at")
+        .order("created_at", { ascending: false })
+        .limit(LEDGER_CALL_LIMIT),
+      supabaseAdmin
+        .from("ai_calls")
+        .select("id, feature, target, error_message, created_at")
+        .eq("status", "실패")
+        .order("created_at", { ascending: false })
+        .limit(LEDGER_FAILURE_LIMIT),
+      supabaseAdmin.from("ai_suggestions").select("kind, status, ai_suggested_value"),
+      supabaseAdmin.from("ai_suggestions").select("response_id").eq("status", "확정"),
+      supabaseAdmin.from("responses").select("id", { count: "exact", head: true }),
+    ]);
+    if (callsRes.error) throw new Error(`AI 호출 기록 조회 실패: ${callsRes.error.message}`);
+    if (failRes.error) throw new Error(`AI 실패 목록 조회 실패: ${failRes.error.message}`);
+    if (suggestionsRes.error) throw new Error(`AI 제안 조회 실패: ${suggestionsRes.error.message}`);
+    if (appliedRes.error) throw new Error(`AI 반영 응답 조회 실패: ${appliedRes.error.message}`);
+    if (totalRes.error) throw new Error(`전체 응답 수 조회 실패: ${totalRes.error.message}`);
+
+    // 기능별 호출 수 / 성공·실패 / 평균 소요 시간 / 마지막 성공 시각
+    const byFeature = new Map<
+      string,
+      {
+        feature: string;
+        total: number;
+        success: number;
+        failed: number;
+        durations: number[];
+        lastSuccessAt: string | null;
+      }
+    >();
+    for (const c of callsRes.data ?? []) {
+      const g = byFeature.get(c.feature) ?? {
+        feature: c.feature,
+        total: 0,
+        success: 0,
+        failed: 0,
+        durations: [],
+        lastSuccessAt: null,
+      };
+      g.total += 1;
+      if (c.status === "성공") {
+        g.success += 1;
+        if (typeof c.duration_ms === "number") g.durations.push(c.duration_ms);
+        if (!g.lastSuccessAt || Date.parse(c.created_at) > Date.parse(g.lastSuccessAt)) {
+          g.lastSuccessAt = c.created_at;
+        }
+      } else {
+        g.failed += 1;
+      }
+      byFeature.set(c.feature, g);
+    }
+    const features: AiLedgerFeatureRow[] = [...byFeature.values()]
+      .map((g) => ({
+        feature: g.feature,
+        total: g.total,
+        success: g.success,
+        failed: g.failed,
+        avgDurationMs: g.durations.length
+          ? Math.round(g.durations.reduce((a, b) => a + b, 0) / g.durations.length)
+          : null,
+        lastSuccessAt: g.lastSuccessAt,
+      }))
+      .sort((a, b) => b.total - a.total);
+
+    // 실패 목록의 재실행 힌트 — 직무분류 가안(직군명)·업무분장 가안(조직명→id 조회)만 대상 지정 재생성이 가능하다.
+    const dutyTargets = [
+      ...new Set(
+        (failRes.data ?? [])
+          .filter((r) => r.feature === AI_FEATURES.DUTY_CHART_DRAFT && r.target)
+          .map((r) => r.target as string),
+      ),
+    ];
+    const orgIdByName = new Map<string, string>();
+    if (dutyTargets.length > 0) {
+      const { data: orgs } = await supabaseAdmin
+        .from("org_units")
+        .select("id, name")
+        .in("name", dutyTargets);
+      // 같은 이름의 조직이 둘 이상이면 먼저 찾은 것으로 재실행한다 — 정밀 지정이 필요하면 업무분장 화면에서 직접.
+      for (const o of orgs ?? []) if (!orgIdByName.has(o.name)) orgIdByName.set(o.name, o.id);
+    }
+
+    const failures: AiLedgerFailureRow[] = (failRes.data ?? []).map((r) => {
+      let retry: AiLedgerFailureRow["retry"] = null;
+      if (r.feature === AI_FEATURES.JOB_CATALOG_DRAFT && r.target) {
+        retry = { kind: "jobCatalog", value: r.target };
+      } else if (r.feature === AI_FEATURES.DUTY_CHART_DRAFT && r.target) {
+        const orgId = orgIdByName.get(r.target);
+        if (orgId) retry = { kind: "dutyChart", value: orgId };
+      }
+      return {
+        id: r.id,
+        feature: r.feature,
+        target: r.target,
+        errorMessage: r.error_message,
+        createdAt: r.created_at,
+        retry,
+      };
+    });
+
+    // 제안 채택률 — 최종 상태만 남아 수락/수정을 구분 못 하므로, "수정"에서만 채워지는
+    // ai_suggested_value 유무로 구분한다(수정 시 AI 원문을 보존, 수락 시엔 비어 있음).
+    const adoptionMap = new Map<
+      string,
+      { kind: string; pending: number; accepted: number; edited: number; rejected: number }
+    >();
+    for (const s of suggestionsRes.data ?? []) {
+      const g = adoptionMap.get(s.kind) ?? {
+        kind: s.kind,
+        pending: 0,
+        accepted: 0,
+        edited: 0,
+        rejected: 0,
+      };
+      if (s.status === "거절") g.rejected += 1;
+      else if (s.status === "확정") {
+        if (s.ai_suggested_value) g.edited += 1;
+        else g.accepted += 1;
+      } else {
+        g.pending += 1; // 제안 · 요청중
+      }
+      adoptionMap.set(s.kind, g);
+    }
+    const adoption: AiLedgerAdoptionRow[] = [...adoptionMap.values()].map((g) => {
+      const decided = g.accepted + g.edited + g.rejected;
+      return {
+        ...g,
+        total: g.pending + decided,
+        acceptedRate: decided > 0 ? Math.round(((g.accepted + g.edited) / decided) * 100) : null,
+      };
+    });
+
+    // 응답 대비 AI 개입 비중
+    const respondedWithAi = new Set((appliedRes.data ?? []).map((r) => r.response_id)).size;
+    const totalResponses = totalRes.count ?? 0;
+    const involvement = {
+      respondedWithAi,
+      totalResponses,
+      ratio: totalResponses > 0 ? Math.round((respondedWithAi / totalResponses) * 100) : null,
+    };
+
+    return { sampleSize: callsRes.data?.length ?? 0, features, failures, adoption, involvement };
   });

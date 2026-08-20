@@ -59,6 +59,154 @@ async function buildSampleVars(
   };
 }
 
+export type MailHealth = {
+  /** 정상 | 주의 | 차단 */
+  signal: "정상" | "주의" | "차단";
+  /** 차단·주의일 때 지금 해야 할 일 한 줄. 정상이면 null. */
+  todo: string | null;
+  simulation: boolean;
+  keyRegistered: boolean;
+  fromAddress: string;
+  fromIsDefault: boolean;
+  fromDomain: string | null;
+  domain: {
+    state: string;
+    detail: string;
+    records: { label: string; status: string; tone: "ok" | "warn" | "unknown" }[];
+  };
+  dailyCap: number;
+  sentToday: number;
+  sentThisMonth: number;
+  /** 요금제 한도는 발송 서비스가 알려 주지 않는다. 왜 못 보여 주는지 화면에 그대로 쓴다. */
+  monthlyQuotaNote: string;
+  bouncedThisMonth: number;
+  bouncedParticipants: number;
+  asOf: string;
+};
+
+/**
+ * 발송 건강검진 (기획 F1).
+ *
+ * 500명 넘는 참여자에게 초대 메일을 보내는데 스팸함으로 들어가면 조사가 멈춘다. 발송 버튼을
+ * 누르기 전에 ① 실제로 나가는 상태인지 ② 발신 도메인 인증이 끝났는지 ③ 오늘 얼마나 더
+ * 보낼 수 있는지를 한 장에서 눈으로 확인한다.
+ *
+ * 값은 전부 실측이다. 조회하지 못한 항목은 빈칸으로 두지 않고 왜 못 했는지를 적는다.
+ */
+export const mailHealth = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<MailHealth> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const {
+      DEFAULT_MAIL_FROM,
+      countSentSince,
+      fetchDomainVerification,
+      isSimulationMode,
+      kstDayStartIso,
+      kstMonthStartIso,
+      mailDailyCap,
+      mailFrom,
+      mailFromDomain,
+    } = await import("@/lib/mailer.server");
+
+    const fromAddress = mailFrom();
+    const fromDomain = mailFromDomain(fromAddress);
+    const monthStart = kstMonthStartIso();
+
+    const [dailyCap, sentToday, sentThisMonth, domain, bounced, bouncedPeople] = await Promise.all([
+      mailDailyCap(supabaseAdmin),
+      countSentSince(supabaseAdmin, kstDayStartIso()),
+      countSentSince(supabaseAdmin, monthStart),
+      fetchDomainVerification(fromDomain),
+      supabaseAdmin
+        .from("mail_logs")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "반송")
+        .gte("sent_at", monthStart),
+      supabaseAdmin
+        .from("participants")
+        .select("id", { count: "exact", head: true })
+        .not("mail_bounced_at", "is", null),
+    ]);
+
+    const simulation = isSimulationMode();
+    const fromIsDefault = fromAddress === DEFAULT_MAIL_FROM;
+    const capReached = sentToday >= dailyCap;
+
+    // 신호 판정.
+    // '차단' 은 "지금 누르면 일이 잘못된다" 에만 쓴다 — 인증 안 된 도메인으로 500통을 스팸함에
+    // 꽂거나, 상한을 넘겨 일부만 나가는 경우. 연습 모드는 의도된 안전한 상태이고 키를 등록할
+    // 때까지 계속 유지되므로 '주의' 로 둔다(늘 빨간 화면이면 아무도 보지 않는다).
+    let signal: MailHealth["signal"] = "정상";
+    let todo: string | null = null;
+    if (simulation) {
+      signal = "주의";
+      todo =
+        "발송 키가 없어 실제 발송과 발신 도메인 인증 확인이 모두 불가합니다. 지금은 문구 검토와 연습 발송만 할 수 있고, 참여자에게 실제로 보내기 전에 발송 키 등록이 필요합니다.";
+    } else if (domain.state === "미등록" || domain.state === "미완료") {
+      signal = "차단";
+      todo = `발신 도메인 인증을 먼저 마치세요. 이 상태로 500명에게 보내면 상당수가 스팸함으로 갑니다. (${domain.state})`;
+    } else if (capReached) {
+      signal = "차단";
+      todo = `오늘 상한 ${dailyCap}건을 이미 채웠습니다. 내일 보내거나 운영 설정에서 상한을 올리세요.`;
+    } else if (fromIsDefault) {
+      signal = "주의";
+      todo = "발신 주소가 아직 임시 주소입니다. 회사 도메인 주소로 바꾼 뒤 대량 발송하세요.";
+    } else if (domain.state !== "정상") {
+      signal = "주의";
+      todo = `발신 도메인 인증 상태를 확인하지 못했습니다 — ${domain.detail}`;
+    } else if (sentToday >= dailyCap * 0.8) {
+      signal = "주의";
+      todo = `오늘 상한 ${dailyCap}건 중 ${sentToday}건을 썼습니다. 남은 여유는 ${dailyCap - sentToday}건입니다.`;
+    }
+
+    return {
+      signal,
+      todo,
+      simulation,
+      keyRegistered: !simulation,
+      fromAddress,
+      fromIsDefault,
+      fromDomain,
+      domain,
+      dailyCap,
+      sentToday,
+      sentThisMonth,
+      monthlyQuotaNote:
+        "요금제의 월 발송 한도는 발송 서비스가 알려 주지 않아 여기서 조회할 수 없습니다. 발송 서비스 화면에서 확인하세요.",
+      bouncedThisMonth: bounced.count ?? 0,
+      bouncedParticipants: bouncedPeople.count ?? 0,
+      asOf: new Date().toISOString(),
+    };
+  });
+
+/** 마지막 발송이 되돌아온 참여자 명단. 참여자 화면은 다른 담당 소유라 데이터만 내준다. */
+export const listBouncedParticipants = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ companyId: z.string().uuid().nullable().optional() }).parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    let query = supabaseAdmin
+      .from("participants")
+      .select(
+        "id, name, emp_no, email, org_text, company_id, account_status, mail_bounced_at, mail_bounce_reason",
+      )
+      .not("mail_bounced_at", "is", null)
+      .order("mail_bounced_at", { ascending: false })
+      .limit(500);
+    if (data.companyId) query = query.eq("company_id", data.companyId);
+    const { data: rows, error } = await query;
+    if (error) throw new Error(error.message);
+    return { rows: rows ?? [], asOf: new Date().toISOString() };
+  });
+
 export const listTemplates = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
@@ -235,9 +383,7 @@ export const previewAllTemplates = createServerFn({ method: "POST" })
         updatedAt: t.updated_at,
         subject,
         html: renderMailHtml(body, vars["접속링크"]),
-        unreplaced: [
-          ...new Set([...findUnreplacedTokens(subject), ...findUnreplacedTokens(body)]),
-        ],
+        unreplaced: [...new Set([...findUnreplacedTokens(subject), ...findUnreplacedTokens(body)])],
       };
     });
 
@@ -468,7 +614,8 @@ export const cancelScheduledBatch = createServerFn({ method: "POST" })
   });
 
 /**
- * 배치의 실패 건만 모아 재발송한다(개별 재발송과 같은 파이프라인, 건별 새 로그 기록).
+ * 배치의 닿지 못한 건(실패 + 반송)을 모아 재발송한다.
+ * 개별 재발송과 같은 파이프라인이며 건별로 새 기록을 남긴다.
  * 이미 개별 재발송으로 회복된 참여자는 건너뛰어 중복 발송을 막는다.
  */
 export const resendFailedLogs = createServerFn({ method: "POST" })
@@ -489,32 +636,47 @@ export const resendFailedLogs = createServerFn({ method: "POST" })
       .order("sent_at");
     if (error) throw new Error(error.message);
 
+    // '반송' 은 한 번 나갔지만 되돌아온 건이라 회복으로 보지 않는다.
+    const UNREACHED = ["실패", "반송"];
     const recovered = new Set(
       (logs ?? [])
-        .filter((l) => l.status !== "실패" && l.participant_id)
+        .filter((l) => !UNREACHED.includes(l.status) && l.participant_id)
         .map((l) => l.participant_id),
     );
     const fails = (logs ?? []).filter(
-      (l) => l.status === "실패" && (!l.participant_id || !recovered.has(l.participant_id)),
+      (l) =>
+        UNREACHED.includes(l.status) && (!l.participant_id || !recovered.has(l.participant_id)),
     );
     if (!fails.length) return { total: 0, ok: 0, failed: 0 };
 
     let ok = 0;
     let failed = 0;
-    for (const log of fails) {
-      const { status } = await resendLog(supabaseAdmin, log.id, data.origin ?? null);
-      if (status === "실패") failed += 1;
-      else ok += 1;
+    /** 일일 상한에 걸려 중단됐을 때 남은 건수와 이유. 여기서 멈춘 사실을 그대로 알린다. */
+    let stopped: { reason: string; remainingTargets: number } | null = null;
+
+    for (const [index, log] of fails.entries()) {
+      try {
+        const { status } = await resendLog(supabaseAdmin, log.id, data.origin ?? null);
+        if (status === "실패") failed += 1;
+        else ok += 1;
+      } catch (err) {
+        // 상한 도달처럼 다음 건도 똑같이 막히는 사유면 여기서 멈추고 이미 처리한 결과를 지킨다.
+        stopped = {
+          reason: err instanceof Error ? err.message : "알 수 없는 오류",
+          remainingTargets: fails.length - index,
+        };
+        break;
+      }
     }
 
     await writeAudit(supabaseAdmin, {
       actor_id: context.userId,
-      action: "실패 건 일괄 재발송",
+      action: "닿지 못한 건 일괄 재발송",
       target_type: "mail_batch",
       target_id: data.batchId,
-      detail: { total: fails.length, ok, failed },
+      detail: { total: fails.length, ok, failed, stopped },
     });
-    return { total: fails.length, ok, failed };
+    return { total: fails.length, ok, failed, stopped };
   });
 
 export const listBatches = createServerFn({ method: "GET" })
@@ -526,12 +688,41 @@ export const listBatches = createServerFn({ method: "GET" })
     const { data, error } = await supabaseAdmin
       .from("mail_batches")
       .select(
-        "id, name, status, total_count, sent_count, failed_count, simulated, scheduled_at, finished_at, created_at, companies(name), mail_templates(name)",
+        "id, name, status, total_count, sent_count, failed_count, simulated, scheduled_at, finished_at, created_at, filters, companies(name), mail_templates(name)",
       )
       .order("created_at", { ascending: false })
       .limit(100);
     if (error) throw new Error(error.message);
-    return data ?? [];
+    const rows = data ?? [];
+
+    // 반송은 발송 시점에는 성공이었다가 나중에 통지로 바뀐다. 배치 행의 sent/failed 로는
+    // 알 수 없으므로 발송 기록에서 세어 붙인다.
+    const bouncedByBatch = new Map<string, number>();
+    if (rows.length) {
+      const { data: bounced } = await supabaseAdmin
+        .from("mail_logs")
+        .select("batch_id")
+        .eq("status", "반송")
+        .in(
+          "batch_id",
+          rows.map((r) => r.id),
+        );
+      for (const b of bounced ?? []) {
+        if (!b.batch_id) continue;
+        bouncedByBatch.set(b.batch_id, (bouncedByBatch.get(b.batch_id) ?? 0) + 1);
+      }
+    }
+
+    return rows.map((r) => {
+      const filters = (r.filters ?? {}) as { heldByDailyCap?: number; dailyCap?: number };
+      return {
+        ...r,
+        bounced_count: bouncedByBatch.get(r.id) ?? 0,
+        /** 일일 상한을 넘겨 보내지 않은 건수 (processBatch 가 filters 에 남긴다). */
+        held_count: typeof filters.heldByDailyCap === "number" ? filters.heldByDailyCap : 0,
+        held_cap: typeof filters.dailyCap === "number" ? filters.dailyCap : null,
+      };
+    });
   });
 
 export const listLogs = createServerFn({ method: "POST" })
@@ -544,11 +735,20 @@ export const listLogs = createServerFn({ method: "POST" })
     const { data: logs, error } = await supabaseAdmin
       .from("mail_logs")
       // participant 의 마지막 접속 시각을 함께 받아 "보낸 뒤 실제로 들어왔는지" 를 화면에서 판단한다.
+      // 반송 시각·재시도 횟수도 함께 준다 — 왜 안 닿았는지를 사람별로 보여 주기 위해서다.
       .select(
-        "id, to_name, to_email, subject, status, error_message, sent_at, participant_id, participants(last_seen_at)",
+        "id, to_name, to_email, subject, status, error_message, sent_at, bounced_at, retry_count, participant_id, participants(last_seen_at, mail_bounced_at, mail_bounce_reason)",
       )
       .eq("batch_id", data.batchId)
       .order("sent_at", { ascending: false });
     if (error) throw new Error(error.message);
-    return logs ?? [];
+    const rows = logs ?? [];
+    return {
+      rows,
+      counts: {
+        total: rows.length,
+        bounced: rows.filter((l) => l.status === "반송").length,
+        failed: rows.filter((l) => l.status === "실패").length,
+      },
+    };
   });

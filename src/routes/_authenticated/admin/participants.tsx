@@ -79,20 +79,25 @@ import {
   parseRosterFile,
   rosterTemplateCsv,
   validateRoster,
+  type RosterDiffKind,
+  type RosterDiffResult,
+  type RosterDiffRow,
   type RosterRaw,
   type RosterRow,
 } from "@/lib/roster";
+import { RosterDiffPanel, type LeaverAction } from "@/components/admin/RosterDiffPanel";
 import {
+  applyRoster,
   archiveParticipant,
   assignParticipantOrg,
   createParticipant,
   deleteParticipant,
+  diffRoster,
   matchParticipantOrgUnits,
   provisionAccounts,
   resetParticipantPassword,
   setParticipantTags,
   updateParticipant,
-  upsertParticipants,
 } from "@/lib/admin.functions";
 import { getAllowedEmailDomains } from "@/lib/settings.functions";
 import { fetchAll } from "@/lib/paginate";
@@ -105,6 +110,7 @@ import { fetchAll } from "@/lib/paginate";
  *   ?status=<상태>   그 상태만 남긴다 (계정 상태 7종)
  *   ?org=<소속id>    그 소속과 하위 소속만 남긴다
  *   ?q=<검색어> ?tag=<태그> ?archived=1 ?tab=list|upload
+ *   ?assignWave=<차수id> 차수 관리 화면이 보낸다 — 그 차수로 배정하는 흐름을 연다
  *
  * 보낸다
  *   /admin/review?response=<응답id>                      그 응답 단건으로 직행
@@ -120,6 +126,7 @@ type ParticipantsSearch = {
   q?: string;
   tag?: string;
   archived?: boolean;
+  assignWave?: string;
 };
 
 /** 값을 지울 때 undefined 를 명시적으로 넘길 수 있어야 한다(exactOptionalPropertyTypes). */
@@ -150,7 +157,8 @@ export const Route = createFileRoute("/_authenticated/admin/participants")({
     if (p) out.p = p;
     // 모르는 상태 값이 오면 무시한다 — 조건에 맞는 사람이 0명인 빈 화면을 만들지 않기 위해.
     const status = text("status");
-    if (status && (ACCOUNT_STATUS_LABELS as readonly string[]).includes(status)) out.status = status;
+    if (status && (ACCOUNT_STATUS_LABELS as readonly string[]).includes(status))
+      out.status = status;
     const org = text("org");
     if (org) out.org = org;
     const q = text("q");
@@ -159,6 +167,8 @@ export const Route = createFileRoute("/_authenticated/admin/participants")({
     if (tag) out.tag = tag;
     const archived = search["archived"];
     if (archived === true || archived === "1" || archived === "true") out.archived = true;
+    const assignWave = text("assignWave");
+    if (assignWave) out.assignWave = assignWave;
     return out;
   },
   head: () => ({
@@ -205,7 +215,10 @@ function useCompanies() {
   return useQuery({
     queryKey: ["companies"],
     queryFn: async () => {
-      const { data, error } = await supabase.from("companies").select("id, name").order("created_at");
+      const { data, error } = await supabase
+        .from("companies")
+        .select("id, name")
+        .order("created_at");
       if (error) throw error;
       return (data ?? []) as Company[];
     },
@@ -247,8 +260,9 @@ function guessMapping(headers: string[]) {
 
 /* ─────────────────── ① 명부 업로드 → 신규 등록 · 기존 갱신 ─────────────────── */
 
-type ExistingKey = { company_id: string; emp_no: string; email: string | null };
-type ExistingIndex = { byKey: Map<string, string | null>; emailOwner: Map<string, string> };
+type ExistingKey = { company_id: string; emp_no: string; email: string | null; name: string };
+type EmailOwner = { key: string; company_id: string; name: string };
+type ExistingIndex = { byKey: Map<string, string | null>; emailOwner: Map<string, EmailOwner> };
 type Classified = RosterRow & { isUpdate: boolean };
 
 function keyOf(companyId: string | null, empNo: string) {
@@ -257,11 +271,17 @@ function keyOf(companyId: string | null, empNo: string) {
 
 function indexExisting(rows: ExistingKey[]): ExistingIndex {
   const byKey = new Map<string, string | null>();
-  const emailOwner = new Map<string, string>();
+  const emailOwner = new Map<string, EmailOwner>();
   for (const r of rows) {
     const key = keyOf(r.company_id, r.emp_no);
     byKey.set(key, r.email);
-    if (r.email) emailOwner.set(r.email.toLowerCase(), key);
+    if (r.email) {
+      emailOwner.set(r.email.toLowerCase(), {
+        key,
+        company_id: r.company_id,
+        name: r.name.trim(),
+      });
+    }
   }
   return { byKey, emailOwner };
 }
@@ -272,13 +292,19 @@ function indexExisting(rows: ExistingKey[]): ExistingIndex {
  * 실제 유니크 제약은 (계열사, 사번) 하나뿐이므로
  *  - '이미 등록된 사번' 은 항상 되돌리고, 같은 키가 있으면 갱신 대상으로 표시한다.
  *  - '이미 등록된 이메일' 은 그 이메일의 주인이 같은 사람일 때만 되돌린다(남의 이메일은 진짜 오류).
+ *    사번을 다시 발급받아 사번만 달라진 경우도 같은 사람으로 본다 — 같은 계열사에 이름까지 같으면
+ *    같은 사람일 가능성이 높고, 실제 변경 내용은 대조 화면에서 「사번 1007 → 1077」로 확인한 뒤
+ *    관리자가 직접 골라 반영한다.
  */
 function reclassify(rows: RosterRow[], index: ExistingIndex): Classified[] {
   return rows.map((r) => {
     const key = keyOf(r.parsed.company_id, r.parsed.emp_no);
     const isUpdate = index.byKey.has(key);
+    const owner = r.parsed.email ? index.emailOwner.get(r.parsed.email.toLowerCase()) : undefined;
     const ownEmail =
-      !!r.parsed.email && index.emailOwner.get(r.parsed.email.toLowerCase()) === key;
+      !!owner &&
+      (owner.key === key ||
+        (owner.company_id === r.parsed.company_id && owner.name === r.parsed.name.trim()));
     const errors = r.errors.filter(
       (e) => e !== "이미 등록된 사번" && !(e === "이미 등록된 이메일" && ownEmail),
     );
@@ -315,12 +341,31 @@ function fixHint(error: string) {
   return ERROR_FIXES.find((e) => error.startsWith(e.match))?.fix ?? "";
 }
 
+/** 분류별 기본 처리. 명부에서 빠진 사람만 관리자가 보관·삭제 중에서 고른다. */
+function actionFor(kind: RosterDiffKind, leaver: LeaverAction) {
+  if (kind === "신규") return "추가" as const;
+  if (kind === "퇴사후보") return leaver;
+  return "갱신" as const;
+}
+
+type ApplyResult = Awaited<ReturnType<typeof applyRoster>>;
+
 function RosterUploadTab() {
   const queryClient = useQueryClient();
+  const { companyId } = useCompanyScope();
   const [fileName, setFileName] = useState("");
   const [rows, setRows] = useState<RosterRaw[]>([]);
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [validated, setValidated] = useState<Classified[] | null>(null);
+
+  /* 대조 결과와, 그 대조에 실제로 쓴 명부. 반영은 같은 명부를 그대로 다시 보내야
+     항목 지목(rowIndex)이 어긋나지 않는다. */
+  const [diff, setDiff] = useState<RosterDiffResult | null>(null);
+  const [diffRows, setDiffRows] = useState<RosterDiffRow[] | null>(null);
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [leaverAction, setLeaverAction] = useState<LeaverAction>("보관");
+  const [provisionNew, setProvisionNew] = useState(false);
+  const [applyResult, setApplyResult] = useState<ApplyResult | null>(null);
 
   const { data: companies } = useCompanies();
   const { data: domainInfo } = useAllowedDomains();
@@ -332,7 +377,7 @@ function RosterUploadTab() {
       fetchAll<ExistingKey>((from, to) =>
         supabase
           .from("participants")
-          .select("company_id, emp_no, email")
+          .select("company_id, emp_no, email, name")
           .order("id")
           .range(from, to),
       ),
@@ -357,12 +402,24 @@ function RosterUploadTab() {
 
   const validRows = (validated ?? []).filter((r) => r.errors.length === 0);
   const errorRows = (validated ?? []).filter((r) => r.errors.length > 0);
-  const updateCount = validRows.filter((r) => r.isUpdate).length;
-  const newCount = validRows.length - updateCount;
+  const chosenCount = diff ? diff.items.filter((i) => selectedKeys.has(i.key)).length : 0;
 
-  const reflect = useMutation({
+  /** 대조 — 아무것도 바꾸지 않는다. 오류 행은 빼고 정상 행만 기존 명단과 맞춰 본다. */
+  const compare = useMutation({
     mutationFn: async () => {
-      const payload = validRows.map((r) => ({
+      const index = indexExisting(existing ?? []);
+      const result = reclassify(
+        validateRoster(mapped, companies ?? [], existing ?? [], domainInfo?.domains ?? []),
+        index,
+      );
+      setValidated(result);
+      const ok = result.filter((r) => r.errors.length === 0);
+      if (ok.length === 0) {
+        throw new Error(
+          "반영할 수 있는 행이 없습니다. 아래 목록의 조치대로 고친 뒤 다시 올리세요.",
+        );
+      }
+      const payload: RosterDiffRow[] = ok.map((r) => ({
         company_id: r.parsed.company_id as string,
         emp_no: r.parsed.emp_no,
         name: r.parsed.name,
@@ -372,16 +429,80 @@ function RosterUploadTab() {
         grade: r.parsed.grade,
         role_level: r.parsed.role_level,
       }));
-      if (payload.length === 0) throw new Error("반영할 건이 없습니다.");
-      return upsertParticipants({ data: { rows: payload }, headers: await authHeaders() });
+      const diffResult = await diffRoster({
+        // 계열사 범위를 좁혀 둔 상태면 그 계열사만 「빠진 사람」 판정 대상으로 삼는다.
+        data: { rows: payload, companyId: companyId !== "all" ? companyId : null },
+        headers: await authHeaders(),
+      });
+      return { payload, diffResult, badCount: result.length - ok.length };
     },
-    onSuccess: () => {
-      toast.success(
-        `신규 ${newCount}명 등록, 갱신 ${updateCount}명 완료했습니다. 명단 탭에서 계정을 생성하세요.`,
+    onSuccess: ({ payload, diffResult, badCount }) => {
+      setDiffRows(payload);
+      setDiff(diffResult);
+      setApplyResult(null);
+      // 명부에서 빠진 사람은 기본으로 고르지 않는다 — 사람이 한 번 더 확인해야 하는 처리다.
+      setSelectedKeys(
+        new Set(diffResult.items.filter((i) => i.kind !== "퇴사후보").map((i) => i.key)),
       );
-      reset();
+      if (badCount > 0) {
+        toast.error(`${badCount}건은 오류가 있어 대조에서 뺐습니다. 아래 목록을 확인하세요.`);
+      } else if (diffResult.items.length === 0) {
+        toast.success("달라진 사람이 없습니다. 반영할 것이 없습니다.");
+      } else {
+        toast.success(`대조를 마쳤습니다. 달라진 사람 ${diffResult.items.length}명을 확인하세요.`);
+      }
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  /** 반영 — 고른 항목만, 고른 처리로만. 서버가 같은 명부로 다시 대조해 처리 내용을 확정한다. */
+  const apply = useMutation({
+    mutationFn: async () => {
+      if (!diff || !diffRows) throw new Error("먼저 대조를 실행하세요.");
+      const decisions = diff.items
+        .filter((i) => selectedKeys.has(i.key))
+        .map((i) => ({ key: i.key, action: actionFor(i.kind, leaverAction) }));
+      if (decisions.length === 0) throw new Error("반영할 항목을 하나 이상 고르세요.");
+
+      const headers = await authHeaders();
+      const result = await applyRoster({
+        data: {
+          companyId: companyId !== "all" ? companyId : null,
+          rows: diffRows,
+          decisions,
+        },
+        headers,
+      });
+
+      // 계정 발급은 명단 탭의 [계정 생성]과 같은 기능을 그대로 부른다.
+      let accounts: { created: number; updated: number; failed: number } | null = null;
+      if (provisionNew && result.createdIds.length > 0) {
+        const ids = result.createdIds.slice(0, 1000);
+        const res = await provisionAccounts({ data: { participantIds: ids }, headers });
+        accounts = { created: res.created, updated: res.updated, failed: res.failures.length };
+        if (result.createdIds.length > ids.length) {
+          accounts.failed += result.createdIds.length - ids.length;
+        }
+      }
+      return { result, accounts };
+    },
+    onSuccess: ({ result, accounts }) => {
+      setApplyResult(result);
+      setSelectedKeys(new Set());
+      const parts = [
+        result.added ? `추가 ${result.added}명` : "",
+        result.updated ? `갱신 ${result.updated}명` : "",
+        result.archived ? `보관 ${result.archived}명` : "",
+        result.deleted ? `삭제 ${result.deleted}명` : "",
+      ].filter(Boolean);
+      toast.success(`${parts.join(" · ") || "반영할 변화가 없었습니다"} 처리했습니다.`);
+      if (result.failures.length > 0)
+        toast.error(`${result.failures.length}건은 처리하지 못했습니다.`);
+      if (accounts) toast.success(`계정 ${accounts.created}건 생성, ${accounts.updated}건 갱신`);
+      if (result.backup.error) toast.error(`백업 없이 진행했습니다: ${result.backup.error}`);
       void queryClient.invalidateQueries({ queryKey: ["participants"] });
       void queryClient.invalidateQueries({ queryKey: ["participants-keys"] });
+      void queryClient.invalidateQueries({ queryKey: ["participants-responses"] });
     },
     onError: (err) => toast.error(errorMessage(err)),
   });
@@ -391,6 +512,15 @@ function RosterUploadTab() {
     setRows([]);
     setMapping({});
     setValidated(null);
+    clearDiff();
+    setApplyResult(null);
+  }
+
+  /** 명부·항목 연결이 바뀌면 대조 결과는 더 이상 그 명부의 것이 아니다. 지우고 다시 대조하게 한다. */
+  function clearDiff() {
+    setDiff(null);
+    setDiffRows(null);
+    setSelectedKeys(new Set());
   }
 
   async function handleFile(file: File | undefined) {
@@ -405,21 +535,32 @@ function RosterUploadTab() {
       setRows(parsed);
       setMapping(guessMapping(Object.keys(parsed[0] ?? {})));
       setValidated(null);
+      clearDiff();
+      setApplyResult(null);
     } catch (err) {
       toast.error(errorMessage(err));
     }
   }
 
-  function runValidation() {
-    const index = indexExisting(existing ?? []);
-    const result = reclassify(
-      validateRoster(mapped, companies ?? [], existing ?? [], domainInfo?.domains ?? []),
-      index,
-    );
-    setValidated(result);
-    const bad = result.filter((r) => r.errors.length > 0).length;
-    if (bad === 0) toast.success(`검증 통과 — ${result.length}건 모두 반영 가능합니다.`);
-    else toast.error(`${bad}건에 오류가 있습니다. 아래 목록의 조치대로 고친 뒤 다시 올리세요.`);
+  function toggleKey(key: string) {
+    setSelectedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  function toggleKind(kind: RosterDiffKind, on: boolean) {
+    const keys = (diff?.items ?? []).filter((i) => i.kind === kind).map((i) => i.key);
+    setSelectedKeys((prev) => {
+      const next = new Set(prev);
+      for (const k of keys) {
+        if (on) next.add(k);
+        else next.delete(k);
+      }
+      return next;
+    });
   }
 
   return (
@@ -455,8 +596,11 @@ function RosterUploadTab() {
       </div>
 
       <p className="rounded-xl border bg-secondary/40 p-3 text-xs text-muted-foreground">
-        이미 등록된 사번은 같은 계열사 기준으로 <strong>갱신</strong>됩니다. 이름·이메일·생년월일·소속·
-        직급·역할단계만 덮어쓰고, 계정·상태·초기 비밀번호는 그대로 둡니다.
+        올린 명부를 기존 명단과 <strong>대조</strong>한 뒤, 반영할 항목을 골라서 처리합니다.
+        대조만으로는 아무것도 바뀌지 않습니다. 같은 사람으로 보는 기준은{" "}
+        <strong>계열사 + 사번</strong>이고, 사번이 달라진 경우에는 이메일로 한 번 더 찾습니다. 반영
+        직전에 시점 저장본을 만들며, 명부에서 빠진 사람은 보관 처리만 하고 이미 작성한 응답은 지우지
+        않습니다.
       </p>
 
       {rows.length === 0 ? (
@@ -485,14 +629,15 @@ function RosterUploadTab() {
                   </Label>
                   <Select
                     value={mapping[column] ?? "__none__"}
-                    onValueChange={(value) =>
+                    onValueChange={(value) => {
+                      clearDiff();
                       setMapping((prev) => {
                         const next = { ...prev };
                         if (value === "__none__") delete next[column];
                         else next[column] = value;
                         return next;
-                      })
-                    }
+                      });
+                    }}
                   >
                     <SelectTrigger aria-label={`${column} 열 선택`}>
                       <SelectValue />
@@ -511,7 +656,7 @@ function RosterUploadTab() {
             </div>
             {missing.length > 0 && (
               <p className="mt-3 text-xs text-destructive">
-                필수 항목 미지정: {missing.join(", ")} — 이 항목을 연결해야 검증할 수 있습니다.
+                필수 항목 미지정: {missing.join(", ")} — 이 항목을 연결해야 대조할 수 있습니다.
               </p>
             )}
           </div>
@@ -525,11 +670,11 @@ function RosterUploadTab() {
                   <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
                 )}
                 <span>
-                  신규 {newCount}명 / 갱신 {updateCount}명
+                  읽은 행 {validated.length}건 · 정상 {validRows.length}건
                   {errorRows.length > 0 && (
                     <span className="font-medium text-destructive">
                       {" "}
-                      · 오류 {errorRows.length}건 · 정상 {validRows.length}건
+                      · 오류 {errorRows.length}건
                     </span>
                   )}
                 </span>
@@ -577,31 +722,121 @@ function RosterUploadTab() {
                     </p>
                   )}
                   <p className="text-xs text-muted-foreground">
-                    오류 행은 반영되지 않습니다. 정상 {validRows.length}건만 먼저 반영하고, 고친
-                    파일을 다시 올려도 됩니다(같은 사번은 갱신됩니다).
+                    오류 행은 대조·반영에서 빠집니다. 정상 {validRows.length}건만 먼저 반영하고,
+                    고친 파일을 다시 올려도 됩니다(이미 반영한 사람은 「변경 없음」으로 나옵니다).
                   </p>
                 </>
               )}
             </div>
           )}
 
-          <div className="flex flex-wrap gap-2">
-            <Button disabled={missing.length > 0} onClick={runValidation}>
-              검증
+          {diff && (
+            <RosterDiffPanel
+              diff={diff}
+              selected={selectedKeys}
+              leaverAction={leaverAction}
+              onToggle={toggleKey}
+              onToggleKind={toggleKind}
+              onLeaverAction={setLeaverAction}
+            />
+          )}
+
+          {applyResult && <ApplyResultCard result={applyResult} />}
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              disabled={missing.length > 0 || compare.isPending}
+              onClick={() => compare.mutate()}
+            >
+              {compare.isPending && <Loader2 className="size-4 animate-spin" />}
+              {diff ? "다시 대조" : "기존 명단과 대조"}
             </Button>
             <Button
               variant="secondary"
-              disabled={!validated || validRows.length === 0 || reflect.isPending}
-              onClick={() => reflect.mutate()}
+              disabled={!diff || chosenCount === 0 || apply.isPending}
+              onClick={() => apply.mutate()}
             >
-              {reflect.isPending && <Loader2 className="size-4 animate-spin" />}
-              오류 제외하고 {validRows.length}건 반영
+              {apply.isPending && <Loader2 className="size-4 animate-spin" />}
+              선택한 {chosenCount}건 반영
             </Button>
-            <Button variant="ghost" disabled={reflect.isPending} onClick={reset}>
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox
+                checked={provisionNew}
+                onCheckedChange={(v) => setProvisionNew(v === true)}
+              />
+              새로 추가되는 사람에게 계정도 함께 발급
+            </label>
+            <Button variant="ghost" disabled={apply.isPending} onClick={reset}>
               전체 취소
             </Button>
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+/** 반영 결과 — 무엇이 몇 건 처리되고 무엇이 왜 안 됐는지. 실패는 사유까지 표로 보여 준다. */
+function ApplyResultCard({ result }: { result: ApplyResult }) {
+  const counts = [
+    { label: "추가", value: result.added },
+    { label: "갱신", value: result.updated },
+    { label: "보관", value: result.archived },
+    { label: "삭제", value: result.deleted },
+    { label: "소속 자동 배정", value: result.orgMatched },
+    { label: "재확인 표시", value: result.rechecked },
+    { label: "실패", value: result.failures.length },
+  ];
+  return (
+    <div className="space-y-3 rounded-xl border bg-card p-4">
+      <p className="text-sm font-medium">반영 결과</p>
+      <ul className="flex flex-wrap gap-2 text-xs">
+        {counts.map((c) => (
+          <li
+            key={c.label}
+            className={`rounded-full px-2.5 py-1 ${
+              c.label === "실패" && c.value > 0
+                ? "bg-destructive/10 font-semibold text-destructive"
+                : "bg-secondary"
+            }`}
+          >
+            {c.label} <span className="tabular-nums">{c.value}</span>건
+          </li>
+        ))}
+      </ul>
+      <p className="text-xs text-muted-foreground">
+        {result.backup.error ? (
+          <span className="text-destructive">
+            반영 전 백업을 만들지 못해 백업 없이 진행했습니다 ({result.backup.error}).
+          </span>
+        ) : (
+          <>
+            반영 전 시점 저장본을 만들었습니다{result.backup.path ? ` (${result.backup.path})` : ""}
+            .
+          </>
+        )}
+      </p>
+      {result.failures.length > 0 && (
+        <div className="max-h-64 overflow-y-auto rounded-lg border">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-secondary text-left text-muted-foreground">
+              <tr>
+                <th className="w-28 border-b px-3 py-2 font-medium">성명</th>
+                <th className="w-20 border-b px-3 py-2 font-medium">처리</th>
+                <th className="border-b px-3 py-2 font-medium">왜 안 됐는지</th>
+              </tr>
+            </thead>
+            <tbody>
+              {result.failures.slice(0, 200).map((f, i) => (
+                <tr key={`${f.name}-${f.action}-${i}`} className="border-t align-top">
+                  <td className="px-3 py-2">{f.name}</td>
+                  <td className="px-3 py-2">{f.action}</td>
+                  <td className="px-3 py-2 text-destructive">{f.reason}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );
@@ -628,11 +863,78 @@ type Participant = {
   /** 계정에 현재 적용된 비밀번호(평문). 발급·초기화·본인 변경 시 갱신된다. */
   initial_password: string | null;
   must_change_password: boolean;
+  /** 안내 메일이 되돌아온 시점·사유. 채우는 쪽은 메일 담당이고 여기서는 표시만 한다 (기획 F1). */
+  mail_bounced_at: string | null;
+  mail_bounce_reason: string | null;
+  /** 배정된 조사 차수 (기획 F8). */
+  wave_id: string | null;
   companies: { name: string } | null;
 };
 
 const PARTICIPANT_COLUMNS =
-  "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, org_unit_id, role, account_status, user_id, tags, archived_at, initial_password, must_change_password, companies(name)";
+  "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, org_unit_id, role, account_status, user_id, tags, archived_at, initial_password, must_change_password, mail_bounced_at, mail_bounce_reason, wave_id, companies(name)";
+
+/* ─────────── 조사 차수 (기획 F8) — 본체는 차수 담당이 만든다 ───────────
+ *
+ * 차수 관리 화면이 `?assignWave=<차수id>` 로 이 화면에 보내면, 그 차수로 배정하는 흐름을 연다.
+ * 모듈은 import.meta.glob 으로 찾는다 — 파일이 없으면 목록이 비어 차수 기능만 꺼지고
+ * (버튼 비활성 + 안내), 있으면 그대로 잡힌다.
+ *
+ * 차수는 survey_waves.company_id 로 계열사에 묶여 있어 목록 조회도 계열사가 필수다.
+ * 그래서 계열사 범위가 「전사」면 배정을 열지 않고 계열사를 먼저 고르라고 안내한다.
+ */
+type WaveOption = {
+  id: string;
+  seq: number;
+  name: string;
+  kind: string;
+  deadline: string | null;
+  status: string;
+  assignedCount: number;
+  submittedCount: number;
+};
+
+type WaveModule = {
+  listWaves?: (opts: {
+    data: { companyId: string };
+    headers: Record<string, string>;
+  }) => Promise<WaveOption[]>;
+  assignWave?: (opts: {
+    data: { participantIds: string[]; waveId: string };
+    headers: Record<string, string>;
+    /** 마감된 차수 소속 응답은 옮기지 않는다. 그 건수가 protectedResponses 로 돌아온다. */
+  }) => Promise<{ updated: number; protectedResponses: number }>;
+};
+
+const WAVE_MODULE_PATH = "../../../lib/wave.functions.ts";
+
+async function loadWaveModule(): Promise<WaveModule | null> {
+  const mods = import.meta.glob<WaveModule>("../../../lib/wave.functions.ts");
+  const load = mods[WAVE_MODULE_PATH];
+  if (!load) return null;
+  try {
+    return await load();
+  } catch {
+    return null;
+  }
+}
+
+/** 차수 목록. null 이면 지금 차수 배정을 쓸 수 없다는 뜻이다(빈 배열과 구분한다). */
+function useWaves(companyId: string) {
+  return useQuery({
+    queryKey: ["survey-waves", companyId],
+    queryFn: async (): Promise<WaveOption[] | null> => {
+      if (companyId === "all") return null;
+      const mod = await loadWaveModule();
+      if (!mod?.listWaves) return null;
+      try {
+        return await mod.listWaves({ data: { companyId }, headers: await authHeaders() });
+      } catch {
+        return null;
+      }
+    },
+  });
+}
 
 type OrgUnitRow = { id: string; parent_id: string | null; name: string; sort: number };
 
@@ -912,8 +1214,7 @@ function RemoveDialog({
         data: { participantId: participant.id, archived: !archived },
         headers: await authHeaders(),
       }),
-    onSuccess: () =>
-      done(archived ? "보관을 해제했습니다." : "보관했습니다. 로그인이 차단됩니다."),
+    onSuccess: () => done(archived ? "보관을 해제했습니다." : "보관했습니다. 로그인이 차단됩니다."),
     onError: (err) => toast.error(errorMessage(err)),
   });
 
@@ -987,6 +1288,7 @@ const LIST_COLUMNS = [
   { key: "job", label: "직무" },
   { key: "role_level", label: "역할단계" },
   { key: "status", label: "상태" },
+  { key: "wave", label: "차수" },
   { key: "grade", label: "직급" },
   { key: "tags", label: "태그" },
   { key: "email", label: "이메일" },
@@ -1067,6 +1369,13 @@ function RosterListTab({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [tagInput, setTagInput] = useState("");
   const [bulkOrgId, setBulkOrgId] = useState("");
+  const [bulkWaveId, setBulkWaveId] = useState("");
+  /** 마지막 차수 배정 결과. 마감 차수 때문에 유지된 응답 건수를 화면에 남겨 둔다. */
+  const [waveResult, setWaveResult] = useState<{
+    waveName: string;
+    updated: number;
+    protectedResponses: number;
+  } | null>(null);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<Participant | null>(null);
   const [removing, setRemoving] = useState<Participant | null>(null);
@@ -1117,11 +1426,23 @@ function RosterListTab({
   const orgOptions = useMemo(() => flattenOrgUnits(units), [units]);
   const unitNameById = useMemo(() => new Map(units.map((u) => [u.id, u.name])), [units]);
 
+  const { data: waves } = useWaves(companyId);
+  const waveAvailable = Array.isArray(waves);
+  const waveNameById = useMemo(
+    () => new Map((waves ?? []).map((w) => [w.id, `${w.seq}차 ${w.name}`])),
+    [waves],
+  );
+
   // 딥링크가 소속을 지정하면 렌즈를 그 소속으로 맞춘다. 이후에는 렌즈 선택이 URL 을 갱신한다.
   useEffect(() => {
     if (search.org && search.org !== selectedOrgId) setSelectedOrgId(search.org);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search.org]);
+
+  // 차수 관리 화면이 보낸 차수를 일괄 배정 칸에 미리 채운다. 사람만 고르면 바로 배정할 수 있다.
+  useEffect(() => {
+    if (search.assignWave) setBulkWaveId(search.assignWave);
+  }, [search.assignWave]);
 
   function selectOrg(id: string | null) {
     setSelectedOrgId(id);
@@ -1173,9 +1494,7 @@ function RosterListTab({
 
   const rows = useMemo(
     () =>
-      orgIdSet
-        ? baseRows.filter((p) => p.org_unit_id && orgIdSet.has(p.org_unit_id))
-        : baseRows,
+      orgIdSet ? baseRows.filter((p) => p.org_unit_id && orgIdSet.has(p.org_unit_id)) : baseRows,
     [baseRows, orgIdSet],
   );
 
@@ -1305,11 +1624,44 @@ function RosterListTab({
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  /** 차수 배정. 차수 기능이 아직 없으면 버튼이 비활성이라 여기까지 오지 않는다. */
+  const waveAssign = useMutation({
+    mutationFn: async () => {
+      const mod = await loadWaveModule();
+      if (!mod?.assignWave) throw new Error("차수 기능을 아직 쓸 수 없습니다.");
+      return mod.assignWave({
+        data: { participantIds: [...selected], waveId: bulkWaveId },
+        headers: await authHeaders(),
+      });
+    },
+    onSuccess: (res) => {
+      const waveName = waveNameById.get(bulkWaveId) ?? "선택한 차수";
+      // 마감된 차수에 매인 응답은 옮기지 않는다. 조용히 넘기면 관리자가 옮겨진 줄 안다.
+      setWaveResult({ waveName, updated: res.updated, protectedResponses: res.protectedResponses });
+      toast.success(
+        `${res.updated}명을 ${waveName}에 배정했습니다.` +
+          (res.protectedResponses > 0
+            ? ` 응답 ${res.protectedResponses}건은 마감된 차수라 유지됩니다.`
+            : ""),
+      );
+      setBulkWaveId("");
+      setSelected(new Set());
+      patch({ assignWave: undefined });
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+      void queryClient.invalidateQueries({ queryKey: ["survey-waves"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
   const selectedIds = [...selected];
   const allSelected = rows.length > 0 && rows.every((r) => selected.has(r.id));
   const hasTagInput = tagInput.trim().length > 0;
   const busy =
-    provision.isPending || bulkReset.isPending || tagMutation.isPending || orgAssign.isPending;
+    provision.isPending ||
+    bulkReset.isPending ||
+    tagMutation.isPending ||
+    orgAssign.isPending ||
+    waveAssign.isPending;
   const columnsChanged = !sameColumns(visibleColumns, DEFAULT_COLUMNS);
   const shownColumns = LIST_COLUMNS.filter((c) => visibleColumns.includes(c.key));
   const remindTarget = selectedIds.length > 0 || !!selectedOrgId;
@@ -1329,6 +1681,8 @@ function RosterListTab({
       "비밀번호",
       "태그",
       "상태",
+      "차수",
+      "메일 반송",
     ];
     const lines = rows.map((p) =>
       [
@@ -1343,6 +1697,10 @@ function RosterListTab({
         p.initial_password ?? "",
         (p.tags ?? []).join(" "),
         p.account_status,
+        p.wave_id ? (waveNameById.get(p.wave_id) ?? "배정됨") : "",
+        p.mail_bounced_at
+          ? `${p.mail_bounced_at.slice(0, 10)} ${p.mail_bounce_reason ?? ""}`.trim()
+          : "",
       ]
         .map(csvCell)
         .join(","),
@@ -1405,7 +1763,20 @@ function RosterListTab({
       case "role_level":
         return p.role_level ?? <span className="text-muted-foreground">-</span>;
       case "status":
-        return <StatusBadge status={p.account_status} withHelp />;
+        return (
+          <span className="inline-flex flex-wrap items-center gap-1.5">
+            <StatusBadge status={p.account_status} withHelp />
+            <BounceBadge participant={p} />
+          </span>
+        );
+      case "wave":
+        // 전사 범위에서는 차수 목록을 불러오지 않는다(차수는 계열사별). 이름 대신 배정 여부만 보여
+        // 준다 — 빈칸으로 두면 「차수가 없는 사람」으로 잘못 읽힌다.
+        return p.wave_id ? (
+          (waveNameById.get(p.wave_id) ?? <span className="text-muted-foreground">배정됨</span>)
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        );
       case "grade":
         return p.grade ?? <span className="text-muted-foreground">-</span>;
       case "tags":
@@ -1497,11 +1868,18 @@ function RosterListTab({
                 variant="outline"
                 size="sm"
                 disabled={rows.length === 0}
-                onClick={() => setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))}
+                onClick={() =>
+                  setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))
+                }
               >
                 {allSelected ? "전체 해제" : "전체 선택"}
               </Button>
-              <Button variant="outline" size="sm" disabled={rows.length === 0} onClick={downloadRoster}>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={rows.length === 0}
+                onClick={downloadRoster}
+              >
                 <Download className="size-4" />
                 명단 내려받기
               </Button>
@@ -1539,9 +1917,7 @@ function RosterListTab({
                 size="sm"
                 disabled={!remindTarget}
                 title={
-                  remindTarget
-                    ? undefined
-                    : "독려할 인원을 선택하거나 왼쪽에서 소속을 고르세요."
+                  remindTarget ? undefined : "독려할 인원을 선택하거나 왼쪽에서 소속을 고르세요."
                 }
                 asChild={remindTarget}
               >
@@ -1618,6 +1994,72 @@ function RosterListTab({
             </div>
           </div>
 
+          {/* 차수 관리 화면에서 「이 차수로 배정」을 눌러 들어온 경우 (기획 F8) */}
+          {search.assignWave && (
+            <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-sm">
+              <span className="rounded-full bg-primary-soft px-2.5 py-1 text-xs font-semibold">
+                차수 배정 중
+              </span>
+              <span className="min-w-0 flex-1">
+                {companyId === "all" ? (
+                  <span className="text-destructive">
+                    차수는 계열사별로 관리합니다. 위에서 계열사를 먼저 고르세요.
+                  </span>
+                ) : !waveAvailable ? (
+                  <span className="text-destructive">
+                    차수 목록을 불러오지 못했습니다. 잠시 뒤 다시 시도해 주세요.
+                  </span>
+                ) : waveNameById.has(search.assignWave) ? (
+                  <>
+                    <strong>{waveNameById.get(search.assignWave)}</strong>에 배정할 사람을 고르고,
+                    아래 [차수 배정]을 누르세요. 지금 선택 {selectedIds.length}명.
+                  </>
+                ) : (
+                  <span className="text-destructive">
+                    이 차수는 지금 보고 있는 계열사의 것이 아닙니다. 계열사 범위를 바꿔 주세요.
+                  </span>
+                )}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={rows.length === 0}
+                onClick={() => setSelected(new Set(rows.map((r) => r.id)))}
+              >
+                표시된 {rows.length}명 모두 고르기
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setBulkWaveId("");
+                  patch({ assignWave: undefined });
+                }}
+              >
+                배정 그만두기
+              </Button>
+            </div>
+          )}
+
+          {waveResult && (
+            <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-sm">
+              <span>
+                <strong>{waveResult.waveName}</strong>에 {waveResult.updated}명을 배정했습니다.
+                {waveResult.protectedResponses > 0 ? (
+                  <span className="text-warning">
+                    {" "}
+                    응답 {waveResult.protectedResponses}건은 마감된 차수라 유지됨
+                  </span>
+                ) : (
+                  " 마감된 차수 때문에 유지된 응답은 없습니다."
+                )}
+              </span>
+              <Button variant="ghost" size="sm" onClick={() => setWaveResult(null)}>
+                닫기
+              </Button>
+            </div>
+          )}
+
           {selectedIds.length > 0 && (
             <div className="flex flex-wrap items-center gap-2 border-t pt-3">
               <Button disabled={busy} onClick={() => provision.mutate(selectedIds)}>
@@ -1688,6 +2130,44 @@ function RosterListTab({
                 {orgAssign.isPending && <Loader2 className="size-4 animate-spin" />}
                 소속 배정
               </Button>
+              {/* 차수를 고를 수 없는 상황이면 그 이유를 그대로 보여 준다. */}
+              <Select
+                value={bulkWaveId || "__pick__"}
+                onValueChange={(v) => setBulkWaveId(v === "__pick__" ? "" : v)}
+                disabled={!waveAvailable}
+              >
+                <SelectTrigger
+                  className="w-[190px]"
+                  aria-label="일괄 배정할 조사 차수"
+                  title={
+                    waveAvailable
+                      ? undefined
+                      : companyId === "all"
+                        ? "차수는 계열사별로 관리합니다. 위에서 계열사를 고르세요."
+                        : "조사 차수를 불러오지 못했습니다."
+                  }
+                >
+                  <SelectValue placeholder="차수 고를 수 없음" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__pick__">— 차수 선택</SelectItem>
+                  {(waves ?? []).map((w) => (
+                    // 마감된 차수에는 새로 배정할 수 없다(서버가 거부한다). 고르지 못하게 막는다.
+                    <SelectItem key={w.id} value={w.id} disabled={w.status === "마감"}>
+                      {w.seq}차 {w.name} · {w.status} · 배정 {w.assignedCount}명
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={busy || !bulkWaveId}
+                onClick={() => waveAssign.mutate()}
+              >
+                {waveAssign.isPending && <Loader2 className="size-4 animate-spin" />}
+                차수 배정
+              </Button>
             </div>
           )}
         </div>
@@ -1745,7 +2225,10 @@ function RosterListTab({
                         </p>
                       </div>
                     </div>
-                    <StatusBadge status={p.account_status} withHelp />
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                      <StatusBadge status={p.account_status} withHelp />
+                      <BounceBadge participant={p} />
+                    </div>
                   </div>
                   <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
                     <div>
@@ -1920,8 +2403,8 @@ function RosterListTab({
                   ))}
                 </ul>
                 <p className="text-xs text-muted-foreground">
-                  미매칭 건은 참여자 수정 화면에서 소속을 직접 선택하거나, 조직도 이름과 소속
-                  표기를 맞춘 뒤 다시 실행하세요.
+                  미매칭 건은 참여자 수정 화면에서 소속을 직접 선택하거나, 조직도 이름과 소속 표기를
+                  맞춘 뒤 다시 실행하세요.
                   {orgMatchReport.unmatched > orgMatchReport.unmatchedList.length &&
                     ` (목록은 ${orgMatchReport.unmatchedList.length}건까지만 표시)`}
                 </p>
@@ -2019,7 +2502,10 @@ function ParticipantDetail({
   const rows: { label: string; value: React.ReactNode }[] = [
     { label: "사번", value: <span className="tabular-nums">{participant.emp_no}</span> },
     { label: "계열사", value: participant.companies?.name ?? "-" },
-    { label: "소속", value: participant.org_unit_id ? orgLabel : `${participant.org_text ?? "-"} (미배정)` },
+    {
+      label: "소속",
+      value: participant.org_unit_id ? orgLabel : `${participant.org_text ?? "-"} (미배정)`,
+    },
     { label: "직급", value: participant.grade ?? "-" },
     { label: "역할단계", value: participant.role_level ?? "-" },
     { label: "생년월일", value: participant.birth_date ?? "-" },
@@ -2028,6 +2514,17 @@ function ParticipantDetail({
     { label: "이메일", value: <span className="break-all">{participant.email ?? "-"}</span> },
     { label: "비밀번호", value: <PasswordCell participant={participant} /> },
   ];
+  if (participant.mail_bounced_at) {
+    rows.push({
+      label: "메일 반송",
+      value: (
+        <span className="text-destructive">
+          {participant.mail_bounced_at.slice(0, 10)} ·{" "}
+          {participant.mail_bounce_reason ?? "사유가 기록되지 않았습니다"}
+        </span>
+      ),
+    });
+  }
 
   return (
     <>
@@ -2064,7 +2561,11 @@ function ParticipantDetail({
           disabled={!participant.user_id || resetting}
           onClick={onReset}
         >
-          {resetting ? <Loader2 className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+          {resetting ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <KeyRound className="size-4" />
+          )}
           비밀번호 초기화
         </Button>
         {response && response.status !== "draft" && (
@@ -2154,6 +2655,23 @@ function PasswordCell({ participant }: { participant: Participant }) {
           최초 변경 전
         </span>
       )}
+    </span>
+  );
+}
+
+/**
+ * 안내 메일이 되돌아온 사람 표시 (기획 F1).
+ * 값을 채우는 쪽은 메일 담당이고 여기서는 표시만 한다 — 사유는 길어서 호버로 보여 준다.
+ */
+function BounceBadge({ participant }: { participant: Participant }) {
+  if (!participant.mail_bounced_at) return null;
+  const when = participant.mail_bounced_at.slice(0, 10);
+  return (
+    <span
+      className="rounded-full bg-destructive/10 px-2 py-0.5 text-[11px] font-semibold text-destructive"
+      title={`${when} 메일이 되돌아왔습니다. 사유: ${participant.mail_bounce_reason ?? "기록되지 않음"}`}
+    >
+      메일 반송
     </span>
   );
 }

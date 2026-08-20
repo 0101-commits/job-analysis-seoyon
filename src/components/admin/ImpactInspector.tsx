@@ -73,12 +73,15 @@ export async function scheduleImpactNotice(
 ) {
   if (!audience || audience.ids.length === 0) return;
   try {
-    const { notified } = await notifyImpacted({
+    const { notified, rechecked } = await notifyImpacted({
       data: { participantIds: audience.ids, field: target.field, note: target.note },
       headers: await authHeaders(),
     });
     toast.success(
-      `영향 인원 ${notified}명에게 변경 안내를 예약했습니다 — 다음 접속 때 배너로 보입니다.`,
+      `영향 인원 ${notified}명에게 변경 안내를 예약했습니다 — 다음 접속 때 배너로 보입니다.` +
+        (rechecked > 0
+          ? ` 이미 작성한 응답 ${rechecked}건은 재확인 대상으로 올렸습니다 (현황 탭에서 잔량 확인).`
+          : ""),
     );
   } catch (err) {
     toast.error(

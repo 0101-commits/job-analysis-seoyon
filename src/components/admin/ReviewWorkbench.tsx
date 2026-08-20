@@ -15,7 +15,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -37,6 +36,7 @@ import { SignalCard } from "@/components/SignalCard";
 import { CollapsibleSection } from "@/components/SectionNav";
 import { FieldHint } from "@/components/FieldHint";
 import { AiInspector } from "@/components/admin/AiInspector";
+import { QualityBadge } from "@/components/admin/QualityBadge";
 import { cn } from "@/lib/utils";
 import {
   approveResponse,
@@ -46,6 +46,7 @@ import {
   getSubmissionSnapshots,
   listReviewQueue,
   rejectResponse,
+  upsertInterview,
 } from "@/lib/review.functions";
 
 /**
@@ -328,6 +329,8 @@ export function ReviewWorkbench({
   onCompareJobChange,
   jobNames,
   companyId,
+  sort,
+  onSortChange,
 }: {
   rows: QueueRow[];
   isLoading: boolean;
@@ -343,6 +346,8 @@ export function ReviewWorkbench({
   onCompareJobChange: (v: string | null) => void;
   jobNames: string[];
   companyId: string | null;
+  sort: string;
+  onSortChange: (v: string) => void;
 }) {
   const index = selectedId ? rows.findIndex((r) => r.id === selectedId) : -1;
   const prevId = index > 0 ? (rows[index - 1]?.id ?? null) : null;
@@ -380,6 +385,8 @@ export function ReviewWorkbench({
         onStatusChange={onStatusChange}
         query={query}
         onQueryChange={onQueryChange}
+        sort={sort}
+        onSortChange={onSortChange}
         className={cn(selectedId && "hidden lg:block")}
       />
 
@@ -445,6 +452,8 @@ function QueuePanel({
   onStatusChange,
   query,
   onQueryChange,
+  sort,
+  onSortChange,
   className,
 }: {
   rows: QueueRow[];
@@ -455,6 +464,8 @@ function QueuePanel({
   onStatusChange: (v: string) => void;
   query: string;
   onQueryChange: (v: string) => void;
+  sort: string;
+  onSortChange: (v: string) => void;
   className?: string;
 }) {
   // 검토 적체 — 지금 목록 안 미검토 건의 평균 대기일 (V15-4)
@@ -479,6 +490,15 @@ function QueuePanel({
             <SelectItem value="rejected">반려</SelectItem>
             <SelectItem value="approved">승인</SelectItem>
             <SelectItem value="all">전체</SelectItem>
+          </SelectContent>
+        </Select>
+        <Select value={sort} onValueChange={onSortChange}>
+          <SelectTrigger aria-label="목록 정렬">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="risk">주의 필요한 순</SelectItem>
+            <SelectItem value="submitted">제출 순 (최근 먼저)</SelectItem>
           </SelectContent>
         </Select>
         <div className="relative">
@@ -539,6 +559,7 @@ function QueuePanel({
                     {r.job_name ?? "직무 미입력"}
                   </p>
                   <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    <QualityBadge score={r.quality_score} />
                     <JobCountBadge count={r.jobCount} />
                     {late !== null && (
                       <span
@@ -553,6 +574,12 @@ function QueuePanel({
                       </span>
                     )}
                   </div>
+                  {r.flags.length > 0 && (
+                    <p className="mt-1.5 line-clamp-2 text-[11px] text-muted-foreground">
+                      {r.flags[0]}
+                      {r.flags.length > 1 ? ` (외 ${r.flags.length - 1}건)` : ""}
+                    </p>
+                  )}
                 </button>
               </li>
             );
@@ -593,7 +620,10 @@ function ResponseWorkspace({
   const queryClient = useQueryClient();
   const [picked, setPicked] = useState<PickedField | null>(null);
   const [approveOpen, setApproveOpen] = useState(false);
-  const [interviewChecked, setInterviewChecked] = useState(false);
+  // 1인 응답 직무 승인 창에서 그 자리에 남기는 인터뷰 기록
+  const [ivWhen, setIvWhen] = useState("");
+  const [ivWho, setIvWho] = useState("");
+  const [ivMemo, setIvMemo] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectStep, setRejectStep] = useState("4");
   const [rejectComment, setRejectComment] = useState("");
@@ -621,6 +651,7 @@ function ResponseWorkspace({
   function invalidate() {
     void queryClient.invalidateQueries({ queryKey: ["review-detail", responseId] });
     void queryClient.invalidateQueries({ queryKey: ["review-queue"] });
+    void queryClient.invalidateQueries({ queryKey: ["interview-targets"] });
   }
 
   /** 판단이 끝나면 다음 건으로 넘긴다 — 목록으로 돌아가 다시 고르는 일을 없앤다. */
@@ -630,16 +661,33 @@ function ResponseWorkspace({
   }
 
   const approve = useMutation({
-    mutationFn: (interviewConfirmed: boolean) =>
-      approveResponse({ data: { responseId, interviewConfirmed } }),
+    /** recordInterview 가 있으면 인터뷰 「완료」 기록을 먼저 남긴 뒤 승인한다(1인 응답 직무 게이트). */
+    mutationFn: async (recordInterview?: { when: string; who: string; memo: string }) => {
+      if (recordInterview) {
+        await upsertInterview({
+          data: {
+            responseId,
+            scheduledAt: recordInterview.when || null,
+            interviewer: recordInterview.who.trim() || null,
+            status: "완료",
+            memo: recordInterview.memo.trim() || null,
+          },
+        });
+      }
+      return approveResponse({ data: { responseId } });
+    },
     onSuccess: (result) => {
       if (!result.ok) {
         toast.error(result.reason ?? "승인할 수 없습니다.");
         if (result.needsInterview) setApproveOpen(true);
+        else setApproveOpen(false);
+        invalidate();
         return;
       }
       setApproveOpen(false);
-      setInterviewChecked(false);
+      setIvWhen("");
+      setIvWho("");
+      setIvMemo("");
       toast.success(nextId ? "승인했습니다. 다음 건을 엽니다." : "응답이 승인되었습니다.");
       invalidate();
       goNext();
@@ -691,6 +739,8 @@ function ResponseWorkspace({
     locked ? undefined : () => setPicked({ multiline: false, ...f });
 
   const skillNames = r.response_skills.map((s) => s.name);
+  const interviews = data.interviews;
+  const interviewDone = interviews.some((iv) => iv.status === "완료");
 
   return (
     <>
@@ -1237,6 +1287,32 @@ function ResponseWorkspace({
                 </div>
               </dl>
             </Section>
+
+            {interviews.length > 0 && (
+              <Section title="인터뷰 기록">
+                <ul className="space-y-2">
+                  {interviews.map((iv) => (
+                    <li key={iv.id} className="rounded-lg border p-3">
+                      <p className="text-xs text-muted-foreground">
+                        {iv.status} ·{" "}
+                        {iv.scheduled_at
+                          ? new Date(iv.scheduled_at).toLocaleString("ko-KR")
+                          : "일정 미정"}{" "}
+                        · {iv.interviewer || "담당 미지정"}
+                      </p>
+                      {iv.memo ? (
+                        <p className="mt-1 whitespace-pre-wrap">{iv.memo}</p>
+                      ) : (
+                        <p className="mt-1 text-muted-foreground">남긴 내용이 없습니다.</p>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-xs text-muted-foreground">
+                  인터뷰에서 확인한 내용은 그대로 보관되어 직무기술서 작성에서 근거로 함께 읽힙니다.
+                </p>
+              </Section>
+            )}
           </>
         )}
       </div>
@@ -1247,10 +1323,45 @@ function ResponseWorkspace({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm font-bold">판단</p>
             <div className="flex items-center gap-1.5">
+              <QualityBadge score={data.quality.score} />
               <JobCountBadge count={data.jobCount} />
               <StatusBadge status={STATUS_LABELS[r.status] ?? r.status} />
             </div>
           </div>
+
+          {data.quality.flags.length > 0 && (
+            <SignalCard
+              tone={data.quality.grade === "양호" ? "neutral" : "attention"}
+              signal={`점검에서 확인된 주의 사유가 ${data.quality.flags.length}건 있습니다 (${data.quality.grade} ${data.quality.score}점).`}
+              evidence={data.quality.flags}
+              {...(data.quality.checkedAt
+                ? { asOf: new Date(data.quality.checkedAt).toLocaleDateString("ko-KR") }
+                : {})}
+            />
+          )}
+
+          {data.jobCount <= 1 && (
+            <SignalCard
+              tone={interviewDone ? "good" : "attention"}
+              signal={
+                interviewDone
+                  ? "1인 응답 직무이며 인터뷰 확인이 끝났습니다."
+                  : "1인 응답 직무여서 인터뷰 확인 없이는 승인할 수 없습니다."
+              }
+              evidence={
+                interviewDone
+                  ? [
+                      `인터뷰 기록 ${interviews.length}건 중 「완료」 기록이 있어 승인 조건을 만족합니다.`,
+                      "인터뷰에서 확인한 내용은 아래 원문의 인터뷰 기록에서 볼 수 있습니다.",
+                    ]
+                  : [
+                      `같은 직무 응답이 ${data.jobCount}건뿐이라 응답만으로는 직무를 확정할 수 없습니다.`,
+                      "승인을 누르면 인터뷰 기록을 남기는 창이 열립니다. 인터뷰 관리 구획에서 미리 남겨 두어도 됩니다.",
+                    ]
+              }
+              asOf={new Date().toLocaleDateString("ko-KR")}
+            />
+          )}
 
           {r.status === "draft" && (
             <p className="rounded-lg bg-secondary p-3 text-xs text-muted-foreground">
@@ -1288,11 +1399,12 @@ function ResponseWorkspace({
               className="flex-1"
               disabled={approve.isPending || r.status === "approved" || r.status === "draft"}
               onClick={() => {
-                if (data.jobCount <= 1) {
+                // 1인 응답 직무는 인터뷰 「완료」 기록이 있어야 승인된다.
+                if (data.jobCount <= 1 && !interviewDone) {
                   setApproveOpen(true);
                   return;
                 }
-                approve.mutate(false);
+                approve.mutate(undefined);
               }}
             >
               승인
@@ -1368,25 +1480,51 @@ function ResponseWorkspace({
             <DialogTitle>인터뷰 확인 후 승인</DialogTitle>
             <DialogDescription>
               「{r.job_name ?? "직무 미입력"}」은 응답이 {data.jobCount}건뿐입니다. 후속 인터뷰로
-              내용을 확인한 경우에만 승인할 수 있습니다.
+              내용을 확인하고 그 기록을 남긴 경우에만 승인할 수 있습니다. 아래에 인터뷰 내용을
+              적으면 「완료」 기록으로 남기고 바로 승인합니다.
             </DialogDescription>
           </DialogHeader>
-          <label className="flex items-start gap-3 rounded-lg border p-3 text-sm">
-            <Checkbox
-              checked={interviewChecked}
-              onCheckedChange={(v) => setInterviewChecked(v === true)}
-            />
-            <span>후속 인터뷰를 통해 응답 내용을 확인했습니다.</span>
-          </label>
+          <div className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="iv-when">인터뷰 일시 (선택)</Label>
+                <Input
+                  id="iv-when"
+                  type="datetime-local"
+                  value={ivWhen}
+                  onChange={(e) => setIvWhen(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="iv-who">담당 (선택)</Label>
+                <Input
+                  id="iv-who"
+                  value={ivWho}
+                  onChange={(e) => setIvWho(e.target.value)}
+                  placeholder="인터뷰를 진행한 사람"
+                />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="iv-memo">인터뷰에서 확인한 내용 (필수)</Label>
+              <Textarea
+                id="iv-memo"
+                rows={5}
+                value={ivMemo}
+                onChange={(e) => setIvMemo(e.target.value)}
+                placeholder="응답에서 확인·보완한 내용을 적어 주세요. 이 기록이 승인 근거로 남고 직무기술서 작성에서 함께 읽힙니다."
+              />
+            </div>
+          </div>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setApproveOpen(false)}>
               취소
             </Button>
             <Button
-              disabled={!interviewChecked || approve.isPending}
-              onClick={() => approve.mutate(true)}
+              disabled={!ivMemo.trim() || approve.isPending}
+              onClick={() => approve.mutate({ when: ivWhen, who: ivWho, memo: ivMemo })}
             >
-              승인
+              인터뷰 기록 후 승인
             </Button>
           </DialogFooter>
         </DialogContent>

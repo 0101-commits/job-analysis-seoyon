@@ -6,6 +6,18 @@ import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { similarity } from "@/components/survey/validation";
+import {
+  DUTY_SIMILAR_THRESHOLD,
+  classifyDutyTasks,
+  extractDutyTasks,
+  normalizeTaskName,
+  taskOverlap,
+  type DutyPair,
+  type TaskRef,
+} from "./task-match.ts";
+
+export { DUTY_SIMILAR_THRESHOLD };
+export type { DutyPair } from "./task-match.ts";
 
 /**
  * participants.org_unit_id 는 마이그레이션(20260818090000_v2_deploy.sql)에만 있고
@@ -1032,7 +1044,7 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
     const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { callLLMJson } = await import("@/lib/llm.server");
+    const { callLLMJson, AI_FEATURES } = await import("@/lib/llm.server");
 
     // 프롬프트에는 조직명·직급 같은 집계값만 넣는다. 이름·사번·이메일은 조회조차 하지 않는다.
     const [{ data: units }, { data: people }, { data: responses }] = await Promise.all([
@@ -1085,6 +1097,9 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
           "각 직군의 직렬은 3~6개다.\n" +
           'JSON 형식: [{"job_group":"직군명","job_series":["직렬1","직렬2"]}]',
         maxTokens: 1200,
+        feature: AI_FEATURES.JOB_CATALOG_DRAFT,
+        target: "직군 골격",
+        actorId: context.userId,
       });
     } catch (err) {
       throw friendlyAiError(err);
@@ -1133,6 +1148,9 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
             system,
             user: detailUser(group.job_group, group.job_series),
             maxTokens: 2048,
+            feature: AI_FEATURES.JOB_CATALOG_DRAFT,
+            target: group.job_group,
+            actorId: context.userId,
           });
           items = Array.isArray(parsed) ? parsed : [];
         } catch (err) {
@@ -1144,6 +1162,9 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
                 system,
                 user: detailUser(group.job_group, [series]),
                 maxTokens: 2048,
+                feature: AI_FEATURES.JOB_CATALOG_DRAFT,
+                target: `${group.job_group} > ${series}`,
+                actorId: context.userId,
               }),
             ),
           );
@@ -1343,7 +1364,7 @@ export const draftDutyCharts = createServerFn({ method: "POST" })
     const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { callLLMJson } = await import("@/lib/llm.server");
+    const { callLLMJson, AI_FEATURES } = await import("@/lib/llm.server");
     const loose = untyped(supabaseAdmin);
 
     // 프롬프트에는 조직명·직급·과업명 집계만 넣는다. 이름·사번·이메일은 조회조차 하지 않는다.
@@ -1436,6 +1457,9 @@ export const draftDutyCharts = createServerFn({ method: "POST" })
             "주요 업무 3~6개, 각 주요 업무마다 세부 업무 2~4개. " +
             "제출된 과업이 있으면 우선 반영하고, 부족한 부분만 일반적인 제조사 실무로 보완한다.\n" +
             'JSON 형식: [{"main":"주요 업무","details":["세부 업무1","세부 업무2"]}]',
+          feature: AI_FEATURES.DUTY_CHART_DRAFT,
+          target: org.name,
+          actorId: context.userId,
           maxTokens: 1500,
         });
         const rows: DutyDraftRow[] = [];
@@ -1973,12 +1997,15 @@ export const inspectImpact = createServerFn({ method: "POST" })
 const NOTICE_FIELDS = ["org_text", "job_name", "role_level"] as const;
 
 /**
- * 마스터 변경 고지 예약 (B5).
+ * 마스터 변경 고지 예약 (B5) + 재확인 일감 발행 (F10).
  *
  * 새 테이블을 만들지 않는다. 참여자 배너(InfoChangeBanner)는 audit_logs 의 「참여자 수정」 기록을
  * getMyInfoChanges 로 읽어 대상자가 다음 접속 때 한 번 보게 되어 있으므로, 영향 인원마다 그 기록을
  * 남기면 그것이 곧 예약된 고지다. detail.source 로 마스터 변경에서 온 것임을 남겨 감사 기록에서
  * 개별 참여자 수정과 구분한다.
+ *
+ * 배너만으로는 「누가 확인했는지」가 남지 않아 관리자가 잔량을 볼 수 없다. 그래서 같은 호출에서
+ * 그 사람들의 응답에 재확인 표시(responses.recheck_*)까지 세운다 — 이것이 미확인 잔량 보드의 모수다.
  */
 export const notifyImpacted = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -1992,33 +2019,44 @@ export const notifyImpacted = createServerFn({ method: "POST" })
       })
       .parse(input),
   )
-  .handler(async ({ data, context }): Promise<{ notified: number }> => {
+  .handler(async ({ data, context }): Promise<{ notified: number; rechecked: number }> => {
     const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const loose = untyped(supabaseAdmin);
 
     const ids = [...new Set(data.participantIds)];
-    const { error } = await untyped(supabaseAdmin)
-      .from("audit_logs")
-      .insert(
-        ids.map((id) => ({
-          actor_id: context.userId,
-          action: "참여자 수정",
-          target_type: "participants",
-          target_id: id,
-          detail: { changed: { [data.field]: data.note }, source: "마스터 변경 고지" },
-        })),
-      );
+    const { error } = await loose.from("audit_logs").insert(
+      ids.map((id) => ({
+        actor_id: context.userId,
+        action: "참여자 수정",
+        target_type: "participants",
+        target_id: id,
+        detail: { changed: { [data.field]: data.note }, source: "마스터 변경 고지" },
+      })),
+    );
     if (error) throw new Error(error.message);
+
+    // 이 사람들이 이미 시작한 응답에 재확인 표시를 세운다(F10). 시작하지 않은 사람은 응답 행이
+    // 없으므로 표시할 것도 없고, 첫 작성 때 바뀐 정보를 그대로 보게 된다.
+    const targetResponses: string[] = [];
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data: found } = await loose
+        .from("responses")
+        .select("id")
+        .in("participant_id", ids.slice(i, i + 200));
+      targetResponses.push(...((found ?? []) as { id: string }[]).map((r) => r.id));
+    }
+    const rechecked = await raiseRecheck(loose, targetResponses, data.note);
 
     await writeAudit(supabaseAdmin, {
       actor_id: context.userId,
       action: "마스터 변경 고지",
       target_type: "participants",
-      detail: { count: ids.length, field: data.field, note: data.note },
+      detail: { count: ids.length, field: data.field, note: data.note, rechecked },
     });
 
-    return { notified: ids.length };
+    return { notified: ids.length, rechecked };
   });
 
 /* ───────────────────────────── 현황 ───────────────────────────── */
@@ -2065,5 +2103,499 @@ export const getMasterStatus = createServerFn({ method: "GET" })
       dutyCharts: dutyCharts.count ?? 0,
       responses: responses.count ?? 0,
       lastUploads,
+    };
+  });
+
+/* ═══════════════ F10. 변경 재확인 일감 ═══════════════ */
+
+/**
+ * 재확인 표시를 세운다.
+ *
+ * 배너 고지(notifyImpacted)는 「보여 주기」까지만 한다 — 누가 실제로 확인했는지는 남지 않아
+ * 관리자가 잔량을 볼 수 없었다. responses.recheck_* 를 상태로 세워 두면 참여자가 확인할 때
+ * recheck_cleared_at 이 찍히고, 그 차이가 곧 미확인 잔량이다.
+ *
+ * 응답자는 이 표시를 내리기만 할 수 있다(guard_response_update) — 세우는 곳은 서버뿐이다.
+ */
+async function raiseRecheck(
+  admin: SupabaseClient,
+  responseIds: string[],
+  reason: string,
+): Promise<number> {
+  const ids = [...new Set(responseIds)].filter(Boolean);
+  if (ids.length === 0) return 0;
+  const now = new Date().toISOString();
+  let flagged = 0;
+  // 주소 길이 때문에 in() 은 잘라서 돈다.
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    const { data, error } = await admin
+      .from("responses")
+      .update({
+        recheck_required: true,
+        recheck_reason: reason,
+        recheck_notified_at: now,
+        // 지난번 확인은 이번 변경에 대한 확인이 아니다 — 다시 미확인으로 돌린다.
+        recheck_cleared_at: null,
+      })
+      .in("id", chunk)
+      .select("id");
+    if (error) throw new Error(error.message);
+    flagged += (data ?? []).length;
+  }
+  return flagged;
+}
+
+/** 지정한 응답에 재확인 표시를 세운다 (업무분장 대조의 「확인 요청」 등이 쓴다). */
+export const flagRecheck = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        responseIds: z.array(z.string().uuid()).min(1).max(2000),
+        reason: z.string().trim().min(1).max(300),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }): Promise<{ flagged: number }> => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const flagged = await raiseRecheck(untyped(supabaseAdmin), data.responseIds, data.reason);
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "재확인 요청",
+      target_type: "responses",
+      detail: { flagged, reason: data.reason },
+    });
+    return { flagged };
+  });
+
+export type RecheckPendingItem = {
+  responseId: string;
+  participantName: string;
+  orgName: string;
+  jobName: string;
+  reason: string;
+  notifiedAt: string | null;
+  /** 통지 후 지난 날수. 통지 시각이 없으면 null. */
+  elapsedDays: number | null;
+};
+
+export type RecheckGroup = { key: string; label: string; pending: number; cleared: number };
+
+export type RecheckBoard = {
+  pending: RecheckPendingItem[];
+  pendingTotal: number;
+  clearedTotal: number;
+  byOrg: RecheckGroup[];
+  byJob: RecheckGroup[];
+  /** 목록에 담긴 사람들의 참여자 id — 독려 안내 화면으로 넘길 때 쓴다. */
+  participantIds: string[];
+  asOf: string;
+  /** 목록 상한에 걸려 일부만 담았는지. */
+  truncated: boolean;
+};
+
+/** 잔량 목록에 담는 최대 건수. 조직·직무별 집계는 전건으로 낸다. */
+const RECHECK_LIST_LIMIT = 300;
+
+type RecheckRow = {
+  id: string;
+  job_name: string | null;
+  recheck_required: boolean;
+  recheck_reason: string | null;
+  recheck_notified_at: string | null;
+  recheck_cleared_at: string | null;
+  participants: {
+    id: string;
+    name: string | null;
+    emp_no: string | null;
+    org_text: string | null;
+    org_unit_id: string | null;
+  } | null;
+};
+
+function elapsedDays(iso: string | null): number | null {
+  if (!iso) return null;
+  const ms = Date.now() - new Date(iso).getTime();
+  return ms < 0 ? 0 : Math.floor(ms / 86_400_000);
+}
+
+/** 집계 한 칸을 만든다 — 없으면 만들고 있으면 더한다. */
+function bumpGroup(map: Map<string, RecheckGroup>, key: string, label: string, isPending: boolean) {
+  const hit = map.get(key) ?? { key, label, pending: 0, cleared: 0 };
+  if (isPending) hit.pending += 1;
+  else hit.cleared += 1;
+  map.set(key, hit);
+}
+
+/**
+ * 미확인 잔량 보드 (F10).
+ *
+ * 재확인이 걸린 응답과 이미 확인된 응답을 한 번에 읽어 조직·직무별로 나눈다.
+ * 전건을 화면으로 내리지 않도록 집계는 여기서 끝내고 목록만 상한까지 담아 보낸다.
+ */
+export const listRecheckPending = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        companyId: z.string().uuid().nullable().optional(),
+        /** 지정하면 그 조직과 하위 조직만 본다. */
+        orgUnitId: z.string().uuid().nullable().optional(),
+      })
+      .parse(input ?? {}),
+  )
+  .handler(async ({ data, context }): Promise<RecheckBoard> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { fetchAll } = await import("@/lib/paginate");
+    const loose = untyped(supabaseAdmin);
+
+    const tree = data.orgUnitId ? await orgSubtree(loose, data.orgUnitId) : null;
+    const scopeIds = tree ? new Set(tree.ids) : null;
+
+    const rows = await fetchAll<RecheckRow>((from, to) => {
+      let q = loose
+        .from("responses")
+        .select(
+          "id, job_name, recheck_required, recheck_reason, recheck_notified_at, recheck_cleared_at, participants(id, name, emp_no, org_text, org_unit_id)",
+        )
+        // 재확인이 걸린 것과 한 번이라도 확인된 것 — 둘을 함께 읽어 잔량과 완료를 한 번에 센다.
+        .or("recheck_required.eq.true,recheck_cleared_at.not.is.null")
+        .order("recheck_notified_at", { ascending: true })
+        .range(from, to);
+      if (data.companyId) q = q.eq("company_id", data.companyId);
+      // 스키마 제네릭을 벗긴 클라이언트라 임베드 형태를 추론하지 못한다 — 위 RecheckRow 가 실제 모양이다.
+      return q as unknown as PromiseLike<{
+        data: RecheckRow[] | null;
+        error: { message: string } | null;
+      }>;
+    });
+
+    let unitQuery = loose.from("org_units").select("id, name");
+    if (data.companyId) unitQuery = unitQuery.eq("company_id", data.companyId);
+    const { data: unitRows } = await unitQuery;
+    const units = new Map(
+      ((unitRows ?? []) as { id: string; name: string }[]).map((u) => [u.id, u.name]),
+    );
+
+    const byOrg = new Map<string, RecheckGroup>();
+    const byJob = new Map<string, RecheckGroup>();
+    const pending: RecheckPendingItem[] = [];
+    const participantIds = new Set<string>();
+    let pendingTotal = 0;
+    let clearedTotal = 0;
+
+    for (const row of rows) {
+      const person = row.participants;
+      if (scopeIds && !(person?.org_unit_id && scopeIds.has(person.org_unit_id))) continue;
+      const isPending = row.recheck_required === true;
+      const orgName =
+        (person?.org_unit_id ? units.get(person.org_unit_id) : null) ??
+        (person?.org_text ?? "").trim();
+      const jobName = (row.job_name ?? "").trim();
+
+      bumpGroup(byOrg, person?.org_unit_id ?? "none", orgName || "소속 미지정", isPending);
+      bumpGroup(byJob, jobName || "none", jobName || "직무 미지정", isPending);
+
+      if (!isPending) {
+        clearedTotal += 1;
+        continue;
+      }
+      pendingTotal += 1;
+      if (person?.id) participantIds.add(person.id);
+      if (pending.length < RECHECK_LIST_LIMIT) {
+        pending.push({
+          responseId: row.id,
+          participantName: personLabel(person),
+          orgName: orgName || "-",
+          jobName: jobName || "-",
+          reason: (row.recheck_reason ?? "").trim() || "바뀐 내용이 기록되지 않았습니다.",
+          notifiedAt: row.recheck_notified_at,
+          elapsedDays: elapsedDays(row.recheck_notified_at),
+        });
+      }
+    }
+
+    const sortGroups = (map: Map<string, RecheckGroup>) =>
+      [...map.values()]
+        .filter((g) => g.pending > 0 || g.cleared > 0)
+        .sort((a, b) => b.pending - a.pending || b.cleared - a.cleared);
+
+    return {
+      pending,
+      pendingTotal,
+      clearedTotal,
+      byOrg: sortGroups(byOrg),
+      byJob: sortGroups(byJob),
+      participantIds: [...participantIds],
+      asOf: new Date().toISOString(),
+      truncated: pendingTotal > pending.length,
+    };
+  });
+
+/* ═══════════════ F11. 업무분장 대조 ═══════════════ */
+
+/** 대조에 넣는 응답 상태 — 아직 작성 중인 응답을 넣으면 누락이 부풀려진다. */
+const DUTY_COUNTED_STATUSES = ["submitted", "approved"];
+
+export type DutyCoverage = {
+  orgName: string;
+  hasChart: boolean;
+  chartUploadedAt: string | null;
+  dutyTaskCount: number;
+  responseCount: number;
+  responseTaskCount: number;
+  /** 분장 과업 중 응답에 나타난 비율(정확 + 유사). 분장이 없으면 0. */
+  reflectedPct: number;
+  matched: DutyPair[];
+  /** 표현이 비슷하지만 같다고 단정하지 않은 것 — 사람이 확인해야 한다. */
+  similar: DutyPair[];
+  /** 분장에는 있는데 어떤 응답에도 없는 과업. */
+  missing: string[];
+  /** 응답에만 있고 분장에 없는 과업. */
+  extra: TaskRef[];
+  /** 「확인 요청」 을 걸 대상 응답 id. */
+  responseIds: string[];
+  asOf: string;
+};
+
+export const compareDutyCoverage = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ companyId: z.string().uuid(), orgUnitId: z.string().uuid() }).parse(input),
+  )
+  .handler(async ({ data, context }): Promise<DutyCoverage> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const loose = untyped(supabaseAdmin);
+
+    const empty: DutyCoverage = {
+      orgName: "",
+      hasChart: false,
+      chartUploadedAt: null,
+      dutyTaskCount: 0,
+      responseCount: 0,
+      responseTaskCount: 0,
+      reflectedPct: 0,
+      matched: [],
+      similar: [],
+      missing: [],
+      extra: [],
+      responseIds: [],
+      asOf: new Date().toISOString(),
+    };
+
+    const tree = await orgSubtree(loose, data.orgUnitId);
+    if (!tree) return empty;
+
+    // 업무분장표는 조직 id 가 아니라 조직명으로 저장돼 있다(duty_charts.org_name).
+    const { data: chart } = await supabaseAdmin
+      .from("duty_charts")
+      .select("rows, uploaded_at")
+      .eq("company_id", data.companyId)
+      .eq("org_name", tree.unit.name)
+      .order("uploaded_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const chartRows = (Array.isArray(chart?.rows) ? chart.rows : []) as Record<string, string>[];
+    const dutyTasks = extractDutyTasks(chartRows);
+
+    // 하위 조직 인원도 이 분장에 속한다고 본다 — 본부 분장을 팀 응답과 맞추기 위함이다.
+    type Row = {
+      id: string;
+      participants: {
+        name: string | null;
+        emp_no: string | null;
+        org_unit_id: string | null;
+      } | null;
+      response_tasks: { name: string }[];
+    };
+    const { data: raw } = await loose
+      .from("responses")
+      .select("id, participants(name, emp_no, org_unit_id), response_tasks(name)")
+      .eq("company_id", data.companyId)
+      .in("status", DUTY_COUNTED_STATUSES)
+      .limit(AUDIENCE_LIMIT);
+    const scope = new Set(tree.ids);
+    const rows = ((raw ?? []) as unknown as Row[]).filter(
+      (r) => r.participants?.org_unit_id && scope.has(r.participants.org_unit_id),
+    );
+
+    // 응답 과업을 정규화 키로 접는다. 같은 과업을 여러 명이 썼으면 첫 작성자를 대표로 보여 준다.
+    const respByNorm = new Map<string, TaskRef>();
+    let responseTaskCount = 0;
+    for (const row of rows) {
+      const who = personLabel(row.participants);
+      for (const task of row.response_tasks) {
+        const name = (task.name ?? "").trim();
+        if (name === "") continue;
+        responseTaskCount += 1;
+        const norm = normalizeTaskName(name);
+        if (norm === "" || respByNorm.has(norm)) continue;
+        respByNorm.set(norm, { name, who });
+      }
+    }
+
+    const { matched, similar, missing, extra } = classifyDutyTasks(dutyTasks, respByNorm);
+
+    return {
+      orgName: tree.unit.name,
+      hasChart: chartRows.length > 0,
+      chartUploadedAt: chart?.uploaded_at ?? null,
+      dutyTaskCount: dutyTasks.length,
+      responseCount: rows.length,
+      responseTaskCount,
+      reflectedPct:
+        dutyTasks.length === 0
+          ? 0
+          : Math.round(((matched.length + similar.length) / dutyTasks.length) * 100),
+      matched,
+      similar,
+      missing,
+      extra,
+      responseIds: rows.map((r) => r.id),
+      asOf: new Date().toISOString(),
+    };
+  });
+
+/* ═══════════════ F14. 직무 중복 진단 ═══════════════ */
+
+/** 병합 후보로 올리는 과업 중복률 하한. 작은 쪽 직무를 분모로 써 포함 관계를 잘 잡는다. */
+export const DIAG_OVERLAP_THRESHOLD = 0.5;
+/** 과업이 이만큼 이하면 직무로 세우기에 근거가 얇다 — 과분할 후보. */
+export const DIAG_SMALL_TASKS = 3;
+/** 과업이 이만큼 이상이면 한 직무에 너무 많은 일이 묶여 있다 — 분리 후보. */
+export const DIAG_LARGE_TASKS = 20;
+/** 병합 후보 목록에 담는 최대 쌍 수. */
+export const DIAG_PAIR_LIMIT = 20;
+
+export type JobOverlapPair = {
+  a: string;
+  b: string;
+  /** 작은 쪽 직무의 과업 중 겹치는 비율(%). */
+  overlapPct: number;
+  aTasks: number;
+  bTasks: number;
+  /** 겹치는 과업 이름 (최대 5개). */
+  shared: string[];
+};
+
+export type JobDiagnosis = {
+  jobCount: number;
+  responseCount: number;
+  duplicatePairs: JobOverlapPair[];
+  tooSmall: { jobName: string; taskCount: number; responseCount: number }[];
+  tooLarge: { jobName: string; taskCount: number; responseCount: number }[];
+  thinEvidence: { jobName: string; taskCount: number }[];
+  asOf: string;
+};
+
+/**
+ * 직무 중복·과분할 진단 (F14).
+ *
+ * 승인·제출된 응답의 과업을 직무별로 모아 네 가지를 본다. 어느 것도 자동으로 고치지 않는다 —
+ * 직무분류를 바꾸는 일은 관리자가 직접 하고 새 버전으로 저장하는 기존 경로를 따른다.
+ *
+ * ponytail: 교집합은 정규화 완전일치로만 센다(직무 115개 × 과업 10개면 유사 판정 전수 비교가
+ * 65만 회가 된다). 표현이 다른 같은 과업까지 잡아야 하면 과업명 사전을 먼저 만들어야 한다.
+ */
+export const diagnoseJobCatalog = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ companyId: z.string().uuid().nullable().optional() }).parse(input ?? {}),
+  )
+  .handler(async ({ data, context }): Promise<JobDiagnosis> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { fetchAll } = await import("@/lib/paginate");
+
+    type Row = { job_name: string | null; response_tasks: { name: string }[] };
+    const rows = await fetchAll<Row>((from, to) => {
+      let q = supabaseAdmin
+        .from("responses")
+        .select("job_name, response_tasks(name)")
+        .in("status", DUTY_COUNTED_STATUSES)
+        .order("id")
+        .range(from, to);
+      if (data.companyId) q = q.eq("company_id", data.companyId);
+      return q;
+    });
+
+    /** 직무명 → { 과업 정규화키 → 원문, 응답 수 } */
+    const byJob = new Map<string, { tasks: Map<string, string>; responses: number }>();
+    for (const row of rows) {
+      const job = (row.job_name ?? "").trim();
+      if (job === "") continue;
+      const bucket = byJob.get(job) ?? { tasks: new Map<string, string>(), responses: 0 };
+      bucket.responses += 1;
+      for (const task of row.response_tasks) {
+        const name = (task.name ?? "").trim();
+        const norm = normalizeTaskName(name);
+        if (norm === "" || bucket.tasks.has(norm)) continue;
+        bucket.tasks.set(norm, name);
+      }
+      byJob.set(job, bucket);
+    }
+
+    const jobs = [...byJob.entries()].map(([jobName, v]) => ({
+      jobName,
+      tasks: v.tasks,
+      responseCount: v.responses,
+    }));
+
+    const duplicatePairs: JobOverlapPair[] = [];
+    for (let i = 0; i < jobs.length; i += 1) {
+      const a = jobs[i]!;
+      if (a.tasks.size === 0) continue;
+      for (let j = i + 1; j < jobs.length; j += 1) {
+        const b = jobs[j]!;
+        if (b.tasks.size === 0) continue;
+        const { ratio, shared } = taskOverlap(a.tasks, b.tasks);
+        if (ratio < DIAG_OVERLAP_THRESHOLD) continue;
+        duplicatePairs.push({
+          a: a.jobName,
+          b: b.jobName,
+          overlapPct: Math.round(ratio * 100),
+          aTasks: a.tasks.size,
+          bTasks: b.tasks.size,
+          shared: shared.slice(0, 5),
+        });
+      }
+    }
+    duplicatePairs.sort((x, y) => y.overlapPct - x.overlapPct);
+
+    return {
+      jobCount: jobs.length,
+      responseCount: rows.length,
+      duplicatePairs: duplicatePairs.slice(0, DIAG_PAIR_LIMIT),
+      tooSmall: jobs
+        .filter((j) => j.tasks.size > 0 && j.tasks.size <= DIAG_SMALL_TASKS)
+        .map((j) => ({
+          jobName: j.jobName,
+          taskCount: j.tasks.size,
+          responseCount: j.responseCount,
+        }))
+        .sort((x, y) => x.taskCount - y.taskCount),
+      tooLarge: jobs
+        .filter((j) => j.tasks.size >= DIAG_LARGE_TASKS)
+        .map((j) => ({
+          jobName: j.jobName,
+          taskCount: j.tasks.size,
+          responseCount: j.responseCount,
+        }))
+        .sort((x, y) => y.taskCount - x.taskCount),
+      thinEvidence: jobs
+        .filter((j) => j.responseCount === 1)
+        .map((j) => ({ jobName: j.jobName, taskCount: j.tasks.size }))
+        .sort((x, y) => x.jobName.localeCompare(y.jobName)),
+      asOf: new Date().toISOString(),
     };
   });

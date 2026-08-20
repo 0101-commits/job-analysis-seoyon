@@ -61,6 +61,9 @@ import { SignalCard } from "@/components/SignalCard";
 import { EmptyState } from "@/components/EmptyState";
 import { usePersistedState } from "@/hooks/use-persisted-ui";
 import { OrgCanvas, type CanvasRollup } from "@/components/admin/OrgCanvas";
+import { RecheckBoard } from "@/components/admin/RecheckBoard";
+import { DutyCompare } from "@/components/admin/DutyCompare";
+import { JobDiagnosisPanel } from "@/components/admin/JobDiagnosisPanel";
 import {
   ImpactCountBadge,
   ImpactInspector,
@@ -111,7 +114,7 @@ import {
 } from "@/lib/master.functions";
 
 /** 화면 안의 위치를 URL 이 갖는다 — 대시보드·검토·전역 검색이 이 규약으로 링크를 보낸다 (기획 D4·P6). */
-const MASTER_TABS = ["org", "job", "duty", "status"] as const;
+const MASTER_TABS = ["org", "job", "duty", "compare", "recheck", "status"] as const;
 type MasterTab = (typeof MASTER_TABS)[number];
 
 type MasterSearch = { tab?: MasterTab; job?: string; org?: string };
@@ -2117,6 +2120,7 @@ function JobDraftPanel({ onApplied }: { onApplied: () => void }) {
 
 function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
   const queryClient = useQueryClient();
+  const { companyId } = useCompanyScope();
   const [suggestions, setSuggestions] = useState<MappingSuggestion[] | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editingJob, setEditingJob] = useState<JobEdit | null>(null);
@@ -2197,6 +2201,7 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
     { id: "job-list", label: "직무분류표", count: catalogRows?.length ?? 0 },
     { id: "job-draft", label: "AI 가안" },
     { id: "job-upload", label: "파일로 올리기" },
+    { id: "job-diagnosis", label: "중복·과분할 진단" },
     { id: "job-versions", label: "버전 관리" },
     { id: "job-mapping", label: "응답 연결 제안" },
   ];
@@ -2291,6 +2296,16 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
           }
           onApplied={invalidateCatalog}
         />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        storageKey="master-job"
+        id="job-diagnosis"
+        title="중복·과분할 진단"
+        subtitle="응답에 적힌 과업을 근거로 합칠 직무·나눌 직무 후보를 찾습니다. 자동으로 바꾸지 않습니다."
+        defaultCollapsed
+      >
+        <JobDiagnosisPanel companyId={companyId === "all" ? null : companyId} />
       </CollapsibleSection>
 
       <CollapsibleSection
@@ -2896,6 +2911,44 @@ function DutyTab() {
 
 /* ───────────────────────── ④ 현황 ───────────────────────── */
 
+/* ─────────────────── ④ 업무분장 대조 (F11) ─────────────────── */
+
+function CompareTab() {
+  const { companyId } = useCompanyScope();
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-sm font-semibold">업무분장 ↔ 응답 대조</h2>
+        <p className="mt-1 text-xs text-muted-foreground">
+          올려 둔 업무분장표의 과업과 실제 응답에 적힌 과업을 맞춰, 조사에서 빠진 일과 분장에 없는
+          일을 찾습니다.
+        </p>
+      </div>
+      <DutyCompare companyId={companyId === "all" ? null : companyId} />
+    </div>
+  );
+}
+
+/* ─────────────────── ⑤ 재확인 잔량 (F10) ─────────────────── */
+
+/** 진행 현황 화면의 「재확인 미확인 N건」 카드가 `?tab=recheck` 로 여기 직행한다. */
+function RecheckTab() {
+  const { companyId } = useCompanyScope();
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-sm font-semibold">변경 재확인 미확인 잔량</h2>
+        <p className="mt-1 text-xs text-muted-foreground">
+          기준 정보를 고쳐 안내를 보낸 응답 중 참여자가 아직 확인하지 않은 건입니다.
+        </p>
+      </div>
+      <RecheckBoard companyId={companyId === "all" ? null : companyId} />
+    </div>
+  );
+}
+
+/* ───────────────────────── ⑥ 현황 ───────────────────────── */
+
 function StatusTab() {
   const { data, isLoading } = useQuery({
     queryKey: ["master-status"],
@@ -2994,10 +3047,12 @@ function MasterPage() {
           })
         }
       >
-        <TabsList className="grid w-full grid-cols-2 sm:w-auto sm:grid-cols-4">
+        <TabsList className="grid w-full grid-cols-2 sm:w-auto sm:grid-cols-6">
           <TabsTrigger value="org">조직도</TabsTrigger>
           <TabsTrigger value="job">직무분류</TabsTrigger>
           <TabsTrigger value="duty">업무분장</TabsTrigger>
+          <TabsTrigger value="compare">업무분장 대조</TabsTrigger>
+          <TabsTrigger value="recheck">재확인 잔량</TabsTrigger>
           <TabsTrigger value="status">현황</TabsTrigger>
         </TabsList>
         <TabsContent value="org" className="mt-4">
@@ -3008,6 +3063,12 @@ function MasterPage() {
         </TabsContent>
         <TabsContent value="duty" className="mt-4">
           <DutyTab />
+        </TabsContent>
+        <TabsContent value="compare" className="mt-4">
+          <CompareTab />
+        </TabsContent>
+        <TabsContent value="recheck" className="mt-4">
+          <RecheckTab />
         </TabsContent>
         <TabsContent value="status" className="mt-4">
           <StatusTab />

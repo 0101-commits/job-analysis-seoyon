@@ -646,3 +646,421 @@ export const listAuditLogs = createServerFn({ method: "POST" })
 
     return { rows: list, actions };
   });
+
+/* ─────────────────── 운영 자동화 (기획 F2·F3·F4·F5) ─────────────────── */
+
+/**
+ * 정기 실행·백업·독려 규칙·진행 리포트의 서버 창구.
+ *
+ * 실행 본체는 서버 전용 모듈(cron.server / backup.server / reminders.server / report.server)에
+ * 있고, 여기서는 관리자 권한 확인과 기록만 얹는다.
+ */
+
+export type JobCard = {
+  job: string;
+  label: string;
+  desc: string;
+  /** 한 번도 실행되지 않았으면 null — 화면에서 "실행 기록 없음"으로 구분한다. */
+  last: {
+    status: string;
+    at: string;
+    durationMs: number | null;
+    count: number | null;
+    detail: string;
+    error: string | null;
+  } | null;
+};
+
+export type AutomationStatus = {
+  jobs: JobCard[];
+  report: { enabled: boolean; weekday: number; recipients: string[] };
+  retentionDays: number;
+  mailDailyCap: number;
+};
+
+/** 실행 결과의 세부 내용을 한 줄로 만든다. */
+function detailLine(detail: unknown): { text: string; count: number | null } {
+  if (!detail || typeof detail !== "object") return { text: "", count: null };
+  const entries = Object.entries(detail as Record<string, unknown>);
+  const countEntry = entries.find(([key]) => key === "건수");
+  const rest = entries
+    .filter(([key]) => key !== "건수")
+    .map(([key, value]) => `${key} ${String(value)}`)
+    .join(" · ");
+  const count = countEntry?.[1];
+  return { text: rest, count: typeof count === "number" ? count : null };
+}
+
+export const getAutomationStatus = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<AutomationStatus> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { CRON_JOBS, CRON_JOB_LABELS } = await import("@/lib/cron.server");
+
+    const [{ data: runs }, { data: system }] = await Promise.all([
+      supabaseAdmin
+        .from("cron_runs")
+        .select("job, status, detail, error_message, duration_ms, finished_at, started_at")
+        .order("started_at", { ascending: false })
+        .limit(200),
+      supabaseAdmin.from("system_settings").select("*").maybeSingle(),
+    ]);
+
+    type RunRow = NonNullable<typeof runs>[number];
+    const latest = new Map<string, RunRow>();
+    for (const row of runs ?? []) if (!latest.has(row.job)) latest.set(row.job, row);
+
+    const settings = (system ?? {}) as {
+      report_enabled?: boolean;
+      report_weekday?: number;
+      report_recipients?: string[];
+      backup_retention_days?: number;
+      mail_daily_cap?: number;
+    };
+
+    return {
+      jobs: CRON_JOBS.map((job) => {
+        const info = CRON_JOB_LABELS[job];
+        const row = latest.get(job);
+        if (!row) return { job, label: info.label, desc: info.desc, last: null };
+        const { text, count } = detailLine(row.detail);
+        return {
+          job,
+          label: info.label,
+          desc: info.desc,
+          last: {
+            status: row.status,
+            at: row.finished_at ?? row.started_at,
+            durationMs: row.duration_ms,
+            count,
+            detail: text,
+            error: row.error_message,
+          },
+        };
+      }),
+      report: {
+        enabled: settings.report_enabled ?? false,
+        weekday: settings.report_weekday ?? 1,
+        recipients: settings.report_recipients ?? [],
+      },
+      retentionDays: settings.backup_retention_days ?? 30,
+      mailDailyCap: settings.mail_daily_cap ?? 500,
+    };
+  });
+
+export const runJobNow = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ job: z.string().trim().min(1).max(40) }).parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { runCronJob, isCronJob, CRON_JOB_LABELS } = await import("@/lib/cron.server");
+
+    if (!isCronJob(data.job)) throw new Error("없는 작업입니다.");
+    const result = await runCronJob(data.job);
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "정기 실행 수동 실행",
+      target_type: "cron_runs",
+      detail: { 작업: CRON_JOB_LABELS[data.job].label, 결과: result.status, 세부: result.detail },
+    });
+
+    const { text, count } = detailLine(result.detail);
+    return {
+      status: result.status,
+      detail: text,
+      count,
+      error: result.error ?? null,
+      durationMs: result.durationMs,
+    };
+  });
+
+const recipientsSchema = z
+  .array(z.string().trim().max(200))
+  .max(20)
+  .transform((list) => [...new Set(list.map((v) => v.trim()).filter((v) => v !== ""))])
+  .refine(
+    (list) => list.every((v) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v)),
+    "메일 주소 형식이 올바르지 않습니다.",
+  );
+
+export const updateAutomationSettings = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        reportEnabled: z.boolean().optional(),
+        reportWeekday: z.number().int().min(0).max(6).optional(),
+        reportRecipients: recipientsSchema.optional(),
+        backupRetentionDays: z.number().int().min(7).max(365).optional(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const patch: Record<string, unknown> = {};
+    if (data.reportEnabled !== undefined) patch["report_enabled"] = data.reportEnabled;
+    if (data.reportWeekday !== undefined) patch["report_weekday"] = data.reportWeekday;
+    if (data.reportRecipients !== undefined) patch["report_recipients"] = data.reportRecipients;
+    if (data.backupRetentionDays !== undefined) {
+      patch["backup_retention_days"] = data.backupRetentionDays;
+    }
+    if (Object.keys(patch).length === 0) return { ok: true };
+
+    const { error } = await supabaseAdmin
+      .from("system_settings")
+      .update(patch as never)
+      .eq("id", true);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "운영 자동화 설정 변경",
+      target_type: "system_settings",
+      detail: patch,
+    });
+    return { ok: true };
+  });
+
+/* ── 백업 (F3) ── */
+
+export const listBackupFiles = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { listBackups } = await import("@/lib/backup.server");
+    return { rows: await listBackups(supabaseAdmin) };
+  });
+
+export const createBackupNow = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ note: z.string().trim().max(200).optional() }).parse(input ?? {}),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { createBackup } = await import("@/lib/backup.server");
+
+    const res = await createBackup(supabaseAdmin, "수동", data.note ?? null, context.userId);
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "수동 백업",
+      target_type: "backups",
+      detail: { 파일: res.path, 건수: res.totalRows },
+    });
+    return { path: res.path, totalRows: res.totalRows, sizeBytes: res.sizeBytes };
+  });
+
+/** 되돌리기 전 차이만 계산한다 — 아무것도 바꾸지 않는다. */
+export const previewBackupRestore = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { restoreBackup } = await import("@/lib/backup.server");
+    return restoreBackup(supabaseAdmin, data.id, { dryRun: true });
+  });
+
+export const applyBackupRestore = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { restoreBackup } = await import("@/lib/backup.server");
+    // 되돌리기 직전 백업과 감사 기록은 restoreBackup 안에서 함께 처리한다.
+    return restoreBackup(supabaseAdmin, data.id, { dryRun: false, actorId: context.userId });
+  });
+
+/* ── 독려 규칙 (F4) ── */
+
+export type ReminderRuleView = {
+  id: string;
+  companyId: string | null;
+  name: string;
+  trigger: string;
+  days: number;
+  templateId: string | null;
+  enabled: boolean;
+  dailyCap: number;
+  /** 지금 이 규칙을 돌리면 몇 명이 대상인지. */
+  targetCount: number;
+  targetNote: string | null;
+  lastRun: { at: string; sent: number | null; skipped: number | null } | null;
+};
+
+export const getReminderRules = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { collectRuleTargets, lastRuleRuns, REMINDER_TRIGGERS, TRIGGER_LABELS } =
+      await import("@/lib/reminders.server");
+
+    const [{ data: rules, error }, { data: templates }, { data: companies }, runs] =
+      await Promise.all([
+        supabaseAdmin
+          .from("reminder_rules")
+          .select(
+            "id, company_id, name, trigger, days, template_id, enabled, daily_cap, last_run_at, last_sent_count",
+          )
+          .order("created_at"),
+        supabaseAdmin.from("mail_templates").select("id, name, kind").order("created_at"),
+        supabaseAdmin.from("companies").select("id, name").order("created_at"),
+        lastRuleRuns(supabaseAdmin),
+      ]);
+    if (error) throw new Error(error.message);
+
+    const views: ReminderRuleView[] = [];
+    for (const rule of rules ?? []) {
+      const targets = await collectRuleTargets(supabaseAdmin, {
+        company_id: rule.company_id,
+        trigger: rule.trigger,
+        days: rule.days,
+      });
+      const run = runs.find((r) => r.rule_id === rule.id);
+      views.push({
+        id: rule.id,
+        companyId: rule.company_id,
+        name: rule.name,
+        trigger: rule.trigger,
+        days: rule.days,
+        templateId: rule.template_id,
+        enabled: rule.enabled,
+        dailyCap: rule.daily_cap,
+        targetCount: targets.participantIds.length,
+        targetNote: targets.note,
+        lastRun: rule.last_run_at
+          ? {
+              at: rule.last_run_at,
+              sent: run?.sent_count ?? rule.last_sent_count ?? null,
+              skipped: run?.skipped_count ?? null,
+            }
+          : null,
+      });
+    }
+
+    return {
+      rules: views,
+      templates: templates ?? [],
+      companies: companies ?? [],
+      triggers: REMINDER_TRIGGERS.map((t) => ({ value: t, desc: TRIGGER_LABELS[t] })),
+    };
+  });
+
+export const saveReminderRule = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        id: z.string().uuid().optional(),
+        name: z.string().trim().min(1).max(60),
+        trigger: z.enum(["미로그인", "작성정체", "반려미수정", "마감임박"]),
+        days: z.number().int().min(1).max(60),
+        companyId: z.string().uuid().nullable(),
+        templateId: z.string().uuid().nullable(),
+        enabled: z.boolean(),
+        dailyCap: z.number().int().min(1).max(2000),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const row = {
+      name: data.name,
+      trigger: data.trigger,
+      days: data.days,
+      company_id: data.companyId,
+      template_id: data.templateId,
+      enabled: data.enabled,
+      daily_cap: data.dailyCap,
+    };
+    const { error } = data.id
+      ? await supabaseAdmin.from("reminder_rules").update(row).eq("id", data.id)
+      : await supabaseAdmin.from("reminder_rules").insert(row);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: data.id ? "독려 규칙 수정" : "독려 규칙 추가",
+      target_type: "reminder_rules",
+      ...(data.id ? { target_id: data.id } : {}),
+      detail: { 이름: data.name, 종류: data.trigger, 기준일: data.days, 사용: data.enabled },
+    });
+    return { ok: true };
+  });
+
+export const deleteReminderRule = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: row } = await supabaseAdmin
+      .from("reminder_rules")
+      .select("name")
+      .eq("id", data.id)
+      .maybeSingle();
+    const { error } = await supabaseAdmin.from("reminder_rules").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "독려 규칙 삭제",
+      target_type: "reminder_rules",
+      target_id: data.id,
+      detail: { 이름: row?.name ?? "" },
+    });
+    return { ok: true };
+  });
+
+export const runReminderRuleNow = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { runReminderRules } = await import("@/lib/reminders.server");
+
+    // force: 관리자가 직접 누른 실행이므로 하루 1회 가드를 넘긴다.
+    const results = await runReminderRules(supabaseAdmin, { force: true, ruleId: data.id });
+    const result = results[0];
+    if (!result) throw new Error("규칙을 찾을 수 없습니다.");
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "독려 규칙 수동 실행",
+      target_type: "reminder_rules",
+      target_id: data.id,
+      detail: { 이름: result.name, 결과: result.status, 발송: result.sent, 남김: result.skipped },
+    });
+    return {
+      status: result.status,
+      sent: result.sent,
+      skipped: result.skipped,
+      reason: result.reason ?? null,
+      error: result.error ?? null,
+    };
+  });

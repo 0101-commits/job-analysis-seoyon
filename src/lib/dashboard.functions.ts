@@ -29,6 +29,8 @@ export type OverviewParticipant = {
   role: string;
   invited_at: string | null;
   last_seen_at: string | null;
+  /** F8 조사 차수. 이 사람이 지금 속한 차수 — 차수 필터의 판정 기준. */
+  wave_id: string | null;
 };
 
 export type OverviewUnit = {
@@ -69,7 +71,7 @@ export const getOrgOverview = createServerFn({ method: "GET" })
       const { data, error } = await admin
         .from("participants")
         .select(
-          "id, name, emp_no, company_id, org_unit_id, org_text, account_status, role, invited_at, last_seen_at",
+          "id, name, emp_no, company_id, org_unit_id, org_text, account_status, role, invited_at, last_seen_at, wave_id",
         )
         .is("archived_at", null)
         .order("id")
@@ -83,11 +85,13 @@ export const getOrgOverview = createServerFn({ method: "GET" })
       companies: companies ?? [],
       units: (units ?? []) as OverviewUnit[],
       participants,
-      settings: ((settings ?? []) as {
-        company_id: string;
-        deadline: string | null;
-        stale_days: number | null;
-      }[]).map((s) => ({ ...s, stale_days: s.stale_days ?? 7 })),
+      settings: (
+        (settings ?? []) as {
+          company_id: string;
+          deadline: string | null;
+          stale_days: number | null;
+        }[]
+      ).map((s) => ({ ...s, stale_days: s.stale_days ?? 7 })),
     };
   });
 
@@ -188,11 +192,13 @@ export const checkIntegrity = createServerFn({ method: "GET" })
         : DEFAULT_ROLE_LEVELS
       ).map((v) => v.trim()),
     );
-    const badRoleLevels = ((people ?? []) as {
-      name: string;
-      emp_no: string;
-      role_level: string;
-    }[]).filter((p) => p.role_level.trim() !== "" && !roleLevels.has(p.role_level.trim()));
+    const badRoleLevels = (
+      (people ?? []) as {
+        name: string;
+        emp_no: string;
+        role_level: string;
+      }[]
+    ).filter((p) => p.role_level.trim() !== "" && !roleLevels.has(p.role_level.trim()));
 
     // ⑷ 예시 직군(job_group_key)과 매칭되지 않는 직군 응답
     const exampleKeys = new Set(
@@ -288,20 +294,34 @@ export const getLaunchReadiness = createServerFn({ method: "GET" })
     const { isSimulationMode } = await import("@/lib/mailer.server");
     const admin = untyped(supabaseAdmin);
 
-    const [orgUnits, jobCatalog, participants, { data: settings }, testLogs] = await Promise.all([
-      admin.from("org_units").select("id", { count: "exact", head: true }),
-      admin.from("job_catalog").select("id", { count: "exact", head: true }),
-      admin
-        .from("participants")
-        .select("id", { count: "exact", head: true })
-        .is("archived_at", null),
-      admin.from("survey_settings").select("deadline"),
-      // 테스트 발송은 배치 없이 to_name='테스트 발송' 으로 기록된다(mail.functions.ts).
-      admin
-        .from("mail_logs")
-        .select("id", { count: "exact", head: true })
-        .eq("to_name", "테스트 발송"),
-    ]);
+    const [orgUnits, jobCatalog, participants, { data: settings }, testLogs, lastCron, lastBackup] =
+      await Promise.all([
+        admin.from("org_units").select("id", { count: "exact", head: true }),
+        admin.from("job_catalog").select("id", { count: "exact", head: true }),
+        admin
+          .from("participants")
+          .select("id", { count: "exact", head: true })
+          .is("archived_at", null),
+        admin.from("survey_settings").select("deadline"),
+        // 테스트 발송은 배치 없이 to_name='테스트 발송' 으로 기록된다(mail.functions.ts).
+        admin
+          .from("mail_logs")
+          .select("id", { count: "exact", head: true })
+          .eq("to_name", "테스트 발송"),
+        // F2 스케줄 실행 이력·F3 자동 백업 — 이 화면은 읽기만 한다(채우는 쪽은 다른 담당).
+        admin
+          .from("cron_runs")
+          .select("job, status, started_at")
+          .order("started_at", { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        admin
+          .from("backups")
+          .select("id, created_at")
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+      ]);
 
     const hasDeadline = ((settings ?? []) as { deadline: string | null }[]).some(
       (s) => s.deadline !== null,
@@ -345,6 +365,21 @@ export const getLaunchReadiness = createServerFn({ method: "GET" })
         ok: (testLogs.count ?? 0) > 0,
         hint: "메일 화면에서 본인에게 테스트 발송을 해 보세요.",
       },
+      {
+        key: "cronRun",
+        label: "정기 실행 최근 성공",
+        ok: lastCron.data?.status === "성공",
+        hint:
+          lastCron.data === null
+            ? "기록 없음 — 아직 정기 작업이 실행된 적이 없습니다."
+            : `최근 실행이 '${lastCron.data.status}'로 끝났습니다(${lastCron.data.job}, ${lastCron.data.started_at}).`,
+      },
+      {
+        key: "backup",
+        label: "자동 백업 최근 성공",
+        ok: lastBackup.data !== null,
+        hint: "기록 없음 — 아직 자동 백업이 실행된 적이 없습니다.",
+      },
     ];
 
     return {
@@ -381,6 +416,10 @@ export type DashboardSignals = {
   failedMails: { id: string; participant_id: string | null; sent_at: string }[];
   /** 제출 → 검토 처리(승인·반려) 평균 소요일. 처리 이력이 없으면 null. */
   reviewTurnaroundDays: number | null;
+  /** F6 문의함 — 아직 답변하지 않은 문의(status='접수'). */
+  openInquiries: { id: string; participant_id: string; category: string; created_at: string }[];
+  /** F10 변경 재확인 — 참여자가 아직 확인 처리하지 않은 응답. */
+  recheckResponses: { id: string; participant_id: string }[];
 };
 
 export const getDashboardSignals = createServerFn({ method: "GET" })
@@ -391,7 +430,14 @@ export const getDashboardSignals = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const admin = untyped(supabaseAdmin);
 
-    const [responses, draftSkills, draftRequirements, failedMails] = await Promise.all([
+    const [
+      responses,
+      draftSkills,
+      draftRequirements,
+      failedMails,
+      openInquiries,
+      recheckResponses,
+    ] = await Promise.all([
       fetchAll<SignalResponse>((from, to) =>
         admin
           .from("responses")
@@ -424,6 +470,24 @@ export const getDashboardSignals = createServerFn({ method: "GET" })
           .order("id")
           .range(from, to),
       ),
+      fetchAll<{ id: string; participant_id: string; category: string; created_at: string }>(
+        (from, to) =>
+          admin
+            .from("inquiries")
+            .select("id, participant_id, category, created_at")
+            .eq("status", "접수")
+            .order("created_at", { ascending: false })
+            .order("id")
+            .range(from, to),
+      ),
+      fetchAll<{ id: string; participant_id: string }>((from, to) =>
+        admin
+          .from("responses")
+          .select("id, participant_id")
+          .eq("recheck_required", true)
+          .order("id")
+          .range(from, to),
+      ),
     ]);
 
     // 승인 게이트는 제출 상태에서만 의미가 있다. 초안·반려 건의 AI 초안은 아직 막는 것이 없다.
@@ -453,5 +517,7 @@ export const getDashboardSignals = createServerFn({ method: "GET" })
       failedMails,
       reviewTurnaroundDays:
         elapsedCount > 0 ? Math.round((elapsedSum / elapsedCount) * 10) / 10 : null,
+      openInquiries,
+      recheckResponses,
     };
   });

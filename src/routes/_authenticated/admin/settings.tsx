@@ -17,6 +17,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { SectionNav, CollapsibleSection, type SectionDef } from "@/components/SectionNav";
+import {
+  AutomationPanel,
+  BackupPanel,
+  ReminderRulesPanel,
+} from "@/components/admin/AutomationPanels";
 import { FieldHint } from "@/components/FieldHint";
 import { EmptyState } from "@/components/EmptyState";
 import { PASSWORD_TOKENS, validatePasswordRule } from "@/lib/password-rule";
@@ -656,6 +661,9 @@ function SettingsPage() {
             <TabsTrigger value="password">초기 비밀번호</TabsTrigger>
             <TabsTrigger value="survey">계열사 운영</TabsTrigger>
             <TabsTrigger value="levels">역할단계</TabsTrigger>
+            <TabsTrigger value="automation">운영 자동화</TabsTrigger>
+            <TabsTrigger value="reminders">독려 규칙</TabsTrigger>
+            <TabsTrigger value="backup">백업</TabsTrigger>
             <TabsTrigger value="security">보안</TabsTrigger>
           </TabsList>
 
@@ -1190,7 +1198,22 @@ function SettingsPage() {
             </CollapsibleSection>
           </TabsContent>
 
-          {/* 4. 보안 — 조사 구조 고지 + 허용 도메인 + 장치 현황 + 감사 기록 */}
+          {/* 4. 운영 자동화 — 정기 실행 현황 + 진행 리포트 (기획 F2·F5) */}
+          <TabsContent value="automation" className="mt-4">
+            <AutomationPanel />
+          </TabsContent>
+
+          {/* 5. 독려 규칙 (기획 F4) */}
+          <TabsContent value="reminders" className="mt-4">
+            <ReminderRulesPanel />
+          </TabsContent>
+
+          {/* 6. 백업·되돌리기 (기획 F3) */}
+          <TabsContent value="backup" className="mt-4">
+            <BackupPanel />
+          </TabsContent>
+
+          {/* 7. 보안 — 조사 구조 고지 + 허용 도메인 + 장치 현황 + 감사 기록 */}
           <TabsContent value="security" className="mt-4 space-y-5">
             <TabIntro>
               이 탭에서는 <strong>누가 어떤 이메일로 참여할 수 있는지</strong>를 정하고,{" "}

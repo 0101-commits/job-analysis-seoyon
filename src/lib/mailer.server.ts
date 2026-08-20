@@ -14,16 +14,94 @@ export const REMINDER_STATUSES = {
   미제출: ["초대발송", "미접속", "작성중", "반려"],
 } as const;
 
+/**
+ * 환경변수 읽기의 단일 창구.
+ *
+ * CF Workers 배포에서는 시크릿이 워커 env 로 들어온다. nitro cloudflare 프리셋이 매 요청
+ * `globalThis.__env__ = env` 를 해 주고, server.ts 가 `__CF_ENV__` 로 한 벌 더 스태시한다.
+ * llm.server.ts 와 같은 순서(`__env__` → `__CF_ENV__` → process.env)로 찾아, 어느 배포에서든
+ * 같은 값을 보게 한다.
+ */
+export function mailEnv(name: string) {
+  const g = globalThis as Record<string, unknown>;
+  const env = (g["__env__"] ?? g["__CF_ENV__"]) as Record<string, unknown> | undefined;
+  const fromWorker = env?.[name];
+  if (typeof fromWorker === "string" && fromWorker.trim()) return fromWorker;
+  const fromProcess = process.env[name];
+  return fromProcess?.trim() ? fromProcess : undefined;
+}
+
 export function appUrl(fallbackOrigin?: string | null) {
   return (
-    process.env["APP_URL"] ??
+    mailEnv("APP_URL") ??
     fallbackOrigin ??
     "https://project--b4c6c58c-96a0-4f8e-872f-d5479003f8b6.lovable.app"
   );
 }
 
 export function isSimulationMode() {
-  return !process.env["RESEND_API_KEY"];
+  return !mailEnv("RESEND_API_KEY");
+}
+
+/** 발송 키를 등록하기 전의 임시 발신 주소. 운영에서는 RESEND_FROM 으로 반드시 바꿔야 한다. */
+export const DEFAULT_MAIL_FROM = "서연 그룹 업무조사 <onboarding@resend.dev>";
+
+export function mailFrom() {
+  return mailEnv("RESEND_FROM") ?? DEFAULT_MAIL_FROM;
+}
+
+/** `이름 <주소@도메인>` 또는 `주소@도메인` 에서 도메인만 뽑는다. */
+export function mailFromDomain(from = mailFrom()) {
+  const address = from.match(/<([^>]+)>/)?.[1] ?? from;
+  const domain = address.trim().split("@")[1];
+  return domain?.trim().toLowerCase() || null;
+}
+
+/** '오늘'·'이번 달' 은 한국 시간 기준. 관리자가 보는 날짜와 상한 계산이 어긋나지 않게 한다. */
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+export function kstDayStartIso(now = Date.now()) {
+  const k = new Date(now + KST_OFFSET_MS);
+  const start = Date.UTC(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate());
+  return new Date(start - KST_OFFSET_MS).toISOString();
+}
+
+export function kstMonthStartIso(now = Date.now()) {
+  const k = new Date(now + KST_OFFSET_MS);
+  const start = Date.UTC(k.getUTCFullYear(), k.getUTCMonth(), 1);
+  return new Date(start - KST_OFFSET_MS).toISOString();
+}
+
+/** 발송 상한 기본값. system_settings.mail_daily_cap 의 DB 기본값과 같은 수를 쓴다. */
+export const DEFAULT_DAILY_CAP = 500;
+
+/**
+ * 실제로 발송기를 거친 건수만 센다.
+ * 연습 모드 기록은 나간 적이 없고, 발송 실패는 수신자에게 닿지 않았다.
+ * 반송은 이미 한 번 나간 뒤 되돌아온 것이므로 발송량에 포함한다.
+ */
+const CONSUMED_STATUSES = ["성공", "반송"];
+
+export async function countSentSince(admin: SupabaseClient, sinceIso: string) {
+  const { count, error } = await admin
+    .from("mail_logs")
+    .select("id", { count: "exact", head: true })
+    .in("status", CONSUMED_STATUSES)
+    .gte("sent_at", sinceIso);
+  if (error) throw new Error(error.message);
+  return count ?? 0;
+}
+
+export async function mailDailyCap(admin: SupabaseClient) {
+  const { data } = await admin.from("system_settings").select("mail_daily_cap").maybeSingle();
+  return (data as { mail_daily_cap?: number } | null)?.mail_daily_cap ?? DEFAULT_DAILY_CAP;
+}
+
+/** 오늘 남은 발송 여유. 상한을 이미 넘겼으면 0. */
+export async function dailyHeadroom(admin: SupabaseClient) {
+  const cap = await mailDailyCap(admin);
+  const sentToday = await countSentSince(admin, kstDayStartIso());
+  return { cap, sentToday, remaining: Math.max(cap - sentToday, 0) };
 }
 
 type ParticipantRow = {
@@ -105,23 +183,202 @@ function toPlainText(body: string) {
   return replaceImageTokens(body, () => "");
 }
 
+/** 발송 실패를 "다시 보내면 될 수도 있는 것" 과 "사람이 고쳐야 하는 것" 으로 나눠 담는다. */
+export class MailSendError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: number | null,
+    readonly transient: boolean,
+  ) {
+    super(message);
+    this.name = "MailSendError";
+  }
+}
+
 export async function sendMail(to: string, subject: string, body: string, link?: string | null) {
-  const key = process.env["RESEND_API_KEY"];
-  const from = process.env["RESEND_FROM"] ?? "서연 그룹 업무조사 <onboarding@resend.dev>";
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from,
-      to: [to],
-      subject,
-      html: renderMailHtml(body, link),
-      text: toPlainText(body),
-    }),
-  });
+  const key = mailEnv("RESEND_API_KEY");
+  let res: Response;
+  try {
+    res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: mailFrom(),
+        to: [to],
+        subject,
+        html: renderMailHtml(body, link),
+        text: toPlainText(body),
+      }),
+    });
+  } catch (err) {
+    // 발송 서비스에 닿지도 못한 경우(네트워크 단절·타임아웃) — 다시 시도할 가치가 있다.
+    throw new MailSendError(
+      err instanceof Error ? err.message : "메일 서버에 닿지 못했습니다",
+      null,
+      true,
+    );
+  }
   const json = (await res.json().catch(() => ({}))) as { id?: string; message?: string };
-  if (!res.ok) throw new Error(json.message ?? `발송 실패 (HTTP ${res.status})`);
+  if (!res.ok) {
+    throw new MailSendError(
+      json.message ?? `발송 실패 (HTTP ${res.status})`,
+      res.status,
+      res.status === 429 || res.status >= 500,
+    );
+  }
   return json.id ?? null;
+}
+
+/** 재시도 전 대기. 429 는 초당 상한이라 짧은 대기로 대부분 풀린다. */
+const RETRY_DELAY_MS = 2000;
+
+/**
+ * 발송 1건 + 자동 재시도.
+ *
+ * 재시도 정책
+ * - 일시적 오류만 **1회** 재시도한다: 429(초당 발송 초과), 5xx(발송 서비스 장애),
+ *   네트워크 단절·타임아웃.
+ * - 영구 오류는 재시도하지 않는다: 그 밖의 4xx — 형식이 잘못된 수신 주소, 거부된 발송 키,
+ *   인증되지 않은 발신 도메인. 같은 요청을 다시 보내도 같은 답이 오고, 잘못된 주소로 반복
+ *   발송하면 발신 도메인 평판만 깎인다. 이런 건은 사람이 원인을 고친 뒤 화면에서
+ *   [재발송] 을 눌러야 한다.
+ * - 재시도까지 실패하면 '실패' 로 기록하고 retry_count 에 몇 번 더 시도했는지 남긴다.
+ */
+export async function sendMailWithRetry(
+  to: string,
+  subject: string,
+  body: string,
+  link?: string | null,
+) {
+  let retryCount = 0;
+  for (;;) {
+    try {
+      const providerId = await sendMail(to, subject, body, link);
+      return { providerId, retryCount, error: null as string | null };
+    } catch (err) {
+      const transient = err instanceof MailSendError ? err.transient : true;
+      const message = err instanceof Error ? err.message : "알 수 없는 오류";
+      if (!transient || retryCount >= 1) return { providerId: null, retryCount, error: message };
+      retryCount += 1;
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+  }
+}
+
+export type DomainRecordCheck = {
+  label: string;
+  status: string;
+  tone: "ok" | "warn" | "unknown";
+};
+
+export type DomainVerification = {
+  /** 정상 | 미완료 | 미등록 | 확인 불가 | 조회 실패 */
+  state: string;
+  detail: string;
+  records: DomainRecordCheck[];
+};
+
+const RECORD_STATUS_LABELS: Record<string, string> = {
+  verified: "확인됨",
+  pending: "확인 중",
+  not_started: "등록 대기",
+  failed: "실패",
+  temporary_failure: "일시 실패",
+};
+
+/**
+ * 발신 도메인의 인증 상태를 발송 서비스에서 조회한다 (기획 F1).
+ *
+ * 500명 이상에게 초대 메일을 보내는데 발신 도메인 인증이 안 돼 있으면 상당수가 스팸함으로
+ * 간다. 발송 버튼을 누르기 전에 화면에서 이 값을 눈으로 확인할 수 있어야 한다.
+ * 조회할 수 없는 상황은 빈칸으로 두지 않고 왜 못 했는지를 그대로 돌려준다.
+ */
+export async function fetchDomainVerification(
+  domain: string | null = mailFromDomain(),
+): Promise<DomainVerification> {
+  const key = mailEnv("RESEND_API_KEY");
+  if (!key) {
+    return {
+      state: "확인 불가",
+      detail: "발송 키가 등록되지 않아 발송 서비스에 물어볼 수 없습니다.",
+      records: [],
+    };
+  }
+  if (!domain) {
+    return {
+      state: "확인 불가",
+      detail: "발신 주소에서 도메인을 읽지 못했습니다. 발신 주소 설정을 확인하세요.",
+      records: [],
+    };
+  }
+
+  const headers = { Authorization: `Bearer ${key}` };
+  try {
+    const listRes = await fetch("https://api.resend.com/domains", { headers });
+    const listJson = (await listRes.json().catch(() => ({}))) as {
+      data?: { id?: string; name?: string; status?: string }[];
+      message?: string;
+    };
+    if (!listRes.ok) {
+      return {
+        state: "조회 실패",
+        detail: `발송 서비스가 조회를 거부했습니다 — ${listJson.message ?? `HTTP ${listRes.status}`}`,
+        records: [],
+      };
+    }
+    const match = (listJson.data ?? []).find((d) => d.name?.toLowerCase() === domain);
+    if (!match?.id) {
+      return {
+        state: "미등록",
+        detail: `${domain} 이(가) 발송 서비스에 등록되어 있지 않습니다. 도메인을 등록하고 안내된 DNS 값을 넣어 인증을 마치세요.`,
+        records: [],
+      };
+    }
+
+    const detailRes = await fetch(`https://api.resend.com/domains/${match.id}`, { headers });
+    const detailJson = (await detailRes.json().catch(() => ({}))) as {
+      status?: string;
+      records?: { record?: string; type?: string; name?: string; status?: string }[];
+      message?: string;
+    };
+    if (!detailRes.ok) {
+      return {
+        state: "조회 실패",
+        detail: `도메인 상세를 읽지 못했습니다 — ${detailJson.message ?? `HTTP ${detailRes.status}`}`,
+        records: [],
+      };
+    }
+
+    const records: DomainRecordCheck[] = (detailJson.records ?? []).map((r) => {
+      const status = r.status ?? "";
+      return {
+        label: [r.record, r.type].filter(Boolean).join(" ") || (r.name ?? "확인 항목"),
+        status: RECORD_STATUS_LABELS[status] ?? (status || "상태 없음"),
+        tone: status === "verified" ? "ok" : "warn",
+      };
+    });
+    // DMARC 는 발송 서비스가 확인해 주지 않는다. 없는 값을 정상으로 꾸미지 않고 그대로 말한다.
+    records.push({
+      label: "DMARC",
+      status: "발송 서비스가 확인하지 않음 — 도메인 관리자가 직접 확인",
+      tone: "unknown",
+    });
+
+    const verified = (detailJson.status ?? match.status) === "verified";
+    return {
+      state: verified ? "정상" : "미완료",
+      detail: verified
+        ? `${domain} 인증이 끝났습니다. 이 주소로 보내면 수신자 쪽에서 정상 발신으로 인정됩니다.`
+        : `${domain} 인증이 아직 끝나지 않았습니다(현재 ${detailJson.status ?? match.status ?? "상태 없음"}). 이 상태로 보내면 상당수가 스팸함으로 갈 수 있습니다.`,
+      records,
+    };
+  } catch (err) {
+    return {
+      state: "조회 실패",
+      detail: `발송 서비스에 닿지 못했습니다 — ${err instanceof Error ? err.message : "알 수 없는 오류"}`,
+      records: [],
+    };
+  }
 }
 
 export async function processBatch(admin: SupabaseClient, batchId: string, origin?: string | null) {
@@ -149,6 +406,9 @@ export async function processBatch(admin: SupabaseClient, batchId: string, origi
   let failed = 0;
   let simulatedCount = 0;
   let total = 0;
+  /** 일일 상한을 넘겨 아예 보내지 않은 건수. 조용히 버리지 않고 배치에 남긴다. */
+  let held = 0;
+  let cap = 0;
   const simulate = isSimulationMode();
 
   try {
@@ -158,7 +418,17 @@ export async function processBatch(admin: SupabaseClient, batchId: string, origi
     const { data: settings } = await admin.from("survey_settings").select("company_id, deadline");
     const link = appUrl(origin);
 
+    // 하루 발송 상한. 연습 모드는 실제로 나가지 않으므로 상한을 쓰지 않는다.
+    const headroom = simulate ? null : await dailyHeadroom(admin);
+    cap = headroom?.cap ?? 0;
+    let remaining = headroom?.remaining ?? Number.POSITIVE_INFINITY;
+
     for (const p of targets) {
+      if (remaining <= 0) {
+        held += 1;
+        continue;
+      }
+
       const vars = buildMailVars({
         name: p.name,
         company: companies?.find((c) => c.id === p.company_id)?.name ?? "",
@@ -174,14 +444,19 @@ export async function processBatch(admin: SupabaseClient, batchId: string, origi
       let status: "성공" | "실패" | "시뮬레이션" = "시뮬레이션";
       let errorMessage: string | null = null;
       let providerId: string | null = null;
+      let retryCount = 0;
 
       if (!simulate) {
-        try {
-          providerId = await sendMail(p.email as string, subject, body, link);
-          status = "성공";
-        } catch (err) {
+        const result = await sendMailWithRetry(p.email as string, subject, body, link);
+        retryCount = result.retryCount;
+        if (result.error) {
           status = "실패";
-          errorMessage = err instanceof Error ? err.message : "알 수 없는 오류";
+          errorMessage = result.error;
+        } else {
+          status = "성공";
+          providerId = result.providerId;
+          // 상한은 실제로 나간 건만 차감한다(거절당한 요청은 수신자에게 닿지 않았다).
+          remaining -= 1;
         }
       }
 
@@ -200,7 +475,10 @@ export async function processBatch(admin: SupabaseClient, batchId: string, origi
         status,
         error_message: errorMessage,
         provider_id: providerId,
+        retry_count: retryCount,
       });
+
+      if (status === "성공") await clearBounceFlag(admin, p.id);
 
       if (status !== "실패" && template.kind === "invite") {
         await admin
@@ -241,10 +519,33 @@ export async function processBatch(admin: SupabaseClient, batchId: string, origi
       failed_count: failed,
       simulated: simulate,
       finished_at: new Date().toISOString(),
+      // 상한에 걸려 보내지 않은 건이 있으면 배치에 그 사실을 남긴다. mail_batches 에 전용 칸이
+      // 없어(구조 변경 없이) filters 에 함께 적고, 이력 화면이 이 값을 읽어 보여 준다.
+      ...(held > 0
+        ? { filters: { ...((batch.filters ?? {}) as object), heldByDailyCap: held, dailyCap: cap } }
+        : {}),
     })
     .eq("id", batchId);
 
-  return { total, sent, failed, simulated: simulate, simulatedCount };
+  if (held > 0) {
+    console.warn(`발송 상한(${cap}건) 초과로 ${held}건 보류 — 배치 ${batchId}`);
+  }
+
+  return { total, sent, failed, simulated: simulate, simulatedCount, held, cap };
+}
+
+/**
+ * 마지막 발송이 반송됐다는 표시를 지운다.
+ * 발송 서비스가 새 발송을 받아들였으면 "직전 발송이 되돌아왔다" 는 표시는 더 이상 사실이 아니다.
+ * 또 반송되면 반송 통지가 다시 들어와 표시가 되살아난다.
+ */
+async function clearBounceFlag(admin: SupabaseClient, participantId: string | null) {
+  if (!participantId) return;
+  await admin
+    .from("participants")
+    .update({ mail_bounced_at: null, mail_bounce_reason: null })
+    .eq("id", participantId)
+    .not("mail_bounced_at", "is", null);
 }
 
 /** 로그에 남은 본문 대신, 원 템플릿 + 현재 접속링크로 다시 렌더한다(옛 링크 재전송 방지). */
@@ -306,13 +607,23 @@ export async function resendLog(admin: SupabaseClient, logId: string, origin?: s
   let status: "성공" | "실패" | "시뮬레이션" = "시뮬레이션";
   let errorMessage: string | null = null;
   let providerId: string | null = null;
+  let retryCount = 0;
   if (!simulate) {
-    try {
-      providerId = await sendMail(toEmail, subject, body, appUrl(origin));
-      status = "성공";
-    } catch (err) {
+    // 재발송도 일일 상한을 지킨다. 넘겼으면 조용히 넘기지 않고 왜 못 보내는지 알린다.
+    const { cap, remaining } = await dailyHeadroom(admin);
+    if (remaining <= 0) {
+      throw new Error(
+        `오늘 보낼 수 있는 상한 ${cap}건을 이미 채웠습니다. 내일 다시 보내거나 운영 설정에서 상한을 올리세요.`,
+      );
+    }
+    const result = await sendMailWithRetry(toEmail, subject, body, appUrl(origin));
+    retryCount = result.retryCount;
+    if (result.error) {
       status = "실패";
-      errorMessage = err instanceof Error ? err.message : "알 수 없는 오류";
+      errorMessage = result.error;
+    } else {
+      status = "성공";
+      providerId = result.providerId;
     }
   }
   await admin.from("mail_logs").insert({
@@ -326,7 +637,9 @@ export async function resendLog(admin: SupabaseClient, logId: string, origin?: s
     status,
     error_message: errorMessage,
     provider_id: providerId,
+    retry_count: retryCount,
   });
+  if (status === "성공") await clearBounceFlag(admin, log.participant_id);
   return { status };
 }
 
