@@ -114,8 +114,9 @@ export const signInWithLock = createServerFn({ method: "POST" })
  * 구조면 적용값과 기록값이 갈라질 수 있다.
  *
  * ⚠ 평문 보관은 대외비 운영 전제의 의도된 선택이다. DB 유출 시 전 계정 비밀번호가 노출된다.
- * 계약: 성공 시 { ok: true }. 비밀번호 적용 실패는 throw. 명부에 연결된 행이 없는 계정
- * (명부 없이 만든 관리자)은 비밀번호만 바뀌고 rostered: false 로 알린다.
+ * 계약: 성공 시 { ok: true, rostered, session }. 비밀번호 적용 실패는 throw. 명부에 연결된 행이
+ * 없는 계정(명부 없이 만든 관리자)은 비밀번호만 바뀌고 rostered: false 로 알린다.
+ * session 은 새 비밀번호로 재발급한 토큰이며, 재발급이 안 되면 null — 호출부는 재로그인으로 보낸다.
  */
 export const changeMyPassword = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -133,10 +134,20 @@ export const changeMyPassword = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: user, error: userError } = await supabaseAdmin.auth.admin.getUserById(
+      context.userId,
+    );
+    const email = user?.user?.email;
+    if (userError || !email) throw new Error("계정 정보를 확인하지 못했습니다.");
+
     const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(context.userId, {
       password: data.password,
     });
     if (authError) throw new Error("비밀번호를 변경하지 못했습니다.");
+
+    // admin API 로 비밀번호를 바꾸면 GoTrue 가 기존 세션을 무효화한다 —
+    // 새 비밀번호로 즉시 재발급해 화면이 로그인으로 튕기지 않게 한다.
+    const session = await passwordGrant(email, data.password);
 
     const { data: rows, error } = await supabaseAdmin
       .from("participants")
@@ -145,7 +156,8 @@ export const changeMyPassword = createServerFn({ method: "POST" })
       .select("id");
     // 비밀번호는 이미 바뀐 상태다. 기록 실패를 성공으로 감추지 않되, 사용자에게는
     // '다시 시도'가 아니라 관리자 문의로 안내되도록 문구를 구분한다.
-    if (error) throw new Error("비밀번호는 변경됐지만 명부 기록에 실패했습니다. 관리자에게 알려 주세요.");
+    if (error)
+      throw new Error("비밀번호는 변경됐지만 명부 기록에 실패했습니다. 관리자에게 알려 주세요.");
 
-    return { ok: true, rostered: (rows?.length ?? 0) > 0 };
+    return { ok: true, rostered: (rows?.length ?? 0) > 0, session };
   });

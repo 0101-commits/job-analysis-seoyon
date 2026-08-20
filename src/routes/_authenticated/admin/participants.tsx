@@ -950,7 +950,11 @@ function RosterListTab() {
   const resetPassword = useMutation({
     mutationFn: async (participantId: string) =>
       resetParticipantPassword({ data: { participantId }, headers: await authHeaders() }),
-    onSuccess: (res) => toast.success(`초기 비밀번호를 ${res.password} 로 재설정했습니다.`),
+    onSuccess: (res) => {
+      toast.success(`초기 비밀번호를 ${res.password} 로 재설정했습니다.`);
+      // 목록의 비밀번호 열이 낡은 값을 계속 보여주지 않게 한다.
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+    },
     onError: (err) => toast.error(errorMessage(err)),
   });
 
