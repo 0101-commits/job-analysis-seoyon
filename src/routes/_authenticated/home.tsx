@@ -6,6 +6,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/StatusBadge";
 import { getLatestReject } from "@/lib/survey.data";
+import { decideMySuggestion } from "@/lib/ai.functions";
 import { InfoChangeBanner } from "@/components/survey/InfoChangeBanner";
 import {
   AiSuggestionCards,
@@ -96,24 +97,25 @@ function RespondentHome() {
     note?: string,
     editedValue?: string,
   ) {
-    // 응답자 직접 UPDATE 정책이 제거돼 SECURITY DEFINER RPC 로만 결정할 수 있다.
-    // types.ts 가 security_hardening 마이그레이션 이후 재생성되지 않아 캐스팅한다.
-    const rpc = supabase.rpc as unknown as (
-      fn: string,
-      args: Record<string, unknown>,
-    ) => Promise<{ error: { message: string } | null }>;
-    const { error } = await rpc("decide_suggestion", {
-      _id: id,
-      _decision: decision,
-      _note: note ?? null,
-      _edited: editedValue ?? null,
-    });
-    if (error) {
-      toast.error(error.message);
+    // 결정과 실제 반영을 서버 함수 하나가 같이 처리한다 — 수락·수정은 즉시 응답에 들어간다.
+    try {
+      const result = await decideMySuggestion({
+        data: {
+          suggestionId: id,
+          decision,
+          ...(note ? { note } : {}),
+          ...(editedValue ? { editedValue } : {}),
+        },
+      });
+      toast.success(
+        result.applied ? `${decision} 처리하고 응답에 반영했습니다.` : "거절 처리했습니다.",
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "처리에 실패했습니다.");
       return;
     }
-    toast.success(`${decision} 처리했습니다.`);
-    await queryClient.invalidateQueries({ queryKey: ["my-ai-suggestions"] });
+    // 반영분이 홈·조사 화면 모두에 즉시 보이도록 관련 쿼리를 통째로 다시 읽는다.
+    await queryClient.invalidateQueries();
   }
 
   const deadline = data?.companies?.survey_settings?.deadline ?? null;

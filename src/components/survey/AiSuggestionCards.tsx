@@ -1,20 +1,14 @@
 // 응답자에게 노출되는 AI 제안 검토 카드. 순수 컴포넌트 — 저장은 호출자가 담당한다.
 //
-// 응답자의 직접 UPDATE 는 RLS 로 막혀 있고, SECURITY DEFINER RPC 로만 결정할 수 있다.
-// (RPC 가 본인 응답의 status='요청중' 행인지 검증하고, '수정' 시 AI 원문을
-//  ai_suggested_value 로 보존한다.) 호출자 예시:
+// 응답자의 직접 UPDATE 는 RLS 로 막혀 있다. 결정은 서버 함수 decideMySuggestion 이 처리하며,
+// 소유 검증 → 수락·수정이면 실제 응답 레코드에 반영 → status='확정' 까지 한 번에 간다
+// ('수정' 시 AI 원문은 ai_suggested_value 로 보존). 거절은 값을 건드리지 않는다. 호출자 예시:
 //
 //   async function handleDecide(id, decision, note, editedValue) {
-//     const { error } = await supabase.rpc("decide_suggestion", {
-//       _id: id,
-//       _decision: decision, // '수락' | '수정' | '거절'
-//       _note: note ?? null,
-//       _edited: editedValue ?? null, // '수정' 이면 필수
-//     });
-//     if (error) toast.error(error.message);
+//     await decideMySuggestion({ data: { suggestionId: id, decision, note, editedValue } });
 //   }
 //
-// 최종 반영(status='확정')은 관리자가 applySuggestion 으로 처리한다.
+// 관리자 직접 반영 경로(route A, status='제안')는 applySuggestion 이 같은 반영 로직을 쓴다.
 import { useState } from "react";
 import { Check, Pencil, Sparkles, X } from "lucide-react";
 

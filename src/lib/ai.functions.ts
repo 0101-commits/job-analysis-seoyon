@@ -643,7 +643,7 @@ export const applySuggestion = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => z.object({ suggestionId: uuid }).parse(input))
   .handler(async ({ data, context }) => {
-    const { requireAdmin, writeAudit, touchResponse } = await import("@/lib/guard.server");
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -658,59 +658,7 @@ export const applySuggestion = createServerFn({ method: "POST" })
       throw new Error(`반영할 수 없는 상태입니다: ${s.status}`);
     }
 
-    const [table, id, field] = s.target.split(":");
-    if (!table) throw new Error(`알 수 없는 반영 대상입니다: ${s.target}`);
-
-    if (table === "response_skills" && id === "new") {
-      // 신규 스킬 제안의 suggested_value 는 구조화 JSON 이다. 응답자 '수정'이 사람이 읽는
-      // 문자열로 덮어쓰면 파싱이 깨지므로, 실패 시 크래시 대신 명확한 사유를 던진다.
-      let draft: {
-        name: string;
-        ksao: string | null;
-        hard_soft: string | null;
-        description: string | null;
-      };
-      try {
-        draft = JSON.parse(s.suggested_value);
-      } catch {
-        throw new Error(
-          "이 스킬 제안은 자유 편집으로 수정할 수 없습니다. 수락 또는 거절만 선택하거나, 관리자가 직접 스킬을 추가하세요.",
-        );
-      }
-      // 관리자(또는 응답자 검토)를 거쳐 반영된 값이므로 초안 표시를 달지 않는다 —
-      // ai_draft 가 남으면 approveResponse 승인 게이트가 계속 막힌다.
-      const { error } = await supabaseAdmin.from("response_skills").insert({
-        response_id: s.response_id,
-        name: draft.name,
-        ksao: draft.ksao,
-        hard_soft: draft.hard_soft,
-        description: draft.description,
-        ai_draft: false,
-      });
-      if (error) throw new Error(error.message);
-    } else if (!id || !field || !APPLY_FIELDS[table]?.includes(field)) {
-      throw new Error(`반영이 허용되지 않은 필드입니다: ${s.target}`);
-    } else if (table === "response_requirements") {
-      // 1:1 테이블이므로 id 자리에 들어온 response_id 로 upsert 한다.
-      const row = { response_id: id, [field]: s.suggested_value, ai_draft: false };
-      const { error } = await supabaseAdmin
-        .from("response_requirements")
-        .upsert(row as never, { onConflict: "response_id" });
-      if (error) throw new Error(error.message);
-    } else {
-      // 필드명이 런타임 값이라 제네릭 추론이 안 된다. 화이트리스트로 이미 검증했다.
-      const patch: Record<string, unknown> = { [field]: s.suggested_value };
-      if (table === "response_skills") patch["ai_draft"] = false;
-      const { error } = await supabaseAdmin
-        .from(table as "responses")
-        .update(patch as never)
-        .eq("id", id);
-      if (error) throw new Error(error.message);
-    }
-
-    // 자식 테이블 반영은 responses.updated_at 트리거를 안 태운다. 부모를 밀어야
-    // 참여자의 다음 저장(save_*_tx 낙관적 락)이 이 반영과의 충돌을 감지한다.
-    if (table !== "responses") await touchResponse(supabaseAdmin, s.response_id);
+    await writeSuggestionValue(supabaseAdmin, s);
 
     const { error: markError } = await supabaseAdmin
       .from("ai_suggestions")
@@ -725,6 +673,152 @@ export const applySuggestion = createServerFn({ method: "POST" })
       target_id: s.id,
       detail: { target: s.target },
     });
+
+    return { applied: true, target: s.target };
+  });
+
+/**
+ * 제안 값을 실제 응답 레코드에 쓴다. 관리자 반영(applySuggestion)과 응답자 수락
+ * (decideMySuggestion)이 같은 경로를 쓰도록 분리했다 — 한쪽만 고쳐 반영 규칙이
+ * 갈라지는 일을 막는다. 권한 검사는 호출자 책임이다.
+ */
+async function writeSuggestionValue(
+  admin: Admin,
+  s: { id: string; response_id: string; target: string; suggested_value: string },
+) {
+  const [table, id, field] = s.target.split(":");
+  if (!table) throw new Error(`알 수 없는 반영 대상입니다: ${s.target}`);
+
+  if (table === "response_skills" && id === "new") {
+    // 신규 스킬 제안의 suggested_value 는 구조화 JSON 이다. 응답자 '수정'이 사람이 읽는
+    // 문자열로 덮어쓰면 파싱이 깨지므로, 실패 시 크래시 대신 명확한 사유를 던진다.
+    let draft: {
+      name: string;
+      ksao: string | null;
+      hard_soft: string | null;
+      description: string | null;
+    };
+    try {
+      draft = JSON.parse(s.suggested_value);
+    } catch {
+      throw new Error(
+        "이 스킬 제안은 자유 편집으로 수정할 수 없습니다. 수락 또는 거절만 선택하거나, 관리자가 직접 스킬을 추가하세요.",
+      );
+    }
+    // 관리자(또는 응답자 검토)를 거쳐 반영된 값이므로 초안 표시를 달지 않는다 —
+    // ai_draft 가 남으면 approveResponse 승인 게이트가 계속 막힌다.
+    const { error } = await admin.from("response_skills").insert({
+      response_id: s.response_id,
+      name: draft.name,
+      ksao: draft.ksao,
+      hard_soft: draft.hard_soft,
+      description: draft.description,
+      ai_draft: false,
+    });
+    if (error) throw new Error(error.message);
+  } else if (!id || !field || !APPLY_FIELDS[table]?.includes(field)) {
+    throw new Error(`반영이 허용되지 않은 필드입니다: ${s.target}`);
+  } else if (table === "response_requirements") {
+    // 1:1 테이블이므로 id 자리에 들어온 response_id 로 upsert 한다.
+    const row = { response_id: id, [field]: s.suggested_value, ai_draft: false };
+    const { error } = await admin
+      .from("response_requirements")
+      .upsert(row as never, { onConflict: "response_id" });
+    if (error) throw new Error(error.message);
+  } else {
+    // 필드명이 런타임 값이라 제네릭 추론이 안 된다. 화이트리스트로 이미 검증했다.
+    const patch: Record<string, unknown> = { [field]: s.suggested_value };
+    if (table === "response_skills") patch["ai_draft"] = false;
+    const { error } = await admin
+      .from(table as "responses")
+      .update(patch as never)
+      .eq("id", id);
+    if (error) throw new Error(error.message);
+  }
+
+  // 자식 테이블 반영은 responses.updated_at 트리거를 안 태운다. 부모를 밀어야
+  // 참여자의 다음 저장(save_*_tx 낙관적 락)이 이 반영과의 충돌을 감지한다.
+  if (table !== "responses") {
+    const { touchResponse } = await import("@/lib/guard.server");
+    await touchResponse(admin, s.response_id);
+  }
+}
+
+/**
+ * 응답자가 자기 응답의 AI 제안을 결정한다. 수락·수정은 그 자리에서 실제 응답에 반영한다
+ * (예전에는 상태만 바꿔 관리자가 다시 반영해야 했고, 그 사이 응답자 화면에는 아무 변화가
+ *  없어 '수락했는데 반영이 안 된다'로 보였다).
+ * 거절은 값을 건드리지 않고 사유만 남긴다.
+ */
+export const decideMySuggestion = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        suggestionId: uuid,
+        decision: z.enum(["수락", "수정", "거절"]),
+        note: z.string().trim().max(2000).optional(),
+        editedValue: z.string().trim().max(4000).optional(),
+      })
+      .refine((v) => v.decision !== "수정" || !!v.editedValue, {
+        message: "수정 결정에는 수정한 내용이 필요합니다.",
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: s, error: loadError } = await supabaseAdmin
+      .from("ai_suggestions")
+      .select(
+        "id, response_id, target, suggested_value, ai_suggested_value, status, responses(participant_id, participants(user_id))",
+      )
+      .eq("id", data.suggestionId)
+      .maybeSingle();
+    if (loadError) throw new Error(loadError.message);
+    if (!s) throw new Error("제안을 찾을 수 없습니다.");
+
+    // 본인 응답의 제안만 결정할 수 있다. RLS 를 우회하는 service_role 이므로 여기서 직접 본다.
+    const owner = (s.responses as { participants?: { user_id: string | null } | null } | null)
+      ?.participants?.user_id;
+    if (!owner || owner !== context.userId) throw new Error("결정할 수 없는 제안입니다.");
+    if (s.status !== "요청중") throw new Error(`이미 처리된 제안입니다: ${s.status}`);
+
+    const now = new Date().toISOString();
+
+    if (data.decision === "거절") {
+      const { error } = await supabaseAdmin
+        .from("ai_suggestions")
+        .update({
+          status: "거절",
+          respondent_note: data.note ?? null,
+          decided_by: context.userId,
+          decided_at: now,
+        })
+        .eq("id", s.id);
+      if (error) throw new Error(error.message);
+      return { applied: false, target: s.target };
+    }
+
+    // 수정이면 응답자가 고친 값을 반영하고, AI 원문은 ai_suggested_value 에 보존한다.
+    const value = data.decision === "수정" ? data.editedValue!.trim() : s.suggested_value;
+    await writeSuggestionValue(supabaseAdmin, { ...s, suggested_value: value });
+
+    const { error } = await supabaseAdmin
+      .from("ai_suggestions")
+      .update({
+        status: "확정",
+        suggested_value: value,
+        ai_suggested_value:
+          data.decision === "수정"
+            ? (s.ai_suggested_value ?? s.suggested_value)
+            : s.ai_suggested_value,
+        respondent_note: data.note ?? null,
+        decided_by: context.userId,
+        decided_at: now,
+      })
+      .eq("id", s.id);
+    if (error) throw new Error(error.message);
 
     return { applied: true, target: s.target };
   });
