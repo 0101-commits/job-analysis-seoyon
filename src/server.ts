@@ -58,6 +58,17 @@ function readEnv(name: string) {
   return fromProcess?.trim() ? fromProcess : undefined;
 }
 
+/**
+ * 토큰 비교. 길이가 같을 때 앞에서 몇 자가 맞았는지가 응답 시간에 드러나지 않게
+ * 전부 훑어서 비교한다(공개 주소라 반복 시도를 막는 값이 곧 이 토큰뿐이다).
+ */
+function sameToken(a: string, b: string) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -74,8 +85,9 @@ function json(body: unknown, status = 200) {
  */
 async function handleCronRequest(request: Request, url: URL) {
   const expected = readEnv("CRON_TOKEN");
-  const provided = request.headers.get("x-cron-token") ?? url.searchParams.get("token");
-  if (!expected || !provided || provided !== expected) {
+  // 토큰은 머리값으로만 받는다 — 쿼리스트링에 실으면 접속 기록에 그대로 남는다.
+  const provided = request.headers.get("x-cron-token");
+  if (!expected || !provided || !sameToken(provided, expected)) {
     return json({ error: "정기 실행 권한이 없습니다." }, 401);
   }
 

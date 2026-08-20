@@ -65,10 +65,12 @@ function bytesToBase64(bytes: ArrayBuffer) {
 async function verifySignature(request: Request, rawBody: string) {
   const secret = envValue("RESEND_WEBHOOK_SECRET");
   if (!secret) {
+    // 비밀키가 없으면 받지 않는다. 확인 없이 처리하면 아무나 이 주소로 가짜 통지를 보내
+    // 재직자를 「메일 반송」으로 표시할 수 있다. 발송을 켤 때 비밀키를 함께 넣는다.
     console.warn(
-      "발송 실패 통지: 확인용 비밀키(RESEND_WEBHOOK_SECRET)가 없어 서명을 확인하지 않고 처리했습니다.",
+      "발송 실패 통지 거부: 확인용 비밀키(RESEND_WEBHOOK_SECRET)가 없습니다. 통지를 처리하지 않았습니다.",
     );
-    return { ok: true, verified: false, reason: "확인용 비밀키 미설정" };
+    return { ok: false, verified: false, reason: "확인용 비밀키가 설정되지 않았습니다" };
   }
 
   const id = request.headers.get("svix-id");
