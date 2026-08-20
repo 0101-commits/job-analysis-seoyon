@@ -43,7 +43,7 @@ import {
 export const Route = createFileRoute("/_authenticated/admin/settings")({
   head: () => ({
     meta: [
-      { title: "설정 | 서연 그룹 업무조사" },
+      { title: "조사 설정 | 서연 그룹 업무조사" },
       { name: "description", content: "조사 기간, 권한 등 시스템 설정을 관리합니다." },
       { property: "og:title", content: "설정 | 서연 그룹 업무조사" },
       { property: "og:description", content: "조사 기간, 권한 등 시스템 설정을 관리합니다." },
@@ -640,7 +640,7 @@ function SettingsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-bold sm:text-2xl">설정</h1>
+        <h1 className="text-xl font-bold sm:text-2xl">조사 설정</h1>
         <p className="mt-1 text-sm text-muted-foreground">
           화면이 무엇을 '늦었다'·'모자라다'로 볼지, 초기 비밀번호와 계열사별 마감을 어떻게 둘지
           여기에서 정합니다. 여기 있는 값은 모두 운영 중에 바꿀 수 있습니다.

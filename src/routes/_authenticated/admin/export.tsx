@@ -44,7 +44,7 @@ import {
 export const Route = createFileRoute("/_authenticated/admin/export")({
   head: () => ({
     meta: [
-      { title: "내보내기 | 서연 그룹 업무조사" },
+      { title: "직무기술서·내보내기 | 서연 그룹 업무조사" },
       { name: "description", content: "조사 결과를 엑셀 등 파일로 내려받습니다." },
       { property: "og:title", content: "내보내기 | 서연 그룹 업무조사" },
       { property: "og:description", content: "조사 결과를 엑셀 등 파일로 내려받습니다." },
@@ -473,7 +473,7 @@ function ExportPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-bold sm:text-2xl">내보내기</h1>
+        <h1 className="text-xl font-bold sm:text-2xl">직무기술서·내보내기</h1>
         <p className="mt-1 text-sm text-muted-foreground">
           직무별 초안을 화면에서 확인한 뒤 표준 직무기술서 양식(엑셀)으로 내려받고, 전체 데이터를
           보관합니다.

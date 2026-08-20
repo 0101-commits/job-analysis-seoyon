@@ -101,6 +101,32 @@ export const FIELD_DEFINITIONS: Record<string, string> = {
   역할단계: "조직 안에서 맡는 역할의 단계입니다. 직급과 별개로 실제 수행 범위를 나타냅니다.",
 };
 
+/**
+ * 앞 낱말의 받침에 맞는 조사를 고른다.
+ *
+ * 항목 이름을 문장에 끼워 넣는 문구가 많은데("「마감일 설정」이 아직"), 이름이 데이터에서
+ * 오므로 조사를 고정하면 "「메일 실발송 모드」이"처럼 틀린 말이 나온다.
+ *
+ *   josa("마감일 설정", "이/가") → "이"
+ *   josa("메일 실발송 모드", "이/가") → "가"
+ */
+export function josa(word: string, pair: "이/가" | "을/를" | "은/는" | "과/와" | "으로/로") {
+  const [withBatchim, withoutBatchim] = pair.split("/") as [string, string];
+  const last = word.trim().slice(-1);
+  const code = last.charCodeAt(0);
+  // 한글 음절이 아니면(숫자·영문·기호) 받침 없는 쪽을 쓴다 — 읽을 때 더 자연스럽다.
+  if (Number.isNaN(code) || code < 0xac00 || code > 0xd7a3) return withoutBatchim;
+  const batchim = (code - 0xac00) % 28;
+  // '로/으로'는 ㄹ 받침도 받침 없는 쪽을 따른다.
+  if (pair === "으로/로" && batchim === 8) return withoutBatchim;
+  return batchim === 0 ? withoutBatchim : withBatchim;
+}
+
+/** 이름과 조사를 붙여 돌려준다. `withJosa("마감일 설정", "이/가")` → "마감일 설정이" */
+export function withJosa(word: string, pair: Parameters<typeof josa>[1]) {
+  return `${word}${josa(word, pair)}`;
+}
+
 /** 자주 쓰는 안내 문구 — 같은 상황에 같은 말을 쓰기 위해 모아 둔다. */
 export const COPY = {
   saveOk: "저장했습니다",

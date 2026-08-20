@@ -62,6 +62,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { StatusBadge } from "@/components/StatusBadge";
+import { josa } from "@/lib/glossary";
 import { EmptyState } from "@/components/EmptyState";
 import {
   OrgTreeFilter,
@@ -162,7 +163,7 @@ export const Route = createFileRoute("/_authenticated/admin/participants")({
   },
   head: () => ({
     meta: [
-      { title: "참여자 관리 | 서연 그룹 업무조사" },
+      { title: "참여자 명부 | 서연 그룹 업무조사" },
       { name: "description", content: "계열사별 참여자 명단과 계정 상태를 관리합니다." },
       { property: "og:title", content: "참여자 관리 | 서연 그룹 업무조사" },
       { property: "og:description", content: "계열사별 참여자 명단과 계정 상태를 관리합니다." },
@@ -737,7 +738,7 @@ function ParticipantFormDialog({
       toast.success(
         participant
           ? `${form.name.trim()} 정보를 수정했습니다.`
-          : `${form.name.trim()}을 명부에 등록했습니다. 목록에서 선택해 계정을 생성하세요.`,
+          : `${form.name.trim()}${josa(form.name.trim(), "을/를")} 명부에 등록했습니다. 목록에서 선택해 계정을 생성하세요.`,
       );
       onOpenChange(false);
       void queryClient.invalidateQueries({ queryKey: ["participants"] });
@@ -2188,7 +2189,7 @@ function ParticipantsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-bold sm:text-2xl">참여자 관리</h1>
+        <h1 className="text-xl font-bold sm:text-2xl">참여자 명부</h1>
         <p className="mt-1 text-sm text-muted-foreground">
           참여자를 등록·수정·보관하고, 계정을 일괄 생성합니다.
         </p>

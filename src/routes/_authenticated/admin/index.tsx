@@ -5,6 +5,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { StatusBadge, STATUS_ORDER } from "@/components/StatusBadge";
+import { josa } from "@/lib/glossary";
 import { SignalCard, type SignalAction, type SignalTone } from "@/components/SignalCard";
 import { EmptyState } from "@/components/EmptyState";
 import { SectionNav, CollapsibleSection } from "@/components/SectionNav";
@@ -28,7 +29,7 @@ import {
 export const Route = createFileRoute("/_authenticated/admin/")({
   head: () => ({
     meta: [
-      { title: "대시보드 | 서연 그룹 업무조사" },
+      { title: "진행 현황 | 서연 그룹 업무조사" },
       { name: "description", content: "소속별 조사 진행 현황을 한눈에 확인합니다." },
       { property: "og:title", content: "대시보드 | 서연 그룹 업무조사" },
       { property: "og:description", content: "소속별 조사 진행 현황을 한눈에 확인합니다." },
@@ -399,7 +400,7 @@ function DashboardPage() {
   if (error) {
     return (
       <div className="space-y-6">
-        <h1 className="text-xl font-bold sm:text-2xl">대시보드</h1>
+        <h1 className="text-xl font-bold sm:text-2xl">진행 현황</h1>
         <EmptyState
           kind="blocked"
           title="현황을 불러오지 못했습니다"
@@ -530,7 +531,7 @@ function DashboardPage() {
                             <SignalCard
                               key={`readiness-${item.key}`}
                               tone="attention"
-                              signal={`개시 준비 항목 「${item.label}」이 아직 충족되지 않았습니다`}
+                              signal={`개시 준비 항목 「${item.label}」${josa(item.label, "이/가")} 아직 충족되지 않았습니다`}
                               evidence={[
                                 item.hint ?? "이 항목을 채우지 않으면 진행 중 문제가 생길 수 있습니다.",
                                 `조사는 이미 시작되었습니다(안내를 받은 참여자 ${total - funnel[0]!.count}명).`,
@@ -884,7 +885,7 @@ function buildSignalCards(args: {
     cards.push({
       key: "review-backlog",
       tone: "attention",
-      signal: `제출 후 ${thresholdLabel}이 지나도록 검토되지 않은 응답이 ${scoped.backlog.length}건입니다`,
+      signal: `제출 후 ${thresholdLabel}${josa(thresholdLabel, "이/가")} 지나도록 검토되지 않은 응답이 ${scoped.backlog.length}건입니다`,
       evidence: [
         args.reviewTurnaroundDays === null
           ? "아직 검토를 마친 응답이 없어 비교할 평균이 없습니다."

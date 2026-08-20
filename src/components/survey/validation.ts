@@ -1,5 +1,6 @@
 // 조사 마법사 ④⑤단계 검증 유틸. 코어(위저드)가 단계 이동 게이트에 사용하고,
 // TaskGrid 는 similarity/findSimilarPairs 를 중복 경고 배지에 재사용한다.
+import { josa } from "@/lib/glossary";
 import type { RequirementsValue, SkillItem, TaskItem, TaskValidation } from "./types";
 
 export const SIMILARITY_THRESHOLD = 0.8;
@@ -304,7 +305,7 @@ export function validateSkills(skills: SkillItem[]): TaskValidation {
       errors.push(`${name}의 구분(지식/기술/태도)을 골라 주세요`);
     }
     if (skill.description.trim() === "") {
-      errors.push(`${name}이 어떤 상황에서 쓰이는 능력인지 한 줄 설명을 적어 주세요`);
+      errors.push(`${name}${josa(name, "이/가")} 어떤 상황에서 쓰이는 능력인지 한 줄 설명을 적어 주세요`);
     }
   });
 

@@ -134,7 +134,7 @@ export const Route = createFileRoute("/_authenticated/admin/master")({
   },
   head: () => ({
     meta: [
-      { title: "마스터 관리 | 서연 그룹 업무조사" },
+      { title: "조직·직무 기준정보 | 서연 그룹 업무조사" },
       { name: "description", content: "직무·조직·등급 등 기준 정보를 관리합니다." },
       { property: "og:title", content: "마스터 관리 | 서연 그룹 업무조사" },
       { property: "og:description", content: "직무·조직·등급 등 기준 정보를 관리합니다." },
@@ -2979,7 +2979,7 @@ function MasterPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-bold sm:text-2xl">마스터 관리</h1>
+        <h1 className="text-xl font-bold sm:text-2xl">조직·직무 기준정보</h1>
         <p className="mt-1 text-sm text-muted-foreground">
           조직도·직무분류·업무분장표를 업로드하고 기준 정보를 관리합니다.
         </p>
