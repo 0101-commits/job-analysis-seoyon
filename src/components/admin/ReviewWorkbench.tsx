@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -6,9 +6,11 @@ import {
   ChevronLeft,
   ChevronRight,
   Columns3,
+  History,
   Keyboard,
   Pencil,
   Search,
+  Sparkles,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -30,11 +32,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { StatusBadge } from "@/components/StatusBadge";
 import { EmptyState } from "@/components/EmptyState";
 import { SignalCard } from "@/components/SignalCard";
-import { CollapsibleSection } from "@/components/SectionNav";
 import { FieldHint } from "@/components/FieldHint";
+import { ActionBar, DocPane, DocWide, ToolLayer } from "@/components/admin/panes";
+import type { ActionGate } from "@/components/admin/panes";
 import { AiInspector } from "@/components/admin/AiInspector";
 import { QualityBadge } from "@/components/admin/QualityBadge";
 import { cn } from "@/lib/utils";
@@ -62,6 +66,8 @@ import {
 
 export type QueueRow = Awaited<ReturnType<typeof listReviewQueue>>["rows"][number];
 export type CenterView = "detail" | "diff" | "job";
+/** 판단 화면을 덮는 도구 층. null 이면 층이 닫힌 상태다. */
+export type ToolKey = "ai" | "history" | null;
 
 type CorrectTable =
   | "responses"
@@ -79,6 +85,18 @@ type PickedField = {
   value: string;
   multiline: boolean;
 };
+
+/**
+ * 정정 연결 — 원문에서 누른 자리에 정정 입력을 띄운다.
+ *
+ * 예전에는 원문(가운데)에서 누르고 우측 패널에서 고쳤다. 시선이 매번 좌우로 600px 왕복했다.
+ * 컨텍스트로 넘기면 원문 부품(Correctable)의 호출부를 스무 곳 고치지 않고도 그 자리에서 고칠 수 있다.
+ */
+const CorrectionCtx = createContext<{
+  responseId: string;
+  picked: PickedField | null;
+  close: () => void;
+} | null>(null);
 
 const STATUS_LABELS: Record<string, string> = {
   draft: "작성중",
@@ -331,6 +349,8 @@ export function ReviewWorkbench({
   companyId,
   sort,
   onSortChange,
+  tool,
+  onToolChange,
 }: {
   rows: QueueRow[];
   isLoading: boolean;
@@ -348,6 +368,8 @@ export function ReviewWorkbench({
   companyId: string | null;
   sort: string;
   onSortChange: (v: string) => void;
+  tool: ToolKey;
+  onToolChange: (v: ToolKey) => void;
 }) {
   const index = selectedId ? rows.findIndex((r) => r.id === selectedId) : -1;
   const prevId = index > 0 ? (rows[index - 1]?.id ?? null) : null;
@@ -374,79 +396,70 @@ export function ReviewWorkbench({
     return () => window.removeEventListener("keydown", onKey);
   }, [nextId, prevId, onSelect]);
 
-  return (
-    <div className="lg:grid lg:items-start lg:gap-4 lg:[grid-template-columns:minmax(240px,280px)_minmax(0,1fr)_minmax(320px,380px)]">
-      <QueuePanel
-        rows={rows}
-        isLoading={isLoading}
-        selectedId={selectedId}
-        onSelect={onSelect}
-        status={status}
-        onStatusChange={onStatusChange}
-        query={query}
-        onQueryChange={onQueryChange}
-        sort={sort}
-        onSortChange={onSortChange}
-        className={cn(selectedId && "hidden lg:block")}
+  // 판단 상태에서는 목록이 화면에서 빠진다. 훑기와 판단을 나란히 두면 둘 다 좁아진다.
+  if (selectedId) {
+    return (
+      <ResponseWorkspace
+        key={selectedId}
+        responseId={selectedId}
+        onClose={() => onSelect(null)}
+        prevId={prevId}
+        nextId={nextId}
+        onNavigate={onSelect}
+        view={view}
+        onViewChange={onViewChange}
+        compareJob={compareJob}
+        onCompareJobChange={onCompareJobChange}
+        jobNames={jobNames}
+        companyId={companyId}
+        tool={tool}
+        onToolChange={onToolChange}
+        {...(index >= 0 ? { position: { index, total: rows.length } } : {})}
       />
+    );
+  }
 
-      {selectedId ? (
-        <ResponseWorkspace
-          key={selectedId}
-          responseId={selectedId}
-          onClose={() => onSelect(null)}
-          prevId={prevId}
-          nextId={nextId}
-          onNavigate={onSelect}
-          view={view}
-          onViewChange={onViewChange}
-          compareJob={compareJob}
-          onCompareJobChange={onCompareJobChange}
+  // 같은 직무 나란히 보기는 넓이가 실제로 필요한 블록이라 읽기 폭 상한을 벗어난다.
+  if (view === "job") {
+    return (
+      <DocWide>
+        <JobComparison
           jobNames={jobNames}
           companyId={companyId}
+          job={compareJob}
+          onJobChange={onCompareJobChange}
+          onBack={() => onViewChange("detail")}
         />
-      ) : view === "job" ? (
-        <div className="mt-4 min-w-0 lg:col-span-2 lg:mt-0">
-          <JobComparison
-            jobNames={jobNames}
-            companyId={companyId}
-            job={compareJob}
-            onJobChange={onCompareJobChange}
-            onBack={() => onViewChange("detail")}
-          />
-        </div>
-      ) : (
-        <div className="mt-4 lg:col-span-2 lg:mt-0">
-          <EmptyState
-            kind="nothing"
-            title="판단할 응답을 고르세요"
-            description={
-              rows.length > 0
-                ? `왼쪽 목록에서 응답을 누르면 원문과 판단 패널이 함께 열립니다. 목록에서 J·K 키로 다음·이전 건으로 이동할 수 있습니다. 현재 ${rows.length}건.`
-                : "조건에 맞는 응답이 없습니다. 상태 필터를 바꾸거나 직무명 검색어를 지워 보세요."
-            }
-            {...(rows[0]
-              ? { actionLabel: "첫 번째 응답 열기", onAction: () => onSelect(rows[0]!.id) }
-              : {})}
-          >
-            {jobNames.length > 0 && (
-              <Button variant="outline" size="sm" onClick={() => onViewChange("job")}>
-                <Columns3 className="size-4" /> 직무별로 나란히 보기
-              </Button>
-            )}
-          </EmptyState>
-        </div>
-      )}
-    </div>
+      </DocWide>
+    );
+  }
+
+  return (
+    <QueueTable
+      rows={rows}
+      isLoading={isLoading}
+      onSelect={onSelect}
+      status={status}
+      onStatusChange={onStatusChange}
+      query={query}
+      onQueryChange={onQueryChange}
+      sort={sort}
+      onSortChange={onSortChange}
+      {...(jobNames.length > 0 ? { onCompareJobs: () => onViewChange("job") } : {})}
+    />
   );
 }
 
-/* ── 좌: 검토 대기 목록 ─────────────────────────────────────── */
+/* ── 훑기 — 전폭 표 ────────────────────────────────────────── */
 
-function QueuePanel({
+/**
+ * 목록은 스캔 작업이다. 카드(건당 110px)로는 한 화면에 6~8건뿐이라 훑을 수 없었다.
+ * 행 높이 --row-h 표로 바꿔 18~22건이 한 번에 들어오게 한다. 등급은 좌측 스트라이프와
+ * 배지로 두 번 부호화해 색만으로 구분하지 않는다.
+ */
+function QueueTable({
   rows,
   isLoading,
-  selectedId,
   onSelect,
   status,
   onStatusChange,
@@ -454,11 +467,10 @@ function QueuePanel({
   onQueryChange,
   sort,
   onSortChange,
-  className,
+  onCompareJobs,
 }: {
   rows: QueueRow[];
   isLoading: boolean;
-  selectedId: string | null;
   onSelect: (id: string) => void;
   status: string;
   onStatusChange: (v: string) => void;
@@ -466,7 +478,7 @@ function QueuePanel({
   onQueryChange: (v: string) => void;
   sort: string;
   onSortChange: (v: string) => void;
-  className?: string;
+  onCompareJobs?: () => void;
 }) {
   // 검토 적체 — 지금 목록 안 미검토 건의 평균 대기일 (V15-4)
   const waits = rows
@@ -477,11 +489,15 @@ function QueuePanel({
       ? Math.round((waits.reduce((a, b) => a + b, 0) / waits.length) * 10) / 10
       : null;
 
+  const cols =
+    "grid-cols-[3px_minmax(0,2.4fr)_minmax(0,1.6fr)_104px_104px_92px] lg:grid-cols-[3px_minmax(0,2.4fr)_minmax(0,1.6fr)_104px_104px_92px_112px]";
+
   return (
-    <div className={cn("space-y-3 lg:sticky lg:top-4", className)}>
-      <div className="space-y-2 rounded-xl border bg-card p-3 shadow-sm">
+    <div className="space-y-3">
+      {/* 렌즈 바 — 좌측 필터 열을 없애고 한 줄로 올린다. 값은 전부 URL 에 남는다. */}
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-card p-3">
         <Select value={status} onValueChange={onStatusChange}>
-          <SelectTrigger aria-label="상태 필터">
+          <SelectTrigger className="w-[130px]" aria-label="상태 필터">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -493,7 +509,7 @@ function QueuePanel({
           </SelectContent>
         </Select>
         <Select value={sort} onValueChange={onSortChange}>
-          <SelectTrigger aria-label="목록 정렬">
+          <SelectTrigger className="w-[190px]" aria-label="목록 정렬">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -501,7 +517,7 @@ function QueuePanel({
             <SelectItem value="submitted">제출 순 (최근 먼저)</SelectItem>
           </SelectContent>
         </Select>
-        <div className="relative">
+        <div className="relative min-w-[200px] flex-1">
           <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={query}
@@ -511,81 +527,108 @@ function QueuePanel({
             className="pl-9"
           />
         </div>
-        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <Keyboard className="size-3.5 shrink-0" aria-hidden />J 다음 · K 이전 건
-        </p>
         {avgWait !== null && (
-          <p className="text-xs text-muted-foreground">
+          <p className="text-xs tabular-nums text-muted-foreground">
             미검토 {waits.length}건 · 제출 후 평균 {avgWait}일 대기
           </p>
         )}
+        {onCompareJobs ? (
+          <Button variant="outline" size="sm" onClick={onCompareJobs}>
+            <Columns3 className="size-4" /> 직무별로 나란히 보기
+          </Button>
+        ) : null}
       </div>
 
       {isLoading ? (
         <p className="text-sm text-muted-foreground">불러오는 중...</p>
       ) : rows.length === 0 ? (
-        <p className="rounded-xl border border-dashed bg-card p-6 text-center text-sm text-muted-foreground">
-          조건에 맞는 응답이 없습니다.
-        </p>
+        <EmptyState
+          kind="nothing"
+          title="조건에 맞는 응답이 없습니다"
+          description="상태 필터를 바꾸거나 직무명 검색어를 지워 보세요."
+        />
       ) : (
-        <ul className="space-y-2 lg:max-h-[calc(100vh-15rem)] lg:overflow-y-auto lg:pr-1">
-          {rows.map((r) => {
-            const late =
-              r.status === "submitted" && r.submitted_at ? daysSince(r.submitted_at) : null;
-            return (
-              <li key={r.id}>
-                <button
-                  type="button"
-                  onClick={() => onSelect(r.id)}
-                  aria-current={selectedId === r.id}
-                  className={cn(
-                    "w-full rounded-xl border bg-card p-3 text-left shadow-sm transition-colors hover:border-primary",
-                    selectedId === r.id && "border-primary ring-1 ring-primary",
-                  )}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="min-w-0 truncate text-sm font-semibold">
-                      {r.participants?.name ?? "-"}
-                      <span className="ml-1.5 text-xs font-normal text-muted-foreground">
-                        {r.participants?.role_level ?? "-"}
-                      </span>
-                    </p>
-                    <StatusBadge status={STATUS_LABELS[r.status] ?? r.status} />
-                  </div>
-                  <p className="mt-1 truncate text-xs text-muted-foreground">
-                    {r.companies?.name} · {r.participants?.org_text ?? "소속 미지정"}
-                  </p>
-                  <p className="mt-1.5 truncate text-sm font-medium">
-                    {r.job_name ?? "직무 미입력"}
-                  </p>
-                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                    <QualityBadge score={r.quality_score} />
-                    <JobCountBadge count={r.jobCount} />
-                    {late !== null && (
-                      <span
-                        className={cn(
-                          "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold",
-                          late > 5
-                            ? "bg-warning/15 text-warning"
-                            : "bg-secondary text-muted-foreground",
-                        )}
-                      >
-                        제출 후 {late}일
-                      </span>
+        <div className="overflow-hidden rounded-xl border bg-card">
+          <div
+            className={cn(
+              "grid items-center gap-3 border-b bg-secondary px-4 py-2 text-[11px] font-semibold text-muted-foreground",
+              cols,
+            )}
+          >
+            <span />
+            <span>직무 · 성명</span>
+            <span>소속</span>
+            <span>등급</span>
+            <span>대기</span>
+            <span>응답 수</span>
+            <span className="hidden lg:block">상태</span>
+          </div>
+
+          <ul>
+            {rows.map((r) => {
+              const late =
+                r.status === "submitted" && r.submitted_at ? daysSince(r.submitted_at) : null;
+              const attention = r.grade === "주의";
+              return (
+                <li key={r.id} className="border-b last:border-b-0">
+                  <button
+                    type="button"
+                    onClick={() => onSelect(r.id)}
+                    title={r.flags[0] ?? "판단 화면을 엽니다"}
+                    className={cn(
+                      "grid w-full min-h-[var(--row-h)] items-center gap-3 px-4 py-1.5 text-left transition-colors hover:bg-secondary",
+                      cols,
                     )}
-                  </div>
-                  {r.flags.length > 0 && (
-                    <p className="mt-1.5 line-clamp-2 text-[11px] text-muted-foreground">
-                      {r.flags[0]}
-                      {r.flags.length > 1 ? ` (외 ${r.flags.length - 1}건)` : ""}
-                    </p>
-                  )}
-                </button>
-              </li>
-            );
-          })}
-        </ul>
+                  >
+                    <span
+                      aria-hidden
+                      className={cn(
+                        "h-5 w-[3px] rounded-full",
+                        attention ? "bg-warning" : "bg-success",
+                      )}
+                    />
+                    <span className="flex min-w-0 items-baseline gap-2">
+                      <span className="truncate text-sm font-semibold">
+                        {r.job_name ?? "직무 미입력"}
+                      </span>
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {r.participants?.name ?? "-"}
+                      </span>
+                    </span>
+                    <span className="truncate text-xs text-muted-foreground">
+                      {r.companies?.name} · {r.participants?.org_text ?? "소속 미지정"}
+                    </span>
+                    <span className="justify-self-start">
+                      <QualityBadge score={r.quality_score} />
+                    </span>
+                    <span
+                      className={cn(
+                        "text-xs tabular-nums",
+                        late !== null && late > 5
+                          ? "font-semibold text-destructive"
+                          : "text-muted-foreground",
+                      )}
+                    >
+                      {late !== null ? `${late}일` : "-"}
+                    </span>
+                    <span className="justify-self-start">
+                      <JobCountBadge count={r.jobCount} />
+                    </span>
+                    <span className="hidden justify-self-start lg:block">
+                      <StatusBadge status={STATUS_LABELS[r.status] ?? r.status} />
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       )}
+
+      <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Keyboard className="size-3.5 shrink-0" aria-hidden />
+        행을 누르면 판단 화면이 열립니다. 판단 화면에서 J 다음 · K 이전 건 · Esc 목록으로.
+      </p>
     </div>
   );
 }
@@ -604,6 +647,9 @@ function ResponseWorkspace({
   onCompareJobChange,
   jobNames,
   companyId,
+  tool,
+  onToolChange,
+  position,
 }: {
   responseId: string;
   onClose: () => void;
@@ -616,6 +662,10 @@ function ResponseWorkspace({
   onCompareJobChange: (v: string | null) => void;
   jobNames: string[];
   companyId: string | null;
+  tool: ToolKey;
+  onToolChange: (v: ToolKey) => void;
+  /** 목록에서 몇 번째 건인지 — 컨텍스트 바의 「3 / 47」 */
+  position?: { index: number; total: number };
 }) {
   const queryClient = useQueryClient();
   const [picked, setPicked] = useState<PickedField | null>(null);
@@ -627,6 +677,8 @@ function ResponseWorkspace({
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectStep, setRejectStep] = useState("4");
   const [rejectComment, setRejectComment] = useState("");
+  /** 단축키(A)는 렌더마다 다시 정해지는 승인 동작을 참조로 본다. */
+  const approveRef = useRef<() => void>(() => {});
 
   const { data, isLoading } = useQuery({
     queryKey: ["review-detail", responseId],
@@ -710,12 +762,55 @@ function ResponseWorkspace({
     onError: (err) => toast.error(`반려에 실패했습니다: ${errorMessage(err)}`),
   });
 
+  /**
+   * 판단 화면 단축키 (기획 v2 P4 선행).
+   *
+   * 수백 건을 처리하는 화면이라 손이 마우스에 묶이면 안 된다. 단축키를 모르는 사용자도
+   * 같은 일을 컨텍스트 바·액션 바 버튼으로 할 수 있고, 입력 중이거나 대화상자가 열려 있으면
+   * 전부 비활성이다. 승인이 막힌 건에서 A 는 승인하지 않고 인터뷰 기록 창을 연다.
+   */
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable)
+        return;
+      if (document.querySelector('[role="dialog"]')) return;
+      const key = e.key.toLowerCase();
+      if (e.key === "Escape") {
+        if (tool !== null) {
+          e.preventDefault();
+          onToolChange(null);
+        }
+        return;
+      }
+      if (key === "i") {
+        e.preventDefault();
+        onToolChange(tool === "ai" ? null : "ai");
+        return;
+      }
+      if (key === "d") {
+        e.preventDefault();
+        onViewChange(view === "diff" ? "detail" : "diff");
+        return;
+      }
+      if (key === "r") {
+        e.preventDefault();
+        setRejectOpen(true);
+        return;
+      }
+      if (key === "a") {
+        e.preventDefault();
+        approveRef.current();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [tool, view, onToolChange, onViewChange]);
+
   if (isLoading || !data) {
-    return (
-      <div className="mt-4 lg:col-span-2 lg:mt-0">
-        <p className="text-sm text-muted-foreground">불러오는 중...</p>
-      </div>
-    );
+    return <p className="text-sm text-muted-foreground">불러오는 중...</p>;
   }
 
   const r = data.response;
@@ -734,41 +829,82 @@ function ResponseWorkspace({
   const hlS = (id: string, f: string) => !!diff?.skills.changed.get(id)?.has(f);
   const hlQ = (f: string) => !!diff?.requirements.has(f);
 
-  /** 정정 가능한 항목을 우측 패널로 넘긴다. 잠긴 상태(비교 중)에서는 넘기지 않는다. */
+  /**
+   * 정정 가능한 항목. 예전에는 비교 중이면 onPick 을 넘기지 않아 눌러도 아무 일이 없었다 —
+   * 이유를 말하지 않는 침묵 실패였다. 잠긴 상태에서도 누를 수 있게 두고 이유를 알린다.
+   */
   const pick = (f: Omit<PickedField, "multiline"> & { multiline?: boolean }) =>
-    locked ? undefined : () => setPicked({ multiline: false, ...f });
+    locked
+      ? () =>
+          toast.info(
+            "이전 제출과 비교하는 동안에는 정정할 수 없습니다. [원문]으로 돌아가면 다시 정정할 수 있습니다.",
+          )
+      : () => setPicked({ multiline: false, ...f });
 
   const skillNames = r.response_skills.map((s) => s.name);
   const interviews = data.interviews;
   const interviewDone = interviews.some((iv) => iv.status === "완료");
 
+  /** 막는 이유를 누르면 근거로 데려간다 — 회색 버튼만 남기지 않는다. */
+  function focusEvidence() {
+    document.getElementById("judge-evidence")?.scrollIntoView({ block: "start" });
+  }
+
+  const aiDraftCount = data.aiDraft.skills + (data.aiDraft.requirements ? 1 : 0);
+
+  /** 승인을 막는 조건. 액션 바가 문장 칩으로 세우고, 누르면 근거·도구로 데려간다. */
+  const gates: ActionGate[] = [];
+  if (r.status === "draft") {
+    gates.push({ label: "작성 중 응답", onFocus: focusEvidence });
+  }
+  if (data.jobCount <= 1 && !interviewDone) {
+    gates.push({ label: "인터뷰 기록 없음", onFocus: focusEvidence });
+  }
+  if (data.aiDraft.any) {
+    gates.push({ label: `AI 초안 ${aiDraftCount}건 미확정`, onFocus: () => onToolChange("ai") });
+  }
+
+  // 콜로저 안에서는 data 의 좁히기가 유지되지 않으므로 한 번 붙잡아 둔다.
+  const jobCount = data.jobCount;
+
+  function runApprove() {
+    if (r.status === "approved" || r.status === "draft" || approve.isPending) return;
+    // 1인 응답 직무는 인터뷰 「완료」 기록이 있어야 승인된다.
+    if (jobCount <= 1 && !interviewDone) {
+      setApproveOpen(true);
+      return;
+    }
+    approve.mutate(undefined);
+  }
+  approveRef.current = runApprove;
+
   return (
-    <>
-      {/* 중앙 — 판단 대상 원문 */}
-      <div className="mt-4 min-w-0 space-y-4 lg:mt-0">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-1">
-            <Button variant="outline" size="sm" onClick={onClose} className="lg:hidden">
-              <ChevronLeft className="size-4" /> 목록
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!prevId}
-              onClick={() => prevId && onNavigate(prevId)}
-            >
-              <ChevronLeft className="size-4" /> 이전
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!nextId}
-              onClick={() => nextId && onNavigate(nextId)}
-            >
-              다음 <ChevronRight className="size-4" />
-            </Button>
+    <CorrectionCtx.Provider value={{ responseId, picked, close: () => setPicked(null) }}>
+      <div className="flex flex-col gap-4">
+        {/* 상단 컨텍스트 바 — 맥락과 이동은 위, 결정은 아래, 가운데는 원문뿐 */}
+        <div className="sticky top-[var(--header-h)] z-10 -mx-4 flex flex-wrap items-center gap-2 border-b bg-background px-4 py-2 sm:-mx-6 sm:px-6">
+          <Button variant="outline" size="sm" onClick={onClose} title="목록으로 (Esc)">
+            <ChevronLeft className="size-4" /> 목록
+          </Button>
+          {position ? (
+            <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs font-semibold tabular-nums text-muted-foreground">
+              {position.index + 1} / {position.total}
+            </span>
+          ) : null}
+          <div className="flex min-w-0 flex-col">
+            <span className="truncate text-sm font-semibold">
+              {r.participants?.name ?? "-"} · {r.job_name ?? "직무 미입력"}
+            </span>
+            <span className="truncate text-xs text-muted-foreground">
+              {r.companies?.name} · {r.participants?.org_text ?? "소속 미지정"}
+              {r.submitted_at ? ` · 제출 후 ${daysSince(r.submitted_at)}일` : ""}
+            </span>
           </div>
-          <div className="flex flex-wrap items-center gap-1.5">
+          <QualityBadge score={data.quality.score} />
+          <JobCountBadge count={data.jobCount} />
+          <StatusBadge status={STATUS_LABELS[r.status] ?? r.status} />
+
+          <div className="ml-auto flex flex-wrap items-center gap-1.5">
             <Button
               variant={view === "detail" ? "secondary" : "outline"}
               size="sm"
@@ -780,6 +916,7 @@ function ResponseWorkspace({
               <Button
                 variant={view === "diff" ? "secondary" : "outline"}
                 size="sm"
+                title="이전 제출과 비교 (D)"
                 onClick={() => onViewChange(view === "diff" ? "detail" : "diff")}
               >
                 이전 제출과 비교
@@ -795,19 +932,130 @@ function ResponseWorkspace({
             >
               <Columns3 className="size-4" /> 같은 직무 비교
             </Button>
+            <span className="mx-1 h-5 w-px bg-border" aria-hidden />
+            <Button
+              variant={tool === "ai" ? "secondary" : "outline"}
+              size="sm"
+              title="AI 점검 (I)"
+              onClick={() => onToolChange(tool === "ai" ? null : "ai")}
+            >
+              <Sparkles className="size-4" /> AI 점검
+              {aiDraftCount > 0 ? (
+                <span className="ml-1 rounded-full bg-warning/20 px-1.5 text-[11px] font-semibold tabular-nums text-warning">
+                  {aiDraftCount}
+                </span>
+              ) : null}
+            </Button>
+            <Button
+              variant={tool === "history" ? "secondary" : "outline"}
+              size="sm"
+              onClick={() => onToolChange(tool === "history" ? null : "history")}
+            >
+              <History className="size-4" /> 이력 {r.review_comments.length}
+            </Button>
+            <span className="mx-1 h-5 w-px bg-border" aria-hidden />
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!prevId}
+              title="이전 건 (K)"
+              onClick={() => prevId && onNavigate(prevId)}
+            >
+              <ChevronLeft className="size-4" /> 이전
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!nextId}
+              title="다음 건 (J)"
+              onClick={() => nextId && onNavigate(nextId)}
+            >
+              다음 <ChevronRight className="size-4" />
+            </Button>
           </div>
         </div>
-
         {view === "job" ? (
-          <JobComparison
-            jobNames={jobNames}
-            companyId={companyId}
-            job={compareJob ?? r.job_name}
-            onJobChange={onCompareJobChange}
-            onBack={() => onViewChange("detail")}
-          />
+          <DocWide>
+            <JobComparison
+              jobNames={jobNames}
+              companyId={companyId}
+              job={compareJob ?? r.job_name}
+              onJobChange={onCompareJobChange}
+              onBack={() => onViewChange("detail")}
+            />
+          </DocWide>
         ) : (
-          <>
+          <DocPane>
+            {/*
+            근거 스트립 — 판단 「전」에 읽는 것이다. 예전에는 우측 레일 위에 쌓여서
+            신호가 많은 건일수록 승인 버튼이 화면 밖으로 밀렸다. 읽기 흐름 안으로 옮긴다.
+          */}
+            <div id="judge-evidence" className="scroll-mt-[var(--sticky-top)] space-y-2">
+              {data.quality.flags.length > 0 && (
+                <SignalCard
+                  tone={data.quality.grade === "양호" ? "neutral" : "attention"}
+                  signal={`점검에서 확인된 주의 사유가 ${data.quality.flags.length}건 있습니다 (${data.quality.grade} ${data.quality.score}점).`}
+                  evidence={data.quality.flags}
+                  {...(data.quality.checkedAt
+                    ? { asOf: new Date(data.quality.checkedAt).toLocaleDateString("ko-KR") }
+                    : {})}
+                />
+              )}
+
+              {data.jobCount <= 1 && (
+                <SignalCard
+                  tone={interviewDone ? "good" : "attention"}
+                  signal={
+                    interviewDone
+                      ? "1인 응답 직무이며 인터뷰 확인이 끝났습니다."
+                      : "1인 응답 직무여서 인터뷰 확인 없이는 승인할 수 없습니다."
+                  }
+                  evidence={
+                    interviewDone
+                      ? [
+                          `인터뷰 기록 ${interviews.length}건 중 「완료」 기록이 있어 승인 조건을 만족합니다.`,
+                          "인터뷰에서 확인한 내용은 아래 원문의 인터뷰 기록에서 볼 수 있습니다.",
+                        ]
+                      : [
+                          `같은 직무 응답이 ${data.jobCount}건뿐이라 응답만으로는 직무를 확정할 수 없습니다.`,
+                          "승인을 누르면 인터뷰 기록을 남기는 창이 열립니다. 인터뷰 관리 구획에서 미리 남겨 두어도 됩니다.",
+                        ]
+                  }
+                  asOf={new Date().toLocaleDateString("ko-KR")}
+                />
+              )}
+
+              {data.aiDraft.any && (
+                <SignalCard
+                  tone="attention"
+                  signal="확정되지 않은 AI 초안이 남아 승인할 수 없습니다."
+                  evidence={[
+                    `역량 ${data.aiDraft.skills}건${data.aiDraft.requirements ? " · 자격요건 포함" : ""}이 AI 초안 표시 상태입니다.`,
+                    "위 [AI 점검]에서 확정하거나 원문에서 항목을 정정하면 승인 게이트가 풀립니다.",
+                  ]}
+                  asOf={new Date().toLocaleDateString("ko-KR")}
+                />
+              )}
+
+              {r.status === "submitted" && r.submitted_at && daysSince(r.submitted_at) > 5 && (
+                <SignalCard
+                  tone="attention"
+                  signal={`제출 후 ${daysSince(r.submitted_at)}일째 검토를 기다리고 있습니다.`}
+                  evidence={[
+                    `제출일 ${formatDate(r.submitted_at)} 기준 경과일입니다.`,
+                    "5일을 넘기면 참여자가 보완 요청을 받아도 기억이 흐려집니다.",
+                  ]}
+                  asOf={new Date().toLocaleDateString("ko-KR")}
+                />
+              )}
+
+              {r.status === "draft" && (
+                <p className="rounded-xl border bg-secondary p-3 text-sm text-muted-foreground">
+                  작성 중 응답은 승인·반려할 수 없고 열람·정정만 가능합니다. 정정하면 작성자가
+                  화면을 열어 두었던 경우 최신 내용 확인 안내를 받게 됩니다.
+                </p>
+              )}
+            </div>
             {view === "diff" && prevSnap && (
               <p className="rounded-xl border border-warning/40 bg-warning/10 p-3 text-sm">
                 {diff ? (
@@ -1313,273 +1561,196 @@ function ResponseWorkspace({
                 </p>
               </Section>
             )}
-          </>
+          </DocPane>
         )}
-      </div>
 
-      {/* 우측 — 판단 패널 */}
-      <div className="mt-4 space-y-3 lg:sticky lg:top-4 lg:mt-0 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto lg:pr-1">
-        <div className="space-y-3 rounded-xl border bg-card p-4 shadow-sm">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-sm font-bold">판단</p>
-            <div className="flex items-center gap-1.5">
-              <QualityBadge score={data.quality.score} />
-              <JobCountBadge count={data.jobCount} />
-              <StatusBadge status={STATUS_LABELS[r.status] ?? r.status} />
-            </div>
-          </div>
-
-          {data.quality.flags.length > 0 && (
-            <SignalCard
-              tone={data.quality.grade === "양호" ? "neutral" : "attention"}
-              signal={`점검에서 확인된 주의 사유가 ${data.quality.flags.length}건 있습니다 (${data.quality.grade} ${data.quality.score}점).`}
-              evidence={data.quality.flags}
-              {...(data.quality.checkedAt
-                ? { asOf: new Date(data.quality.checkedAt).toLocaleDateString("ko-KR") }
-                : {})}
-            />
-          )}
-
-          {data.jobCount <= 1 && (
-            <SignalCard
-              tone={interviewDone ? "good" : "attention"}
-              signal={
-                interviewDone
-                  ? "1인 응답 직무이며 인터뷰 확인이 끝났습니다."
-                  : "1인 응답 직무여서 인터뷰 확인 없이는 승인할 수 없습니다."
-              }
-              evidence={
-                interviewDone
-                  ? [
-                      `인터뷰 기록 ${interviews.length}건 중 「완료」 기록이 있어 승인 조건을 만족합니다.`,
-                      "인터뷰에서 확인한 내용은 아래 원문의 인터뷰 기록에서 볼 수 있습니다.",
-                    ]
-                  : [
-                      `같은 직무 응답이 ${data.jobCount}건뿐이라 응답만으로는 직무를 확정할 수 없습니다.`,
-                      "승인을 누르면 인터뷰 기록을 남기는 창이 열립니다. 인터뷰 관리 구획에서 미리 남겨 두어도 됩니다.",
-                    ]
-              }
-              asOf={new Date().toLocaleDateString("ko-KR")}
-            />
-          )}
-
-          {r.status === "draft" && (
-            <p className="rounded-lg bg-secondary p-3 text-xs text-muted-foreground">
-              작성 중 응답은 승인·반려할 수 없고 열람·정정만 가능합니다. 정정하면 작성자가 화면을
-              열어 두었던 경우 최신 내용 확인 안내를 받게 됩니다.
-            </p>
-          )}
-
-          {data.aiDraft.any && (
-            <SignalCard
-              tone="attention"
-              signal="확정되지 않은 AI 초안이 남아 승인할 수 없습니다."
-              evidence={[
-                `역량 ${data.aiDraft.skills}건${data.aiDraft.requirements ? " · 자격요건 포함" : ""}이 AI 초안 표시 상태입니다.`,
-                "초안 표시가 남아 있으면 승인 게이트가 막힙니다. 아래 AI 점검에서 확정하거나 항목을 정정하세요.",
-              ]}
-              asOf={new Date().toLocaleDateString("ko-KR")}
-            />
-          )}
-
-          {r.status === "submitted" && r.submitted_at && daysSince(r.submitted_at) > 5 && (
-            <SignalCard
-              tone="attention"
-              signal={`제출 후 ${daysSince(r.submitted_at)}일째 검토를 기다리고 있습니다.`}
-              evidence={[
-                `제출일 ${formatDate(r.submitted_at)} 기준 경과일입니다.`,
-                "5일을 넘기면 참여자가 보완 요청을 받아도 기억이 흐려집니다.",
-              ]}
-              asOf={new Date().toLocaleDateString("ko-KR")}
-            />
-          )}
-
-          <div className="flex gap-2">
+        <ActionBar
+          primary={
             <Button
-              className="flex-1"
               disabled={approve.isPending || r.status === "approved" || r.status === "draft"}
-              onClick={() => {
-                // 1인 응답 직무는 인터뷰 「완료」 기록이 있어야 승인된다.
-                if (data.jobCount <= 1 && !interviewDone) {
-                  setApproveOpen(true);
-                  return;
-                }
-                approve.mutate(undefined);
-              }}
+              onClick={runApprove}
             >
-              승인
+              승인 <span className="ml-1 text-xs opacity-70">A</span>
             </Button>
+          }
+          secondary={
             <Button
               variant="outline"
-              className="flex-1"
               disabled={reject.isPending || r.status === "rejected" || r.status === "draft"}
               onClick={() => setRejectOpen(true)}
             >
-              반려
+              반려 <span className="ml-1 text-xs text-muted-foreground">R</span>
             </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            승인·반려하면 {nextId ? "다음 건이 자동으로 열립니다." : "목록으로 돌아갑니다."}
-          </p>
-        </div>
-
-        <CorrectionPanel
-          responseId={responseId}
-          picked={picked}
-          locked={locked}
-          onClose={() => setPicked(null)}
+          }
+          gates={gates}
+          hint={
+            <span className="tabular-nums">
+              A 승인 · R 반려 · I 점검 · D 비교 · J·K 이동 · Esc 목록
+              {nextId ? " · 판단하면 다음 건이 열립니다" : ""}
+            </span>
+          }
         />
 
-        <AiInspector
-          responseId={responseId}
-          jobName={r.job_name}
-          skillNames={skillNames}
-          aiDraftCount={data.aiDraft.skills + (data.aiDraft.requirements ? 1 : 0)}
-          companyId={companyId}
-          onUseRejectDraft={(text, step) => {
-            setRejectComment(text);
-            setRejectStep(String(step));
-            setRejectOpen(true);
-          }}
-          onApplied={invalidate}
-        />
-
-        <CollapsibleSection
-          storageKey="review-panel"
-          id="review-history"
-          title="정정·검토 이력"
-          subtitle={`${r.review_comments.length}건`}
-          defaultCollapsed={r.review_comments.length === 0}
+        {/*
+        도구 층 — 점검·이력은 한 건에 한두 번 쓴다. 상시 폭을 주지 않고 원문을 덮는 층으로 띄운다.
+        층은 원문을 밀어내지 않으므로 닫으면 읽던 자리가 그대로 남는다.
+      */}
+        <ToolLayer
+          open={tool !== null}
+          onOpenChange={(open) => onToolChange(open ? (tool ?? "ai") : null)}
+          title={tool === "history" ? "정정·검토 이력" : "AI 점검"}
+          description={
+            tool === "history"
+              ? `이 응답에 남은 정정·반려 기록 ${r.review_comments.length}건입니다.`
+              : "AI 초안을 확정하거나 보완 요청 문구 초안을 만듭니다."
+          }
         >
-          {r.review_comments.length === 0 ? (
-            <p className="rounded-xl border border-dashed bg-card p-4 text-center text-xs text-muted-foreground">
-              아직 남은 이력이 없습니다. 정정·반려를 하면 여기에 기록됩니다.
-            </p>
+          {tool === "history" ? (
+            r.review_comments.length === 0 ? (
+              <p className="rounded-xl border border-dashed bg-card p-4 text-center text-xs text-muted-foreground">
+                아직 남은 이력이 없습니다. 정정·반려를 하면 여기에 기록됩니다.
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {r.review_comments.map((c) => (
+                  <li key={c.id} className="rounded-lg border bg-card p-3 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold">
+                        {c.kind === "reject" ? "반려" : c.kind === "correction" ? "정정" : "코멘트"}
+                        {c.step ? ` · ${STEPS[c.step - 1] ?? `${c.step}단계`}` : ""}
+                      </span>
+                      <span className="text-muted-foreground">{formatDate(c.created_at)}</span>
+                    </div>
+                    <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{c.body}</p>
+                  </li>
+                ))}
+              </ul>
+            )
           ) : (
-            <ul className="space-y-2">
-              {r.review_comments.map((c) => (
-                <li key={c.id} className="rounded-lg border bg-card p-3 text-xs">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-semibold">
-                      {c.kind === "reject" ? "반려" : c.kind === "correction" ? "정정" : "코멘트"}
-                      {c.step ? ` · ${STEPS[c.step - 1] ?? `${c.step}단계`}` : ""}
-                    </span>
-                    <span className="text-muted-foreground">{formatDate(c.created_at)}</span>
-                  </div>
-                  <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{c.body}</p>
-                </li>
-              ))}
-            </ul>
+            <AiInspector
+              responseId={responseId}
+              jobName={r.job_name}
+              skillNames={skillNames}
+              aiDraftCount={aiDraftCount}
+              companyId={companyId}
+              onUseRejectDraft={(text, step) => {
+                setRejectComment(text);
+                setRejectStep(String(step));
+                onToolChange(null);
+                setRejectOpen(true);
+              }}
+              onApplied={invalidate}
+            />
           )}
-        </CollapsibleSection>
+        </ToolLayer>
+
+        <Dialog open={approveOpen} onOpenChange={setApproveOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>인터뷰 확인 후 승인</DialogTitle>
+              <DialogDescription>
+                「{r.job_name ?? "직무 미입력"}」은 응답이 {data.jobCount}건뿐입니다. 후속 인터뷰로
+                내용을 확인하고 그 기록을 남긴 경우에만 승인할 수 있습니다. 아래에 인터뷰 내용을
+                적으면 「완료」 기록으로 남기고 바로 승인합니다.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <Label htmlFor="iv-when">인터뷰 일시 (선택)</Label>
+                  <Input
+                    id="iv-when"
+                    type="datetime-local"
+                    value={ivWhen}
+                    onChange={(e) => setIvWhen(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="iv-who">담당 (선택)</Label>
+                  <Input
+                    id="iv-who"
+                    value={ivWho}
+                    onChange={(e) => setIvWho(e.target.value)}
+                    placeholder="인터뷰를 진행한 사람"
+                  />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="iv-memo">인터뷰에서 확인한 내용 (필수)</Label>
+                <Textarea
+                  id="iv-memo"
+                  rows={5}
+                  value={ivMemo}
+                  onChange={(e) => setIvMemo(e.target.value)}
+                  placeholder="응답에서 확인·보완한 내용을 적어 주세요. 이 기록이 승인 근거로 남고 직무기술서 작성에서 함께 읽힙니다."
+                />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="ghost" onClick={() => setApproveOpen(false)}>
+                취소
+              </Button>
+              <Button
+                disabled={!ivMemo.trim() || approve.isPending}
+                onClick={() => approve.mutate({ when: ivWhen, who: ivWho, memo: ivMemo })}
+              >
+                인터뷰 기록 후 승인
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog open={rejectOpen} onOpenChange={setRejectOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>응답 반려</DialogTitle>
+              <DialogDescription>
+                돌아갈 단계와 사유를 남기면 응답자가 해당 단계부터 다시 작성합니다.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="reject-step">되돌릴 단계</Label>
+                <Select value={rejectStep} onValueChange={setRejectStep}>
+                  <SelectTrigger id="reject-step">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {STEPS.map((label, i) => (
+                      <SelectItem key={label} value={String(i + 1)}>
+                        {label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="reject-comment">반려 사유 (필수)</Label>
+                <Textarea
+                  id="reject-comment"
+                  rows={5}
+                  value={rejectComment}
+                  onChange={(e) => setRejectComment(e.target.value)}
+                  placeholder="어떤 부분을 어떻게 보완해야 하는지 구체적으로 적어 주세요."
+                />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="ghost" onClick={() => setRejectOpen(false)}>
+                취소
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={!rejectComment.trim() || reject.isPending}
+                onClick={() => reject.mutate()}
+              >
+                반려
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
-
-      <Dialog open={approveOpen} onOpenChange={setApproveOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>인터뷰 확인 후 승인</DialogTitle>
-            <DialogDescription>
-              「{r.job_name ?? "직무 미입력"}」은 응답이 {data.jobCount}건뿐입니다. 후속 인터뷰로
-              내용을 확인하고 그 기록을 남긴 경우에만 승인할 수 있습니다. 아래에 인터뷰 내용을
-              적으면 「완료」 기록으로 남기고 바로 승인합니다.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1.5">
-                <Label htmlFor="iv-when">인터뷰 일시 (선택)</Label>
-                <Input
-                  id="iv-when"
-                  type="datetime-local"
-                  value={ivWhen}
-                  onChange={(e) => setIvWhen(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="iv-who">담당 (선택)</Label>
-                <Input
-                  id="iv-who"
-                  value={ivWho}
-                  onChange={(e) => setIvWho(e.target.value)}
-                  placeholder="인터뷰를 진행한 사람"
-                />
-              </div>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="iv-memo">인터뷰에서 확인한 내용 (필수)</Label>
-              <Textarea
-                id="iv-memo"
-                rows={5}
-                value={ivMemo}
-                onChange={(e) => setIvMemo(e.target.value)}
-                placeholder="응답에서 확인·보완한 내용을 적어 주세요. 이 기록이 승인 근거로 남고 직무기술서 작성에서 함께 읽힙니다."
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setApproveOpen(false)}>
-              취소
-            </Button>
-            <Button
-              disabled={!ivMemo.trim() || approve.isPending}
-              onClick={() => approve.mutate({ when: ivWhen, who: ivWho, memo: ivMemo })}
-            >
-              인터뷰 기록 후 승인
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={rejectOpen} onOpenChange={setRejectOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>응답 반려</DialogTitle>
-            <DialogDescription>
-              돌아갈 단계와 사유를 남기면 응답자가 해당 단계부터 다시 작성합니다.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="reject-step">되돌릴 단계</Label>
-              <Select value={rejectStep} onValueChange={setRejectStep}>
-                <SelectTrigger id="reject-step">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {STEPS.map((label, i) => (
-                    <SelectItem key={label} value={String(i + 1)}>
-                      {label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="reject-comment">반려 사유 (필수)</Label>
-              <Textarea
-                id="reject-comment"
-                rows={5}
-                value={rejectComment}
-                onChange={(e) => setRejectComment(e.target.value)}
-                placeholder="어떤 부분을 어떻게 보완해야 하는지 구체적으로 적어 주세요."
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setRejectOpen(false)}>
-              취소
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={!rejectComment.trim() || reject.isPending}
-              onClick={() => reject.mutate()}
-            >
-              반려
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </>
+    </CorrectionCtx.Provider>
   );
 }
 
@@ -1641,17 +1812,19 @@ function Correctable({
   picked?: boolean;
   onPick?: (() => void) | undefined;
 }) {
+  const ctx = useContext(CorrectionCtx);
   const text = (
     <span className={cn("min-w-0 flex-1 whitespace-pre-wrap break-words", highlight && HL)}>
       {value || "-"}
     </span>
   );
   if (!onPick) return <span className="block">{text}</span>;
-  return (
+
+  const trigger = (
     <button
       type="button"
       onClick={onPick}
-      title="누르면 오른쪽 판단 패널에서 정정할 수 있습니다"
+      title="누르면 이 자리에서 정정할 수 있습니다"
       className={cn(
         "group flex w-full items-start gap-1.5 rounded px-1 py-0.5 text-left transition-colors hover:bg-secondary",
         picked && "bg-primary-soft ring-1 ring-primary",
@@ -1667,6 +1840,24 @@ function Correctable({
       />
     </button>
   );
+
+  if (!picked || !ctx?.picked) return trigger;
+  return (
+    <Popover
+      open
+      onOpenChange={(open) => {
+        if (!open) ctx.close();
+      }}
+    >
+      <PopoverTrigger asChild>{trigger}</PopoverTrigger>
+      <PopoverContent
+        align="start"
+        className="w-[min(30rem,92vw)] border-0 bg-transparent p-0 shadow-none"
+      >
+        <CorrectionPanel responseId={ctx.responseId} picked={ctx.picked} onClose={ctx.close} />
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 /* ── 우: 필드 정정 ──────────────────────────────────────────── */
@@ -1675,12 +1866,10 @@ function Correctable({
 function CorrectionPanel({
   responseId,
   picked,
-  locked,
   onClose,
 }: {
   responseId: string;
-  picked: PickedField | null;
-  locked: boolean;
+  picked: PickedField;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -1688,17 +1877,17 @@ function CorrectionPanel({
 
   // 다른 항목을 고르면 그 값으로 갈아탄다.
   useEffect(() => {
-    setDraft(picked?.value ?? "");
-  }, [picked?.table, picked?.id, picked?.field, picked?.value]);
+    setDraft(picked.value);
+  }, [picked.table, picked.id, picked.field, picked.value]);
 
   const mutation = useMutation({
     mutationFn: () =>
       correctField({
         data: {
           responseId,
-          table: picked!.table,
-          id: picked!.id,
-          field: picked!.field,
+          table: picked.table,
+          id: picked.id,
+          field: picked.field,
           value: draft,
         },
       }),
@@ -1715,26 +1904,8 @@ function CorrectionPanel({
     onError: (err) => toast.error(`정정에 실패했습니다: ${errorMessage(err)}`),
   });
 
-  if (locked) {
-    return (
-      <div className="rounded-xl border bg-card p-4 text-xs text-muted-foreground shadow-sm">
-        이전 제출과 비교하는 동안에는 정정할 수 없습니다. [원문]으로 돌아가면 다시 정정할 수
-        있습니다.
-      </div>
-    );
-  }
-
-  if (!picked) {
-    return (
-      <div className="rounded-xl border border-dashed bg-card p-4 text-xs text-muted-foreground">
-        가운데 원문에서 항목을 누르면 여기서 바로 정정할 수 있습니다. 정정 내용은 이력에 남고,
-        작성자에게는 최신 내용 확인 안내가 갑니다.
-      </div>
-    );
-  }
-
   return (
-    <div className="space-y-2 rounded-xl border border-primary/40 bg-card p-4 shadow-sm">
+    <div className="space-y-2 rounded-xl border border-primary/40 bg-card p-4 shadow-lg">
       <div className="flex items-center justify-between gap-2">
         <p className="text-sm font-bold">{picked.label} 정정</p>
         <button

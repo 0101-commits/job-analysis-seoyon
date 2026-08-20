@@ -24,7 +24,7 @@ import {
 import { StatusBadge } from "@/components/StatusBadge";
 import { EmptyState } from "@/components/EmptyState";
 import { SectionNav, CollapsibleSection } from "@/components/SectionNav";
-import { ReviewWorkbench, type CenterView } from "@/components/admin/ReviewWorkbench";
+import { ReviewWorkbench, type CenterView, type ToolKey } from "@/components/admin/ReviewWorkbench";
 import { ReviewQualityPanel } from "@/components/admin/ReviewQualityPanel";
 import { InterviewPanel } from "@/components/admin/InterviewPanel";
 import { InquiryInbox, inquiryAlerts, useInquiries } from "@/components/admin/InquiryInbox";
@@ -45,6 +45,7 @@ import { infoFieldLabel } from "@/lib/survey.data";
  *   &job=<직무명>                  view=job 일 때 비교 대상 직무
  *   &req=요청|처리완료|반려|all    정보 수정 요청 구획 상태 필터 (기본 요청)
  *   &sort=risk|submitted           검토 대기 목록 정렬 (기본 risk = 주의 필요한 순)
+ *   &tool=ai|history               판단 화면을 덮는 도구 층 (없으면 닫힌 상태)
  *   ?tab=inquiry                   문의함 구획을 펼친 상태로 열고 그 위치로 이동 (진행 현황 딥링크 수신)
  */
 
@@ -52,11 +53,13 @@ const QUEUE_STATUSES = ["submitted", "draft", "rejected", "approved", "all"] as 
 const VIEWS = ["detail", "diff", "job"] as const;
 const REQ_STATUSES = ["요청", "처리완료", "반려", "all"] as const;
 const SORTS = ["risk", "submitted"] as const;
+const TOOLS = ["ai", "history"] as const;
 const TABS = ["inquiry"] as const;
 
 type QueueStatus = (typeof QUEUE_STATUSES)[number];
 type ReqStatus = (typeof REQ_STATUSES)[number];
 type QueueSort = (typeof SORTS)[number];
+type Tool = (typeof TOOLS)[number];
 type Tab = (typeof TABS)[number];
 
 interface ReviewSearch {
@@ -67,6 +70,7 @@ interface ReviewSearch {
   job?: string;
   req?: ReqStatus;
   sort?: QueueSort;
+  tool?: Tool;
   tab?: Tab;
 }
 
@@ -97,6 +101,8 @@ export const Route = createFileRoute("/_authenticated/admin/review")({
     if (req) out.req = req;
     const sort = pick(search["sort"], SORTS);
     if (sort) out.sort = sort;
+    const tool = pick(search["tool"], TOOLS);
+    if (tool) out.tool = tool;
     const tab = pick(search["tab"], TABS);
     if (tab) out.tab = tab;
     return out;
@@ -132,6 +138,9 @@ function ReviewPage() {
   const reqStatus = search.req ?? "요청";
   const sort = search.sort ?? "risk";
   const selectedId = search.response ?? null;
+  const tool: ToolKey = search.tool ?? null;
+  // 판단 중에는 화면을 그 한 건에 내준다 — 훑기·문의·정정 요청 구획은 함께 띄우지 않는다.
+  const focused = selectedId !== null;
 
   /** 화면 상태 변경은 전부 URL 갱신으로 처리한다. 빈 값은 키째 지운다. */
   function setSearch(patch: SearchPatch, replace = false) {
@@ -182,28 +191,32 @@ function ReviewPage() {
 
   return (
     <div className="space-y-5">
-      <div>
-        <h1 className="text-xl font-bold sm:text-2xl">응답 검토</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          제출된 업무조사를 한 건씩 판단합니다. 지금 조건에 맞는 응답 {rows.length}건.
-        </p>
-      </div>
+      {!focused && (
+        <div>
+          <h1 className="text-xl font-bold sm:text-2xl">응답 검토</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            제출된 업무조사를 한 건씩 판단합니다. 지금 조건에 맞는 응답 {rows.length}건.
+          </p>
+        </div>
+      )}
 
-      <SectionNav
-        sections={[
-          { id: "workbench", label: "검토 대기", count: rows.length },
-          { id: "quality", label: "점검 결과", count: attention },
-          { id: "interviews", label: "인터뷰 관리" },
-          {
-            id: "inquiries",
-            label: inquiry.heavy.length > 0 ? "문의함 (주의)" : "문의함",
-            count: inquiry.pending,
-          },
-          { id: "info-requests", label: "정보 수정 요청", count: infoData?.pending ?? 0 },
-        ]}
-      />
+      {!focused && (
+        <SectionNav
+          sections={[
+            { id: "workbench", label: "검토 대기", count: rows.length },
+            { id: "quality", label: "점검 결과", count: attention },
+            { id: "interviews", label: "인터뷰 관리" },
+            {
+              id: "inquiries",
+              label: inquiry.heavy.length > 0 ? "문의함 (주의)" : "문의함",
+              count: inquiry.pending,
+            },
+            { id: "info-requests", label: "정보 수정 요청", count: infoData?.pending ?? 0 },
+          ]}
+        />
+      )}
 
-      <section id="workbench" className="scroll-mt-20">
+      <section id="workbench" className="scroll-mt-[var(--sticky-top)]">
         <ReviewWorkbench
           rows={rows}
           isLoading={isLoading}
@@ -221,89 +234,95 @@ function ReviewPage() {
           companyId={scope}
           sort={sort}
           onSortChange={(v) => setSearch({ sort: v === "risk" ? undefined : (v as QueueSort) })}
+          tool={tool}
+          onToolChange={(v) => setSearch({ tool: v ?? undefined })}
         />
       </section>
 
-      <CollapsibleSection
-        storageKey="review-page"
-        id="quality"
-        title="점검 결과 · 일괄 승인 후보"
-        subtitle="규칙으로 응답을 확인해 주의가 필요한 건을 목록 위로 올리고, 양호한 건은 묶어서 승인합니다."
-        aside={
-          attention > 0 ? (
-            <span className="rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground">
-              주의 {attention}
-            </span>
-          ) : null
-        }
-      >
-        <ReviewQualityPanel
-          rows={rows}
-          unchecked={data?.unchecked ?? 0}
-          companyId={scope}
-          onSelect={(id) => setSearch({ response: id })}
-        />
-      </CollapsibleSection>
+      {focused ? null : (
+        <>
+          <CollapsibleSection
+            storageKey="review-page"
+            id="quality"
+            title="점검 결과 · 일괄 승인 후보"
+            subtitle="규칙으로 응답을 확인해 주의가 필요한 건을 목록 위로 올리고, 양호한 건은 묶어서 승인합니다."
+            aside={
+              attention > 0 ? (
+                <span className="rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground">
+                  주의 {attention}
+                </span>
+              ) : null
+            }
+          >
+            <ReviewQualityPanel
+              rows={rows}
+              unchecked={data?.unchecked ?? 0}
+              companyId={scope}
+              onSelect={(id) => setSearch({ response: id })}
+            />
+          </CollapsibleSection>
 
-      <CollapsibleSection
-        storageKey="review-page"
-        id="interviews"
-        title="인터뷰 관리"
-        subtitle="응답자가 1명인 직무는 인터뷰 기록이 있어야 승인됩니다. 2~4명인 직무는 심층 검토 대상입니다."
-        defaultCollapsed
-      >
-        <InterviewPanel companyId={scope} onSelect={(id) => setSearch({ response: id })} />
-      </CollapsibleSection>
+          <CollapsibleSection
+            storageKey="review-page"
+            id="interviews"
+            title="인터뷰 관리"
+            subtitle="응답자가 1명인 직무는 인터뷰 기록이 있어야 승인됩니다. 2~4명인 직무는 심층 검토 대상입니다."
+            defaultCollapsed
+          >
+            <InterviewPanel companyId={scope} onSelect={(id) => setSearch({ response: id })} />
+          </CollapsibleSection>
 
-      {/*
+          {/*
         딥링크(?tab=inquiry)로 들어오면 펼친 채로 보여야 한다. 접힘 상태는 화면 단위 localStorage 에
         저장돼 밖에서 열 수 없으므로, 딥링크일 때만 저장 키를 갈라 접힘 기록을 타지 않게 한다.
         ponytail: 저장 키 분리로 해결 — CollapsibleSection 에 열림 제어 prop 이 생기면 그걸로 바꾼다.
       */}
-      <CollapsibleSection
-        storageKey={inquiryTab ? "review-page-inquiry-link" : "review-page"}
-        id="inquiries"
-        title="문의함"
-        subtitle="참여자가 보낸 문의를 확인하고 답변합니다."
-        defaultCollapsed={!inquiryTab}
-        aside={
-          inquiry.pending > 0 ? (
-            <span
-              className={
-                inquiry.heavy.length > 0
-                  ? "rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground"
-                  : "rounded-full bg-secondary px-2 py-0.5 text-[11px] font-semibold text-muted-foreground"
-              }
-            >
-              {inquiry.heavy.length > 0 ? `주의 ${inquiry.pending}` : inquiry.pending}
-            </span>
-          ) : null
-        }
-      >
-        <InquiryInbox query={inquiryQuery} />
-      </CollapsibleSection>
+          <CollapsibleSection
+            storageKey={inquiryTab ? "review-page-inquiry-link" : "review-page"}
+            id="inquiries"
+            title="문의함"
+            subtitle="참여자가 보낸 문의를 확인하고 답변합니다."
+            defaultCollapsed={!inquiryTab}
+            aside={
+              inquiry.pending > 0 ? (
+                <span
+                  className={
+                    inquiry.heavy.length > 0
+                      ? "rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground"
+                      : "rounded-full bg-secondary px-2 py-0.5 text-[11px] font-semibold text-muted-foreground"
+                  }
+                >
+                  {inquiry.heavy.length > 0 ? `주의 ${inquiry.pending}` : inquiry.pending}
+                </span>
+              ) : null
+            }
+          >
+            <InquiryInbox query={inquiryQuery} />
+          </CollapsibleSection>
 
-      <CollapsibleSection
-        storageKey="review-page"
-        id="info-requests"
-        title="정보 수정 요청"
-        subtitle="참여자가 보낸 인사정보 정정 요청을 확인하고 반영합니다."
-        defaultCollapsed
-        aside={
-          infoData?.pending ? (
-            <span className="rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground">
-              {infoData.pending}
-            </span>
-          ) : null
-        }
-      >
-        <InfoRequests
-          rows={infoData?.rows ?? []}
-          isLoading={infoLoading}
-          status={reqStatus}
-          onStatusChange={(v) => setSearch({ req: v as ReqStatus })}
-        />
-      </CollapsibleSection>
+          <CollapsibleSection
+            storageKey="review-page"
+            id="info-requests"
+            title="정보 수정 요청"
+            subtitle="참여자가 보낸 인사정보 정정 요청을 확인하고 반영합니다."
+            defaultCollapsed
+            aside={
+              infoData?.pending ? (
+                <span className="rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground">
+                  {infoData.pending}
+                </span>
+              ) : null
+            }
+          >
+            <InfoRequests
+              rows={infoData?.rows ?? []}
+              isLoading={infoLoading}
+              status={reqStatus}
+              onStatusChange={(v) => setSearch({ req: v as ReqStatus })}
+            />
+          </CollapsibleSection>
+        </>
+      )}
     </div>
   );
 }

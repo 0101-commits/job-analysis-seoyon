@@ -104,6 +104,15 @@
   --sidebar-ring: oklch(0.53 0.128 259);
   --font-sans:
     "Pretendard Variable", Pretendard, -apple-system, "Noto Sans KR", "Malgun Gothic", sans-serif;
+
+  /* 레이아웃 토큰 — 화면 골격 치수의 단일 원천 (기획 v2). */
+  --header-h: 97px; /* 셸이 ResizeObserver 로 실측해 덮어쓴다. 첫 페인트용 기본값 */
+  --sticky-top: calc(var(--header-h) + 0.75rem);
+  --measure-read: 840px; /* 판단 대상 원문 — 한 줄 55자 내외 */
+  --measure-wide: 1200px; /* 표·비교처럼 넓이가 실제로 필요한 블록의 상한 */
+  --layer-w: 440px; /* 도구 층 (점검·이력·반려 작성) */
+  --row-h: 36px; /* 표 기본 행 높이 */
+  --lens-h: 58px; /* 렌즈 바 */
 }
 
 .dark {

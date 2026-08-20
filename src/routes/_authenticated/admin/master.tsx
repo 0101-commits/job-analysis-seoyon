@@ -234,7 +234,7 @@ function EditorWithInspector({
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
       <div className="min-w-0 space-y-6">{children}</div>
-      <div className="lg:sticky lg:top-20 lg:self-start">{inspector}</div>
+      <div className="lg:sticky lg:top-[var(--sticky-top)] lg:self-start">{inspector}</div>
     </div>
   );
 }

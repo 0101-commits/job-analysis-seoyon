@@ -144,7 +144,7 @@ function AiPage() {
         ]}
       />
 
-      <section id="sweep-ledger" className="scroll-mt-20 space-y-3">
+      <section id="sweep-ledger" className="scroll-mt-[var(--sticky-top)] space-y-3">
         <h2 className="text-base font-semibold">AI 사용 현황</h2>
         <p className="text-sm text-muted-foreground">
           AI 가 무엇을 얼마나 바꿨고 어디서 실패했는지 봅니다.
@@ -152,7 +152,7 @@ function AiPage() {
         <AiLedgerPanel />
       </section>
 
-      <section id="sweep-pending" className="scroll-mt-20 space-y-3">
+      <section id="sweep-pending" className="scroll-mt-[var(--sticky-top)] space-y-3">
         <h2 className="text-base font-semibold">미결 AI 제안</h2>
         <p className="text-sm text-muted-foreground">
           아직 수락·거절되지 않은 제안이 남은 응답입니다. 제안이 남아 있으면 승인 게이트가 막힐 수
@@ -195,12 +195,12 @@ function AiPage() {
         )}
       </section>
 
-      <section id="sweep-poor" className="scroll-mt-20 space-y-3">
+      <section id="sweep-poor" className="scroll-mt-[var(--sticky-top)] space-y-3">
         <h2 className="text-base font-semibold">부실 응답 스윕</h2>
         <PoorSweep scope={scope} onProxyError={setProxyError} />
       </section>
 
-      <section id="sweep-merge" className="scroll-mt-20 space-y-3">
+      <section id="sweep-merge" className="scroll-mt-[var(--sticky-top)] space-y-3">
         <h2 className="text-base font-semibold">표기 통일</h2>
         <MergeSweep scope={scope} onProxyError={setProxyError} />
       </section>

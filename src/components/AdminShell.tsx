@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -87,6 +87,7 @@ const FLAT_SCREENS = [...NAV.flatMap((g) => g.items), AI_TOOLS].map((i) => ({
 
 export function AdminShell({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
+  const headerRef = useRef<HTMLElement>(null);
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -150,6 +151,22 @@ export function AdminShell({ children }: { children: ReactNode }) {
 
   const lensLabel = selectedOrgId ? orgPathLabel(orgUnits ?? [], selectedOrgId) : null;
 
+  /*
+   * 헤더 높이가 97px·93px 로 하드코딩되어 여섯 곳에 퍼져 있으면, 헤더 구성(배지 추가 등)이
+   * 바뀔 때마다 sticky 사이드바·모바일 드로어가 헤더 뒤로 숨는다. 실측해서 CSS 변수 하나로
+   * 흘려보낸다.
+   */
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(() => {
+      const h = Math.round(el.getBoundingClientRect().height);
+      document.documentElement.style.setProperty("--header-h", `${h}px`);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   function NavLink({ item }: { item: NavItem }) {
     const active = item.exact ? pathname === item.to : pathname.startsWith(item.to);
     const badge = item.badge === "review" ? reviewWaiting : undefined;
@@ -209,7 +226,7 @@ export function AdminShell({ children }: { children: ReactNode }) {
 
   return (
     <div className="min-h-screen bg-secondary">
-      <header className="sticky top-0 z-30 border-b bg-card">
+      <header ref={headerRef} className="sticky top-0 z-30 border-b bg-card">
         <div className="flex items-center gap-3 px-4 py-3 sm:px-6">
           <Button
             variant="ghost"
@@ -259,14 +276,15 @@ export function AdminShell({ children }: { children: ReactNode }) {
         <OpsEvidenceBar />
       </header>
 
-      {/* 아래 97px·93px 은 헤더(제목줄 61px + 운영 증거 바 36px) 높이다. 헤더 구성이 바뀌면 함께 고친다. */}
-      <div className="mx-auto flex w-full max-w-[1400px]">
-        <aside className="sticky top-[97px] hidden h-[calc(100vh-97px)] w-60 shrink-0 overflow-y-auto border-r bg-sidebar p-4 lg:block">
+      {/* 헤더 높이는 위 ResizeObserver 가 --header-h 로 실측해 넣는다. */}
+      {/* 읽기 폭은 셸이 아니라 내용이 갖는다 — 화면마다 필요한 폭이 다르므로 여기서 상한을 두지 않는다. */}
+      <div className="flex w-full">
+        <aside className="sticky top-[var(--header-h)] hidden h-[calc(100vh-var(--header-h))] w-60 shrink-0 overflow-y-auto border-r bg-sidebar p-4 lg:block">
           {nav}
         </aside>
 
         {open && (
-          <div className="fixed inset-0 top-[93px] z-20 lg:hidden">
+          <div className="fixed inset-0 top-[var(--header-h)] z-20 lg:hidden">
             <button
               type="button"
               aria-label="메뉴 닫기"

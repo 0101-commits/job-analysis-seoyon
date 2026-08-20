@@ -1797,7 +1797,7 @@ function RosterListTab({
         onSelect={selectOrg}
         counts={orgCounts}
         title="소속"
-        className="h-fit lg:sticky lg:top-4"
+        className="h-fit lg:sticky lg:top-[var(--sticky-top)]"
       />
 
       <div className="min-w-0 space-y-4">
