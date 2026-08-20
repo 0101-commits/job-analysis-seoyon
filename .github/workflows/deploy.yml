@@ -26,11 +26,18 @@ jobs:
       - run: npm ci
 
       # VITE_* 는 빌드 시점에 클라이언트 번들로 인라인된다.
+      # 버전과 빌드 시각은 관리자 화면 상단 운영 표시줄이 읽는다 —
+      # "배포했다는데 화면이 그대로"인 상황을 눈으로 판별하기 위한 값이다.
       - name: Build
-        run: npm run build
+        run: |
+          # 수동 실행(workflow_dispatch)에는 커밋 시각이 없으므로 현재 시각으로 채운다.
+          export VITE_BUILD_TIME="${VITE_BUILD_TIME:-$(date -Is)}"
+          npm run build
         env:
           VITE_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+          VITE_APP_VERSION: ${{ github.sha }}
+          VITE_BUILD_TIME: ${{ github.event.head_commit.timestamp }}
 
       # 산출물 wrangler.json 은 매 빌드 초기화되므로 서버 런타임 vars 와 cron 트리거를 주입한다.
       - name: Inject server vars & cron trigger

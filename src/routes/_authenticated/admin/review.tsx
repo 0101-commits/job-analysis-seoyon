@@ -2,13 +2,10 @@ import { useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Check, ChevronLeft, ChevronRight, Pencil, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Dialog,
   DialogContent,
@@ -25,22 +22,70 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { StatusBadge } from "@/components/StatusBadge";
+import { EmptyState } from "@/components/EmptyState";
+import { SectionNav, CollapsibleSection } from "@/components/SectionNav";
+import { ReviewWorkbench, type CenterView } from "@/components/admin/ReviewWorkbench";
 import { useCompanyScope } from "@/components/CompanyContext";
-import { cn } from "@/lib/utils";
-import {
-  approveResponse,
-  correctField,
-  getJobComparison,
-  getResponseDetail,
-  getSubmissionSnapshots,
-  handleInfoRequest,
-  listInfoRequests,
-  listReviewQueue,
-  rejectResponse,
-} from "@/lib/review.functions";
+import { handleInfoRequest, listInfoRequests, listReviewQueue } from "@/lib/review.functions";
 import { infoFieldLabel } from "@/lib/survey.data";
 
+/**
+ * 응답 검토 화면.
+ *
+ * URL 규약 (D4) — 화면 상태는 전부 URL 이 원천이다. 새로고침·뒤로가기·링크 공유가 모두 동작하고,
+ * 대시보드·참여자 목록·전역 검색·메일은 `?response=<id>` 로 이 화면의 한 건을 바로 연다.
+ *
+ *   ?response=<응답 id>            그 응답을 연 상태로 렌더 (딥링크 수신 규약)
+ *   &status=submitted|draft|rejected|approved|all   검토 대기 목록 상태 필터 (기본 submitted)
+ *   &q=<직무명 검색어>
+ *   &view=detail|diff|job          가운데 패널: 원문 / 이전 제출과 비교 / 같은 직무 비교
+ *   &job=<직무명>                  view=job 일 때 비교 대상 직무
+ *   &req=요청|처리완료|반려|all    정보 수정 요청 구획 상태 필터 (기본 요청)
+ */
+
+const QUEUE_STATUSES = ["submitted", "draft", "rejected", "approved", "all"] as const;
+const VIEWS = ["detail", "diff", "job"] as const;
+const REQ_STATUSES = ["요청", "처리완료", "반려", "all"] as const;
+
+type QueueStatus = (typeof QUEUE_STATUSES)[number];
+type ReqStatus = (typeof REQ_STATUSES)[number];
+
+interface ReviewSearch {
+  response?: string;
+  status?: QueueStatus;
+  q?: string;
+  view?: CenterView;
+  job?: string;
+  req?: ReqStatus;
+}
+
+/** 상태 변경 요청 — undefined 는 "이 키를 URL 에서 지운다"는 뜻이다. */
+type SearchPatch = { [K in keyof ReviewSearch]?: ReviewSearch[K] | undefined };
+
+/** 값이 없는 키는 URL 에 남기지 않는다 (exactOptionalPropertyTypes). */
+function pick<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value)
+    ? (value as T)
+    : undefined;
+}
+
 export const Route = createFileRoute("/_authenticated/admin/review")({
+  validateSearch: (search: Record<string, unknown>): ReviewSearch => {
+    const out: ReviewSearch = {};
+    const response = search["response"];
+    if (typeof response === "string" && response.length > 0) out.response = response;
+    const status = pick(search["status"], QUEUE_STATUSES);
+    if (status) out.status = status;
+    const q = search["q"];
+    if (typeof q === "string" && q.trim().length > 0) out.q = q;
+    const view = pick(search["view"], VIEWS);
+    if (view) out.view = view;
+    const job = search["job"];
+    if (typeof job === "string" && job.length > 0) out.job = job;
+    const req = pick(search["req"], REQ_STATUSES);
+    if (req) out.req = req;
+    return out;
+  },
   head: () => ({
     meta: [
       { title: "응답 검토 | 서연 그룹 업무조사" },
@@ -52,42 +97,6 @@ export const Route = createFileRoute("/_authenticated/admin/review")({
   component: ReviewPage,
 });
 
-type CorrectTable =
-  | "responses"
-  | "response_tasks"
-  | "response_activities"
-  | "response_skills"
-  | "response_requirements";
-
-const STATUS_LABELS: Record<string, string> = {
-  draft: "작성중",
-  submitted: "제출",
-  rejected: "반려",
-  approved: "승인",
-};
-
-const AUTHORITY_LABELS: Record<string, string> = {
-  D: "D 결정",
-  R: "R 검토",
-  O: "O 실행",
-  S: "S 지원",
-};
-
-const STEPS = [
-  "1. 기본 정보",
-  "2. 직무 확인",
-  "3. 정의·목적",
-  "4. 과업·활동",
-  "5. 스킬·요건",
-  "6. 자기평가",
-];
-
-const LV_GUIDE = "Lv.1 기본·일상 수행 → Lv.2 독립 완결 → Lv.3 복잡 업무·코칭 → Lv.4 방향 제시";
-
-/** K/S/A 코드만 보면 뜻을 모르므로 화면에는 한글을 함께 적는다. */
-const KSAO_LABEL: Record<string, string> = { K: "지식 K", S: "기술 S", A: "태도 A" };
-const ksaoLabel = (code: string) => KSAO_LABEL[code] ?? code;
-
 function errorMessage(err: unknown) {
   return err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
 }
@@ -96,194 +105,32 @@ function formatDate(value: string | null) {
   return value ? new Date(value).toLocaleDateString("ko-KR") : "-";
 }
 
-function daysSince(value: string) {
-  return Math.floor((Date.now() - Date.parse(value)) / 86_400_000);
-}
-
-// ── V15-1 재제출 변경분 비교 ──────────────────────────────────
-// 스냅샷 payload(snapshot_submission RPC 산출물)와 현재 데이터를 필드 단위로 비교한다.
-
-type SnapRec = Record<string, unknown>;
-
-interface SnapshotPayload {
-  response?: SnapRec;
-  tasks?: (SnapRec & { activities?: SnapRec[] })[];
-  skills?: SnapRec[];
-  requirements?: SnapRec[];
-}
-
-/** 상세 화면에 표시되는 필드만 비교 대상으로 삼는다 (하이라이트는 표시 레이어이므로). */
-const RESPONSE_DIFF_FIELDS = [
-  "job_group",
-  "job_series",
-  "job_name",
-  "definition",
-  "mission",
-  "missed_note",
-  "pain_note",
-  "coverage_pct",
-  "onboarding_done",
-] as const;
-const TASK_DIFF_FIELDS = [
-  "name",
-  "importance",
-  "authority",
-  "transferable",
-  "improve_type",
-  "improve_note",
-] as const;
-const SKILL_DIFF_FIELDS = ["name", "ksao", "hard_soft", "description"] as const;
-const REQ_DIFF_FIELDS = [
-  "education",
-  "proficiency",
-  "majors_required",
-  "majors_preferred",
-  "trainings",
-  "licenses",
-  "languages",
-] as const;
-
-/** null·undefined·빈 문자열은 같은 값으로, jsonb 배열·객체는 직렬화해 비교한다. */
-function norm(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  return typeof v === "object" ? JSON.stringify(v) : String(v);
-}
-
-interface ListDiff {
-  /** 현재 항목 id → 바뀐 필드 집합 */
-  changed: Map<string, Set<string>>;
-  /** 직전 제출에 없던 현재 항목 id */
-  added: Set<string>;
-  /** 직전 제출에만 있던 항목 (원본 그대로) */
-  removed: SnapRec[];
-  /** 현재 항목 id → 매칭된 직전 항목 */
-  pairs: Map<string, SnapRec>;
-}
-
-/** id 우선, 없으면 이름으로 직전 제출 항목과 매칭해 필드 단위 변경을 계산한다. */
-function diffList(prev: SnapRec[], cur: { id: string }[], fields: readonly string[]): ListDiff {
-  const prevById = new Map(prev.map((p) => [String(p["id"]), p]));
-  const changed = new Map<string, Set<string>>();
-  const added = new Set<string>();
-  const pairs = new Map<string, SnapRec>();
-  const matched = new Set<SnapRec>();
-
-  const compare = (c: { id: string }, p: SnapRec) => {
-    matched.add(p);
-    pairs.set(c.id, p);
-    const fieldDiff = new Set<string>();
-    for (const f of fields) {
-      if (norm((c as SnapRec)[f]) !== norm(p[f])) fieldDiff.add(f);
-    }
-    if (fieldDiff.size > 0) changed.set(c.id, fieldDiff);
-  };
-
-  const unmatchedCur: { id: string }[] = [];
-  for (const c of cur) {
-    const p = prevById.get(c.id);
-    if (p) compare(c, p);
-    else unmatchedCur.push(c);
-  }
-  for (const c of unmatchedCur) {
-    const name = norm((c as SnapRec)["name"]);
-    const p = name ? prev.find((x) => !matched.has(x) && norm(x["name"]) === name) : undefined;
-    if (p) compare(c, p);
-    else added.add(c.id);
-  }
-  return { changed, added, removed: prev.filter((p) => !matched.has(p)), pairs };
-}
-
-type DetailResponse = Awaited<ReturnType<typeof getResponseDetail>>["response"];
-
-interface SnapshotDiff {
-  response: Set<string>;
-  tasks: ListDiff;
-  activityChanged: Set<string>;
-  activityAdded: Set<string>;
-  /** 현재 과업 id → 그 과업에서 삭제된 활동들 */
-  activityRemoved: Map<string, SnapRec[]>;
-  skills: ListDiff;
-  requirements: Set<string>;
-}
-
-function computeDiff(prev: SnapshotPayload, r: DetailResponse): SnapshotDiff {
-  const response = new Set<string>();
-  const cur = r as unknown as SnapRec;
-  for (const f of RESPONSE_DIFF_FIELDS) {
-    if (norm(prev.response?.[f]) !== norm(cur[f])) response.add(f);
-  }
-
-  const tasks = diffList(prev.tasks ?? [], r.response_tasks, TASK_DIFF_FIELDS);
-
-  const activityChanged = new Set<string>();
-  const activityAdded = new Set<string>();
-  const activityRemoved = new Map<string, SnapRec[]>();
-  for (const t of r.response_tasks) {
-    const p = tasks.pairs.get(t.id);
-    if (!p) continue; // 신규 과업은 통째로 "신규" 배지 — 활동은 개별 표시하지 않는다.
-    const d = diffList(
-      ((p as { activities?: SnapRec[] }).activities ?? []) as SnapRec[],
-      t.response_activities,
-      ["name"],
-    );
-    for (const id of d.changed.keys()) activityChanged.add(id);
-    for (const id of d.added) activityAdded.add(id);
-    if (d.removed.length > 0) activityRemoved.set(t.id, d.removed);
-  }
-
-  const skills = diffList(prev.skills ?? [], r.response_skills, SKILL_DIFF_FIELDS);
-
-  const requirements = new Set<string>();
-  const prevReq = prev.requirements?.[0];
-  const curReq = r.response_requirements as unknown as SnapRec | null;
-  for (const f of REQ_DIFF_FIELDS) {
-    if (norm(prevReq?.[f]) !== norm(curReq?.[f])) requirements.add(f);
-  }
-
-  return { response, tasks, activityChanged, activityAdded, activityRemoved, skills, requirements };
-}
-
-/** 변경 필드 노랑 하이라이트 (비교 모드 전용 표시 레이어) */
-const HL = "rounded bg-warning/30 px-1";
-
-function NewBadge() {
-  return (
-    <span className="inline-flex shrink-0 items-center rounded-full bg-success/15 px-2 py-0.5 text-[11px] font-semibold text-success">
-      신규
-    </span>
-  );
-}
-
-function RemovedBadge() {
-  return (
-    <span className="inline-flex shrink-0 items-center rounded-full bg-destructive/10 px-2 py-0.5 text-[11px] font-semibold text-destructive">
-      삭제됨
-    </span>
-  );
-}
-
-/** 직무 응답 수에 따른 신뢰도 배지 — 1인 응답은 인터뷰 없이는 확정할 수 없다. */
-function JobCountBadge({ count }: { count: number }) {
-  const style =
-    count >= 5
-      ? "bg-success/15 text-success"
-      : count >= 2
-        ? "bg-warning/15 text-warning"
-        : "bg-destructive/10 text-destructive";
-  const label = count >= 5 ? "정상" : count >= 2 ? "주의" : "인터뷰 필수";
-  return (
-    <span className={cn("inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold", style)}>
-      {count}인 · {label}
-    </span>
-  );
-}
-
 function ReviewPage() {
   const { companyId } = useCompanyScope();
   const scope = companyId === "all" ? null : companyId;
-  const [status, setStatus] = useState("submitted");
-  const [jobQuery, setJobQuery] = useState("");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const search = Route.useSearch();
+  const navigate = Route.useNavigate();
+
+  const status = search.status ?? "submitted";
+  const jobQuery = search.q ?? "";
+  const view = search.view ?? "detail";
+  const reqStatus = search.req ?? "요청";
+  const selectedId = search.response ?? null;
+
+  /** 화면 상태 변경은 전부 URL 갱신으로 처리한다. 빈 값은 키째 지운다. */
+  function setSearch(patch: SearchPatch, replace = false) {
+    void navigate({
+      search: (prev: ReviewSearch) => {
+        const next: SearchPatch = { ...prev, ...patch };
+        for (const key of Object.keys(next) as (keyof SearchPatch)[]) {
+          const value = next[key];
+          if (value === undefined || value === "") delete next[key];
+        }
+        return next as ReviewSearch;
+      },
+      replace,
+    });
+  }
 
   const { data, isLoading } = useQuery({
     queryKey: ["review-queue", scope, status, jobQuery],
@@ -291,8 +138,7 @@ function ReviewPage() {
       listReviewQueue({
         data: {
           companyId: scope,
-          status:
-            status === "all" ? null : (status as "draft" | "submitted" | "rejected" | "approved"),
+          status: status === "all" ? null : status,
           jobName: jobQuery.trim() || undefined,
         },
       }),
@@ -301,970 +147,67 @@ function ReviewPage() {
   const rows = data?.rows ?? [];
   const jobNames = Object.keys(data?.jobCounts ?? {}).sort((a, b) => a.localeCompare(b));
 
-  // V15-4 검토 적체 — 현재 목록 중 미검토(제출 상태) 건의 평균 대기일
-  const pendingWaits = rows
-    .filter((r) => r.status === "submitted" && r.submitted_at)
-    .map((r) => daysSince(r.submitted_at!));
-  const avgWait =
-    pendingWaits.length > 0
-      ? Math.round((pendingWaits.reduce((a, b) => a + b, 0) / pendingWaits.length) * 10) / 10
-      : null;
-
-  const selectedIndex = selectedId ? rows.findIndex((r) => r.id === selectedId) : -1;
-
-  const [infoStatus, setInfoStatus] = useState("요청");
   const { data: infoData, isLoading: infoLoading } = useQuery({
-    queryKey: ["info-requests", infoStatus],
-    queryFn: () =>
-      listInfoRequests({
-        data: { status: infoStatus === "all" ? null : (infoStatus as "요청" | "처리완료" | "반려") },
-      }),
+    queryKey: ["info-requests", reqStatus],
+    queryFn: () => listInfoRequests({ data: { status: reqStatus === "all" ? null : reqStatus } }),
   });
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <div>
         <h1 className="text-xl font-bold sm:text-2xl">응답 검토</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          제출된 업무조사를 검토하고 승인 또는 반려합니다. 총 {rows.length}건
+          제출된 업무조사를 한 건씩 판단합니다. 지금 조건에 맞는 응답 {rows.length}건.
         </p>
       </div>
 
-      <Tabs defaultValue="queue">
-        <TabsList className="w-full sm:w-auto">
-          <TabsTrigger value="queue" className="flex-1 sm:flex-none">
-            건별 검토
-          </TabsTrigger>
-          <TabsTrigger value="compare" className="flex-1 sm:flex-none">
-            직무 비교
-          </TabsTrigger>
-          <TabsTrigger value="info" className="flex-1 gap-2 sm:flex-none">
-            정정 요청
-            {infoData?.pending ? (
-              <span className="rounded-full bg-destructive px-1.5 py-0.5 text-[11px] font-semibold text-destructive-foreground">
-                {infoData.pending}
-              </span>
-            ) : null}
-          </TabsTrigger>
-        </TabsList>
+      <SectionNav
+        sections={[
+          { id: "workbench", label: "검토 대기", count: rows.length },
+          { id: "info-requests", label: "정보 수정 요청", count: infoData?.pending ?? 0 },
+        ]}
+      />
 
-        <TabsContent value="queue" className="mt-4">
-          {/* 좌우 분할이 아니라 전환형 — 응답을 고르면 응답자 화면과 같은 한 단 흐름으로 상세만 본다. */}
-          <div className="space-y-4">
-            <div className={cn("space-y-3", selectedId && "hidden")}>
-              <div className="space-y-2 rounded-xl border bg-card p-3 shadow-sm">
-                <Select value={status} onValueChange={setStatus}>
-                  <SelectTrigger aria-label="상태 필터">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="submitted">제출</SelectItem>
-                    <SelectItem value="draft">작성중</SelectItem>
-                    <SelectItem value="rejected">반려</SelectItem>
-                    <SelectItem value="approved">승인</SelectItem>
-                    <SelectItem value="all">전체</SelectItem>
-                  </SelectContent>
-                </Select>
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    value={jobQuery}
-                    onChange={(e) => setJobQuery(e.target.value)}
-                    placeholder="직무명 검색"
-                    aria-label="직무명 검색"
-                    className="pl-9"
-                  />
-                </div>
-                {avgWait !== null && (
-                  <p className="text-xs text-muted-foreground">
-                    미검토 {pendingWaits.length}건 · 제출 후 평균 {avgWait}일 대기
-                  </p>
-                )}
-              </div>
+      <section id="workbench" className="scroll-mt-20">
+        <ReviewWorkbench
+          rows={rows}
+          isLoading={isLoading}
+          selectedId={selectedId}
+          onSelect={(id) => setSearch({ response: id ?? undefined })}
+          status={status}
+          onStatusChange={(v) => setSearch({ status: v as QueueStatus })}
+          query={jobQuery}
+          onQueryChange={(v) => setSearch({ q: v }, true)}
+          view={view}
+          onViewChange={(v) => setSearch({ view: v === "detail" ? undefined : v })}
+          compareJob={search.job ?? null}
+          onCompareJobChange={(v) => setSearch({ job: v ?? undefined })}
+          jobNames={jobNames}
+          companyId={scope}
+        />
+      </section>
 
-              {isLoading ? (
-                <p className="text-sm text-muted-foreground">불러오는 중...</p>
-              ) : rows.length === 0 ? (
-                <p className="rounded-xl border border-dashed bg-card p-6 text-center text-sm text-muted-foreground">
-                  조건에 맞는 응답이 없습니다.
-                </p>
-              ) : (
-                <ul className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                  {rows.map((r) => (
-                    <li key={r.id}>
-                      <button
-                        type="button"
-                        onClick={() => setSelectedId(r.id)}
-                        className={cn(
-                          "w-full rounded-xl border bg-card p-4 text-left shadow-sm transition-colors hover:border-primary",
-                          selectedId === r.id && "border-primary ring-1 ring-primary",
-                        )}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <p className="font-semibold">
-                            {r.participants?.name ?? "-"}
-                            <span className="ml-2 text-xs font-normal text-muted-foreground">
-                              {r.participants?.role_level ?? "-"}
-                            </span>
-                          </p>
-                          <StatusBadge status={STATUS_LABELS[r.status] ?? r.status} />
-                        </div>
-                        <p className="mt-1 truncate text-xs text-muted-foreground">
-                          {r.companies?.name} · {r.participants?.org_text ?? "-"}
-                        </p>
-                        <p className="mt-2 truncate text-sm font-medium">{r.job_name ?? "직무 미입력"}</p>
-                        <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <JobCountBadge count={r.jobCount} />
-                            {r.status === "submitted" && r.submitted_at && (
-                              <span
-                                className={cn(
-                                  "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold",
-                                  daysSince(r.submitted_at) > 5
-                                    ? "bg-warning/15 text-warning"
-                                    : "bg-secondary text-muted-foreground",
-                                )}
-                              >
-                                제출 후 {daysSince(r.submitted_at)}일
-                              </span>
-                            )}
-                          </div>
-                          <span className="text-xs text-muted-foreground">
-                            {formatDate(r.submitted_at)}
-                          </span>
-                        </div>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-            {selectedId && (
-              // 응답자가 보던 폭과 비슷하게 가운데 한 단으로. 목록은 [목록] 버튼으로 돌아간다.
-              <div className="mx-auto w-full max-w-3xl">
-                <ReviewDetail
-                  responseId={selectedId}
-                  onClose={() => setSelectedId(null)}
-                  prevId={selectedIndex > 0 ? (rows[selectedIndex - 1]?.id ?? null) : null}
-                  nextId={selectedIndex >= 0 ? (rows[selectedIndex + 1]?.id ?? null) : null}
-                  onNavigate={setSelectedId}
-                />
-              </div>
-            )}
-          </div>
-        </TabsContent>
-
-        <TabsContent value="compare" className="mt-4">
-          <JobComparison jobNames={jobNames} companyId={scope} />
-        </TabsContent>
-
-        <TabsContent value="info" className="mt-4">
-          <InfoRequests
-            rows={infoData?.rows ?? []}
-            isLoading={infoLoading}
-            status={infoStatus}
-            onStatusChange={setInfoStatus}
-          />
-        </TabsContent>
-      </Tabs>
-    </div>
-  );
-}
-
-/** 관리자 직접 정정 — 저장 시 review_comments 에 correction 이력이 남는다. */
-function EditableText({
-  responseId,
-  table,
-  id,
-  field,
-  value,
-  multiline,
-  className,
-  highlight,
-  readOnly,
-}: {
-  responseId: string;
-  table: CorrectTable;
-  id: string;
-  field: string;
-  value: string | null;
-  multiline?: boolean;
-  className?: string;
-  /** 비교 모드 — 직전 제출과 값이 달라진 필드 */
-  highlight?: boolean;
-  /** 비교 모드 중에는 정정(연필)을 숨긴다 — 표시 레이어와 편집이 섞이지 않게 */
-  readOnly?: boolean;
-}) {
-  const queryClient = useQueryClient();
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(value ?? "");
-
-  const mutation = useMutation({
-    mutationFn: () => correctField({ data: { responseId, table, id, field, value: draft } }),
-    onSuccess: (result) => {
-      setEditing(false);
-      if (result.changed) {
-        toast.success("정정 내용이 기록되었습니다.");
-        void queryClient.invalidateQueries({ queryKey: ["review-detail", responseId] });
-        void queryClient.invalidateQueries({ queryKey: ["review-queue"] });
-      }
-    },
-    onError: (err) => toast.error(`정정에 실패했습니다: ${errorMessage(err)}`),
-  });
-
-  if (editing) {
-    return (
-      <div className="space-y-2">
-        {multiline ? (
-          <Textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            rows={3}
-            aria-label="정정 내용"
-          />
-        ) : (
-          <Input value={draft} onChange={(e) => setDraft(e.target.value)} aria-label="정정 내용" />
-        )}
-        <div className="flex gap-2">
-          <Button size="sm" onClick={() => mutation.mutate()} disabled={mutation.isPending}>
-            <Check className="size-4" /> 저장
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => {
-              setDraft(value ?? "");
-              setEditing(false);
-            }}
-          >
-            <X className="size-4" /> 취소
-          </Button>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className={cn("flex items-start gap-2", className)}>
-      <span className={cn("min-w-0 flex-1 whitespace-pre-wrap break-words", highlight && HL)}>
-        {value || "-"}
-      </span>
-      {!readOnly && (
-        <button
-          type="button"
-          aria-label="정정"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
-          onClick={() => {
-            setDraft(value ?? "");
-            setEditing(true);
-          }}
-        >
-          <Pencil className="size-3.5" />
-        </button>
-      )}
-    </div>
-  );
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="rounded-xl border bg-card p-4 shadow-sm">
-      <h3 className="text-sm font-bold text-primary">{title}</h3>
-      <div className="mt-3 space-y-3 text-sm">{children}</div>
-    </section>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <p className="text-xs text-muted-foreground">{label}</p>
-      <div className="mt-0.5 font-medium">{children}</div>
-    </div>
-  );
-}
-
-function AiDraftBadge() {
-  return (
-    <span className="inline-flex shrink-0 items-center rounded-full bg-warning/15 px-2 py-0.5 text-[11px] font-semibold text-warning">
-      AI 초안
-    </span>
-  );
-}
-
-function ReviewDetail({
-  responseId,
-  onClose,
-  prevId,
-  nextId,
-  onNavigate,
-}: {
-  responseId: string;
-  onClose: () => void;
-  prevId: string | null;
-  nextId: string | null;
-  onNavigate: (id: string) => void;
-}) {
-  const queryClient = useQueryClient();
-  const [approveOpen, setApproveOpen] = useState(false);
-  const [interviewChecked, setInterviewChecked] = useState(false);
-  const [rejectOpen, setRejectOpen] = useState(false);
-  const [rejectStep, setRejectStep] = useState("4");
-  const [rejectComment, setRejectComment] = useState("");
-  const [compareOn, setCompareOn] = useState(false);
-
-  const { data, isLoading } = useQuery({
-    queryKey: ["review-detail", responseId],
-    queryFn: () => getResponseDetail({ data: { responseId } }),
-  });
-
-  // V15-1 — 스냅샷이 2개 이상(=재제출)일 때만 비교 버튼을 노출한다.
-  const { data: snapData } = useQuery({
-    queryKey: ["snapshots", responseId],
-    queryFn: () => getSubmissionSnapshots({ data: { responseId } }),
-  });
-  const snaps = snapData?.list ?? [];
-  const prevSnap = snaps.length >= 2 ? snaps[snaps.length - 2] : null;
-
-  const { data: prevPayloadData } = useQuery({
-    queryKey: ["snapshot-payload", responseId, prevSnap?.seq],
-    queryFn: () => getSubmissionSnapshots({ data: { responseId, seq: prevSnap!.seq } }),
-    enabled: compareOn && prevSnap !== null,
-  });
-
-  function invalidate() {
-    void queryClient.invalidateQueries({ queryKey: ["review-detail", responseId] });
-    void queryClient.invalidateQueries({ queryKey: ["review-queue"] });
-  }
-
-  const approve = useMutation({
-    mutationFn: (interviewConfirmed: boolean) =>
-      approveResponse({ data: { responseId, interviewConfirmed } }),
-    onSuccess: (result) => {
-      if (!result.ok) {
-        toast.error(result.reason ?? "승인할 수 없습니다.");
-        if (result.needsInterview) setApproveOpen(true);
-        return;
-      }
-      setApproveOpen(false);
-      setInterviewChecked(false);
-      toast.success("응답이 승인되었습니다.");
-      invalidate();
-    },
-    onError: (err) => toast.error(`승인에 실패했습니다: ${errorMessage(err)}`),
-  });
-
-  const reject = useMutation({
-    mutationFn: () =>
-      rejectResponse({
-        data: { responseId, step: Number(rejectStep), comment: rejectComment.trim() },
-      }),
-    onSuccess: () => {
-      setRejectOpen(false);
-      setRejectComment("");
-      toast.success("응답이 반려되었습니다.");
-      invalidate();
-    },
-    onError: (err) => toast.error(`반려에 실패했습니다: ${errorMessage(err)}`),
-  });
-
-  if (isLoading || !data) {
-    return <p className="text-sm text-muted-foreground">불러오는 중...</p>;
-  }
-
-  const r = data.response;
-  const req = r.response_requirements;
-  const licenses = (req?.licenses ?? []) as { name?: string; kind?: string; grade?: string }[];
-  const languages = (req?.languages ?? []) as { language?: string; level?: string }[];
-
-  const diff =
-    compareOn && prevSnap && prevPayloadData?.payload
-      ? computeDiff(prevPayloadData.payload as SnapshotPayload, r)
-      : null;
-  const ro = diff !== null;
-  const hlR = (f: string) => !!diff?.response.has(f);
-  const hlT = (id: string, f: string) => !!diff?.tasks.changed.get(id)?.has(f);
-  const hlS = (id: string, f: string) => !!diff?.skills.changed.get(id)?.has(f);
-  const hlQ = (f: string) => !!diff?.requirements.has(f);
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-1">
-          {/* 전환형 레이아웃이라 폭에 관계없이 목록 복귀 버튼이 필요하다. */}
-          <Button variant="outline" size="sm" onClick={onClose}>
-            <ChevronLeft className="size-4" /> 목록
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!prevId}
-            onClick={() => prevId && onNavigate(prevId)}
-          >
-            <ChevronLeft className="size-4" /> 이전
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!nextId}
-            onClick={() => nextId && onNavigate(nextId)}
-          >
-            다음 <ChevronRight className="size-4" />
-          </Button>
-        </div>
-        <div className="flex flex-1 items-center justify-end gap-2">
-          {prevSnap && (
-            <Button
-              variant={compareOn ? "secondary" : "outline"}
-              size="sm"
-              onClick={() => setCompareOn((v) => !v)}
-            >
-              이전 제출과 비교
-            </Button>
-          )}
-          <JobCountBadge count={data.jobCount} />
-          <StatusBadge status={STATUS_LABELS[r.status] ?? r.status} />
-        </div>
-      </div>
-
-      {compareOn && prevSnap && (
-        <p className="rounded-xl border border-warning/40 bg-warning/10 p-3 text-sm">
-          {diff ? (
-            <>
-              {prevSnap.seq}차 제출({formatDate(prevSnap.created_at)}) 대비 변경분을 표시합니다 —{" "}
-              <span className={HL}>노랑</span>=변경, 신규·삭제는 배지로 표시됩니다. 비교 중에는
-              정정이 비활성화됩니다.
-            </>
-          ) : (
-            "비교 데이터를 불러오는 중..."
-          )}
-        </p>
-      )}
-
-      {r.status === "draft" && (
-        <p className="rounded-xl border bg-secondary p-3 text-sm text-muted-foreground">
-          작성 중 응답은 승인·반려할 수 없고 열람·정정만 가능합니다. 정정하면 작성자가 화면을 열어
-          두었던 경우 최신 내용 확인 안내를 받게 됩니다.
-        </p>
-      )}
-
-      {data.aiDraft.any && (
-        <p className="rounded-xl border border-warning/40 bg-warning/10 p-3 text-sm text-warning">
-          확정되지 않은 AI 초안이 남아 있습니다 (스킬 {data.aiDraft.skills}건
-          {data.aiDraft.requirements ? ", 자격요건 포함" : ""}). 승인 전에 확정 또는 정정이
-          필요합니다.
-        </p>
-      )}
-
-      <Section title="기본 정보">
-        <dl className="grid grid-cols-2 gap-3">
-          <Field label="성명">{r.participants?.name ?? "-"}</Field>
-          <Field label="사번">{r.participants?.emp_no ?? "-"}</Field>
-          <Field label="소속">{r.participants?.org_text ?? "-"}</Field>
-          <Field label="계열사">{r.companies?.name ?? "-"}</Field>
-          <Field label="직급">{r.participants?.grade ?? "-"}</Field>
-          <Field label="역할단계">{r.participants?.role_level ?? "-"}</Field>
-          <Field label="제출일">{formatDate(r.submitted_at)}</Field>
-          <Field label="검토일">{formatDate(r.reviewed_at)}</Field>
-        </dl>
-      </Section>
-
-      <Section title="직무">
-        <dl className="grid gap-3 sm:grid-cols-3">
-          <Field label="직군">
-            <EditableText responseId={r.id} table="responses" id={r.id} field="job_group" value={r.job_group} highlight={hlR("job_group")} readOnly={ro} />
-          </Field>
-          <Field label="직렬">
-            <EditableText responseId={r.id} table="responses" id={r.id} field="job_series" value={r.job_series} highlight={hlR("job_series")} readOnly={ro} />
-          </Field>
-          <Field label="직무명">
-            <EditableText responseId={r.id} table="responses" id={r.id} field="job_name" value={r.job_name} highlight={hlR("job_name")} readOnly={ro} />
-          </Field>
-        </dl>
-      </Section>
-
-      <Section title="정의 · 목적">
-        <Field label="직무 정의">
-          <EditableText
-            responseId={r.id}
-            table="responses"
-            id={r.id}
-            field="definition"
-            value={r.definition}
-            multiline
-            highlight={hlR("definition")}
-            readOnly={ro}
-          />
-        </Field>
-        <Field label="직무 미션">
-          <EditableText
-            responseId={r.id}
-            table="responses"
-            id={r.id}
-            field="mission"
-            value={r.mission}
-            multiline
-            highlight={hlR("mission")}
-            readOnly={ro}
-          />
-        </Field>
-      </Section>
-
-      <Section title={`과업 (${r.response_tasks.length}건)`}>
-        {r.response_tasks.length === 0 ? (
-          <p className="text-muted-foreground">등록된 과업이 없습니다.</p>
-        ) : (
-          <ul className="space-y-3">
-            {r.response_tasks.map((t, i) => {
-              const removedActs = diff?.activityRemoved.get(t.id) ?? [];
-              return (
-                <li key={t.id} className="rounded-lg border p-3">
-                  <div className="flex items-start gap-2">
-                    <span className="mt-0.5 text-xs font-semibold text-muted-foreground">
-                      {i + 1}
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <EditableText
-                        responseId={r.id}
-                        table="response_tasks"
-                        id={t.id}
-                        field="name"
-                        value={t.name}
-                        multiline
-                        highlight={hlT(t.id, "name")}
-                        readOnly={ro}
-                      />
-                    </div>
-                    {diff?.tasks.added.has(t.id) && <NewBadge />}
-                  </div>
-                  <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                    <span
-                      className={cn(
-                        "rounded-full px-2 py-0.5",
-                        hlT(t.id, "importance") ? "bg-warning/30" : "bg-secondary",
-                      )}
-                    >
-                      중요도 {t.importance ?? "-"}
-                    </span>
-                    <span
-                      className={cn(
-                        "rounded-full px-2 py-0.5",
-                        hlT(t.id, "authority") ? "bg-warning/30" : "bg-secondary",
-                      )}
-                    >
-                      {t.authority ? AUTHORITY_LABELS[t.authority] : "책임수준 미입력"}
-                    </span>
-                    {t.transferable !== null && (
-                      <span
-                        className={cn(
-                          "rounded-full px-2 py-0.5",
-                          hlT(t.id, "transferable") ? "bg-warning/30" : "bg-secondary",
-                        )}
-                      >
-                        {t.transferable ? "이관 가능" : "이관 불가"}
-                      </span>
-                    )}
-                    {t.improve_type && (
-                      <span
-                        className={cn(
-                          "rounded-full px-2 py-0.5 text-accent-foreground",
-                          hlT(t.id, "improve_type") ? "bg-warning/30" : "bg-primary-soft",
-                        )}
-                      >
-                        개선: {t.improve_type}
-                      </span>
-                    )}
-                  </div>
-                  {t.improve_note && (
-                    <div className="mt-2 text-xs text-muted-foreground">
-                      <EditableText
-                        responseId={r.id}
-                        table="response_tasks"
-                        id={t.id}
-                        field="improve_note"
-                        value={t.improve_note}
-                        multiline
-                        highlight={hlT(t.id, "improve_note")}
-                        readOnly={ro}
-                      />
-                    </div>
-                  )}
-                  {(t.response_activities.length > 0 || removedActs.length > 0) && (
-                    <ul className="mt-2 space-y-1 border-t pt-2 text-xs">
-                      {t.response_activities.map((a) => (
-                        <li key={a.id} className="flex gap-2">
-                          <span className="text-muted-foreground">·</span>
-                          <div className="min-w-0 flex-1">
-                            <EditableText
-                              responseId={r.id}
-                              table="response_activities"
-                              id={a.id}
-                              field="name"
-                              value={a.name}
-                              highlight={diff?.activityChanged.has(a.id) ?? false}
-                              readOnly={ro}
-                            />
-                          </div>
-                          {diff?.activityAdded.has(a.id) && <NewBadge />}
-                        </li>
-                      ))}
-                      {removedActs.map((a, j) => (
-                        <li key={`removed-act-${j}`} className="flex items-center gap-2">
-                          <span className="text-muted-foreground">·</span>
-                          <span className="min-w-0 flex-1 text-muted-foreground line-through">
-                            {norm(a["name"]) || "-"}
-                          </span>
-                          <RemovedBadge />
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        )}
-        {diff && diff.tasks.removed.length > 0 && (
-          <ul className="space-y-2">
-            {diff.tasks.removed.map((t, i) => (
-              <li
-                key={`removed-task-${i}`}
-                className="flex items-center gap-2 rounded-lg border border-dashed p-3"
-              >
-                <span className="min-w-0 flex-1 text-muted-foreground line-through">
-                  {norm(t["name"]) || "-"}
-                </span>
-                <RemovedBadge />
-              </li>
-            ))}
-          </ul>
-        )}
-      </Section>
-
-      <Section title={`스킬 · 자격요건 (스킬 ${r.response_skills.length}건)`}>
-        {r.response_skills.length === 0 ? (
-          <p className="text-muted-foreground">등록된 스킬이 없습니다.</p>
-        ) : (
-          <ul className="space-y-2">
-            {r.response_skills.map((s) => (
-              <li key={s.id} className="rounded-lg border p-3">
-                <div className="flex items-start gap-2">
-                  <div className="min-w-0 flex-1 font-medium">
-                    <EditableText
-                      responseId={r.id}
-                      table="response_skills"
-                      id={s.id}
-                      field="name"
-                      value={s.name}
-                      highlight={hlS(s.id, "name")}
-                      readOnly={ro}
-                    />
-                  </div>
-                  {diff?.skills.added.has(s.id) && <NewBadge />}
-                  {s.ai_draft && <AiDraftBadge />}
-                </div>
-                <div className="mt-1 flex flex-wrap gap-2 text-xs">
-                  {s.ksao && (
-                    <span
-                      className={cn(
-                        "rounded-full px-2 py-0.5",
-                        hlS(s.id, "ksao") ? "bg-warning/30" : "bg-secondary",
-                      )}
-                    >
-                      {ksaoLabel(s.ksao)}
-                    </span>
-                  )}
-                  {s.hard_soft && (
-                    <span
-                      className={cn(
-                        "rounded-full px-2 py-0.5",
-                        hlS(s.id, "hard_soft") ? "bg-warning/30" : "bg-secondary",
-                      )}
-                    >
-                      {s.hard_soft}
-                    </span>
-                  )}
-                </div>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  <EditableText
-                    responseId={r.id}
-                    table="response_skills"
-                    id={s.id}
-                    field="description"
-                    value={s.description}
-                    multiline
-                    highlight={hlS(s.id, "description")}
-                    readOnly={ro}
-                  />
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-        {diff && diff.skills.removed.length > 0 && (
-          <ul className="space-y-2">
-            {diff.skills.removed.map((s, i) => (
-              <li
-                key={`removed-skill-${i}`}
-                className="flex items-center gap-2 rounded-lg border border-dashed p-3"
-              >
-                <span className="min-w-0 flex-1 text-muted-foreground line-through">
-                  {norm(s["name"]) || "-"}
-                </span>
-                <RemovedBadge />
-              </li>
-            ))}
-          </ul>
-        )}
-
-        <div className="rounded-lg border p-3">
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-xs font-semibold text-muted-foreground">자격요건</p>
-            {req?.ai_draft && <AiDraftBadge />}
-          </div>
-          {req ? (
-            <dl className="mt-2 grid gap-3 sm:grid-cols-2">
-              <Field label="학력">
-                <span className={cn(hlQ("education") && HL)}>{req.education ?? "-"}</span>
-              </Field>
-              <Field label="숙련 기간">
-                <EditableText
-                  responseId={r.id}
-                  table="response_requirements"
-                  id={req.id}
-                  field="proficiency"
-                  value={req.proficiency}
-                  highlight={hlQ("proficiency")}
-                  readOnly={ro}
-                />
-              </Field>
-              <Field label="필수 전공">
-                <EditableText
-                  responseId={r.id}
-                  table="response_requirements"
-                  id={req.id}
-                  field="majors_required"
-                  value={req.majors_required}
-                  highlight={hlQ("majors_required")}
-                  readOnly={ro}
-                />
-              </Field>
-              <Field label="우대 전공">
-                <EditableText
-                  responseId={r.id}
-                  table="response_requirements"
-                  id={req.id}
-                  field="majors_preferred"
-                  value={req.majors_preferred}
-                  highlight={hlQ("majors_preferred")}
-                  readOnly={ro}
-                />
-              </Field>
-              <Field label="자격증">
-                <span className={cn(hlQ("licenses") && HL)}>
-                  {licenses.length === 0
-                    ? "-"
-                    : licenses
-                        .map((l) => [l.name, l.grade, l.kind].filter(Boolean).join(" "))
-                        .join(", ")}
-                </span>
-              </Field>
-              <Field label="어학">
-                <span className={cn(hlQ("languages") && HL)}>
-                  {languages.length === 0
-                    ? "-"
-                    : languages
-                        .map((l) => [l.language, l.level].filter(Boolean).join(" "))
-                        .join(", ")}
-                </span>
-              </Field>
-              <div className="sm:col-span-2">
-                <Field label="교육 이수">
-                  <EditableText
-                    responseId={r.id}
-                    table="response_requirements"
-                    id={req.id}
-                    field="trainings"
-                    value={req.trainings}
-                    multiline
-                    highlight={hlQ("trainings")}
-                    readOnly={ro}
-                  />
-                </Field>
-              </div>
-            </dl>
-          ) : (
-            <p className="mt-2 text-muted-foreground">작성된 자격요건이 없습니다.</p>
-          )}
-        </div>
-      </Section>
-
-      <Section title="자기평가">
-        <dl className="grid gap-3 sm:grid-cols-2">
-          <Field label="업무 포괄 정도">
-            <span className={cn(hlR("coverage_pct") && HL)}>
-              {r.coverage_pct ? `${r.coverage_pct}%` : "-"}
+      <CollapsibleSection
+        storageKey="review-page"
+        id="info-requests"
+        title="정보 수정 요청"
+        subtitle="참여자가 보낸 인사정보 정정 요청을 확인하고 반영합니다."
+        defaultCollapsed
+        aside={
+          infoData?.pending ? (
+            <span className="rounded-full bg-destructive px-2 py-0.5 text-[11px] font-semibold text-destructive-foreground">
+              {infoData.pending}
             </span>
-          </Field>
-          <Field label="온보딩 완료">
-            <span className={cn(hlR("onboarding_done") && HL)}>
-              {r.onboarding_done ? "예" : "아니오"}
-            </span>
-          </Field>
-          <div className="sm:col-span-2">
-            <Field label="누락된 업무">
-              <EditableText
-                responseId={r.id}
-                table="responses"
-                id={r.id}
-                field="missed_note"
-                value={r.missed_note}
-                multiline
-                highlight={hlR("missed_note")}
-                readOnly={ro}
-              />
-            </Field>
-          </div>
-          <div className="sm:col-span-2">
-            <Field label="업무 애로사항">
-              <EditableText
-                responseId={r.id}
-                table="responses"
-                id={r.id}
-                field="pain_note"
-                value={r.pain_note}
-                multiline
-                highlight={hlR("pain_note")}
-                readOnly={ro}
-              />
-            </Field>
-          </div>
-        </dl>
-      </Section>
-
-      {r.review_comments.length > 0 && (
-        <Section title={`검토 이력 (${r.review_comments.length}건)`}>
-          <ul className="space-y-2">
-            {r.review_comments.map((c) => (
-              <li key={c.id} className="rounded-lg border p-3 text-xs">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-semibold">
-                    {c.kind === "reject" ? "반려" : c.kind === "correction" ? "정정" : "코멘트"}
-                    {c.step ? ` · ${STEPS[c.step - 1] ?? `${c.step}단계`}` : ""}
-                  </span>
-                  <span className="text-muted-foreground">{formatDate(c.created_at)}</span>
-                </div>
-                <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{c.body}</p>
-              </li>
-            ))}
-          </ul>
-        </Section>
-      )}
-
-      <div className="sticky bottom-0 flex gap-2 border-t bg-card p-3 shadow-sm">
-        <Button
-          className="flex-1"
-          disabled={approve.isPending || r.status === "approved" || r.status === "draft"}
-          onClick={() => {
-            if (data.jobCount <= 1) {
-              setApproveOpen(true);
-              return;
-            }
-            approve.mutate(false);
-          }}
-        >
-          승인
-        </Button>
-        <Button
-          variant="outline"
-          className="flex-1"
-          disabled={reject.isPending || r.status === "rejected" || r.status === "draft"}
-          onClick={() => setRejectOpen(true)}
-        >
-          반려
-        </Button>
-      </div>
-
-      <Dialog open={approveOpen} onOpenChange={setApproveOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>인터뷰 확인 후 승인</DialogTitle>
-            <DialogDescription>
-              「{r.job_name ?? "직무 미입력"}」은 응답이 {data.jobCount}건뿐입니다. 후속 인터뷰로
-              내용을 확인한 경우에만 승인할 수 있습니다.
-            </DialogDescription>
-          </DialogHeader>
-          <label className="flex items-start gap-3 rounded-lg border p-3 text-sm">
-            <Checkbox
-              checked={interviewChecked}
-              onCheckedChange={(v) => setInterviewChecked(v === true)}
-            />
-            <span>후속 인터뷰를 통해 응답 내용을 확인했습니다.</span>
-          </label>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setApproveOpen(false)}>
-              취소
-            </Button>
-            <Button
-              disabled={!interviewChecked || approve.isPending}
-              onClick={() => approve.mutate(true)}
-            >
-              승인
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={rejectOpen} onOpenChange={setRejectOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>응답 반려</DialogTitle>
-            <DialogDescription>
-              돌아갈 단계와 사유를 남기면 응답자가 해당 단계부터 다시 작성합니다.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="reject-step">되돌릴 단계</Label>
-              <Select value={rejectStep} onValueChange={setRejectStep}>
-                <SelectTrigger id="reject-step">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {STEPS.map((label, i) => (
-                    <SelectItem key={label} value={String(i + 1)}>
-                      {label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="reject-comment">반려 사유 (필수)</Label>
-              <Textarea
-                id="reject-comment"
-                rows={4}
-                value={rejectComment}
-                onChange={(e) => setRejectComment(e.target.value)}
-                placeholder="어떤 부분을 어떻게 보완해야 하는지 구체적으로 적어 주세요."
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setRejectOpen(false)}>
-              취소
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={!rejectComment.trim() || reject.isPending}
-              onClick={() => reject.mutate()}
-            >
-              반려
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          ) : null
+        }
+      >
+        <InfoRequests
+          rows={infoData?.rows ?? []}
+          isLoading={infoLoading}
+          status={reqStatus}
+          onStatusChange={(v) => setSearch({ req: v as ReqStatus })}
+        />
+      </CollapsibleSection>
     </div>
   );
 }
@@ -1337,9 +280,11 @@ function InfoRequests({
       {isLoading ? (
         <p className="text-sm text-muted-foreground">불러오는 중...</p>
       ) : rows.length === 0 ? (
-        <p className="rounded-xl border border-dashed bg-card p-8 text-center text-sm text-muted-foreground">
-          조건에 맞는 정정 요청이 없습니다.
-        </p>
+        <EmptyState
+          kind="nothing"
+          title="처리할 정정 요청이 없습니다"
+          description="참여자가 1단계에서 인사정보 정정을 요청하면 여기에 쌓입니다. 다른 상태를 보려면 위 필터를 바꾸세요."
+        />
       ) : (
         <ul className="space-y-3">
           {rows.map((r) => (
@@ -1462,104 +407,6 @@ function InfoRequests({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
-  );
-}
-
-function JobComparison({ jobNames, companyId }: { jobNames: string[]; companyId: string | null }) {
-  const [job, setJob] = useState("");
-
-  const { data, isFetching } = useQuery({
-    queryKey: ["job-comparison", job, companyId],
-    queryFn: () => getJobComparison({ data: { jobName: job, companyId } }),
-    enabled: job.length > 0,
-  });
-
-  return (
-    <div className="space-y-4">
-      <div className="rounded-xl border border-primary/30 bg-primary-soft p-3 text-sm text-accent-foreground">
-        <p className="font-semibold">역할단계 참조표</p>
-        <p className="mt-1">{LV_GUIDE}</p>
-      </div>
-
-      <div className="max-w-sm">
-        <Select value={job} onValueChange={setJob}>
-          <SelectTrigger aria-label="비교할 직무 선택">
-            <SelectValue placeholder="비교할 직무를 선택하세요" />
-          </SelectTrigger>
-          <SelectContent>
-            {jobNames.map((name) => (
-              <SelectItem key={name} value={name}>
-                {name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {!job ? (
-        <p className="rounded-xl border border-dashed bg-card p-8 text-center text-sm text-muted-foreground">
-          직무를 선택하면 응답자별 과업·스킬을 나란히 비교합니다.
-        </p>
-      ) : isFetching || !data ? (
-        <p className="text-sm text-muted-foreground">불러오는 중...</p>
-      ) : data.columns.length === 0 ? (
-        <p className="rounded-xl border border-dashed bg-card p-8 text-center text-sm text-muted-foreground">
-          비교할 응답이 없습니다.
-        </p>
-      ) : (
-        <div className="flex gap-4 overflow-x-auto pb-2">
-          {data.columns.map((c) => (
-            <div key={c.id} className="w-[300px] shrink-0 rounded-xl border bg-card p-4 shadow-sm">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="font-semibold">{c.participants?.name ?? "-"}</p>
-                  <p className="truncate text-xs text-muted-foreground">
-                    {c.participants?.org_text ?? "-"}
-                  </p>
-                </div>
-                <span className="shrink-0 rounded-full bg-secondary px-2 py-0.5 text-[11px] font-semibold">
-                  {c.participants?.role_level ?? "미지정"}
-                </span>
-              </div>
-
-              <p className="mt-3 text-xs font-semibold text-muted-foreground">
-                과업 {c.response_tasks.length}건
-              </p>
-              <ul className="mt-2 space-y-2">
-                {c.response_tasks.map((t) => (
-                  <li key={t.id} className="rounded-lg border p-2 text-xs">
-                    <span className="block min-w-0">{t.name}</span>
-                    <div className="mt-1.5 flex flex-wrap gap-1">
-                      <span className="rounded-full bg-secondary px-1.5 py-0.5">
-                        중요도 {t.importance ?? "-"}
-                      </span>
-                      <span className="rounded-full bg-secondary px-1.5 py-0.5">
-                        {t.authority ? AUTHORITY_LABELS[t.authority] : "미입력"}
-                      </span>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-
-              <p className="mt-3 text-xs font-semibold text-muted-foreground">
-                스킬 {c.response_skills.length}건
-              </p>
-              <ul className="mt-2 space-y-1 text-xs">
-                {c.response_skills.map((s) => (
-                  <li key={s.id} className="flex gap-1.5">
-                    <span className="text-muted-foreground">·</span>
-                    <span className="min-w-0 flex-1">
-                      {s.name}
-                      {s.ksao ? ` (${ksaoLabel(s.ksao)})` : ""}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

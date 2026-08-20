@@ -1,5 +1,5 @@
-import { useMemo, useState, type ReactNode } from "react";
-import { createFileRoute } from "@tanstack/react-router";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -56,7 +56,18 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { SectionNav, CollapsibleSection, type SectionDef } from "@/components/SectionNav";
+import { SignalCard } from "@/components/SignalCard";
+import { EmptyState } from "@/components/EmptyState";
+import { usePersistedState } from "@/hooks/use-persisted-ui";
 import { OrgCanvas, type CanvasRollup } from "@/components/admin/OrgCanvas";
+import {
+  ImpactCountBadge,
+  ImpactInspector,
+  scheduleImpactNotice,
+  useImpactAudience,
+  type ImpactTarget,
+} from "@/components/admin/ImpactInspector";
 import { getOrgOverview, type OrgOverview } from "@/lib/dashboard.functions";
 import { parseRosterFile } from "@/lib/roster";
 import { similarity } from "@/components/survey/validation";
@@ -73,6 +84,7 @@ import {
   draftJobCatalog,
   DUTY_ORG_LIMIT,
   getMasterStatus,
+  inspectImpact,
   jobCatalogTemplateCsv,
   listCatalogVersions,
   listDutyCharts,
@@ -98,7 +110,28 @@ import {
   type UploadReport,
 } from "@/lib/master.functions";
 
+/** 화면 안의 위치를 URL 이 갖는다 — 대시보드·검토·전역 검색이 이 규약으로 링크를 보낸다 (기획 D4·P6). */
+const MASTER_TABS = ["org", "job", "duty", "status"] as const;
+type MasterTab = (typeof MASTER_TABS)[number];
+
+type MasterSearch = { tab?: MasterTab; job?: string; org?: string };
+
+function pickString(value: unknown) {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
 export const Route = createFileRoute("/_authenticated/admin/master")({
+  /** `?tab=<탭>` `?job=<직무 id>` `?org=<소속 id>` — 모르는 값은 조용히 버린다. */
+  validateSearch: (search: Record<string, unknown>): MasterSearch => {
+    const tab = pickString(search["tab"]);
+    const job = pickString(search["job"]);
+    const org = pickString(search["org"]);
+    return {
+      ...(tab && (MASTER_TABS as readonly string[]).includes(tab) ? { tab: tab as MasterTab } : {}),
+      ...(job ? { job } : {}),
+      ...(org ? { org } : {}),
+    };
+  },
   head: () => ({
     meta: [
       { title: "마스터 관리 | 서연 그룹 업무조사" },
@@ -132,6 +165,75 @@ function downloadCsv(name: string, body: string) {
 
 function formatDate(value: string) {
   return new Date(value).toLocaleString("ko-KR", { dateStyle: "medium", timeStyle: "short" });
+}
+
+/** 좁은 화면에서는 캔버스 대신 트리를 쓴다 — 노드 카드는 손가락 조작에 맞지 않는다. */
+function useNarrowScreen() {
+  const [narrow, setNarrow] = useState(false);
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 767px)");
+    const apply = () => setNarrow(query.matches);
+    apply();
+    query.addEventListener("change", apply);
+    return () => query.removeEventListener("change", apply);
+  }, []);
+  return narrow;
+}
+
+/**
+ * 탭 맨 위의 요약 스트립 (기획 A4) — 지금 무엇을 보고 있는지 먼저 알려 준다.
+ * 오른쪽 `⋯` 에는 자주 쓰지 않는 조작을 모아 편집 영역이 화면의 주인공이 되게 한다 (P1).
+ */
+function TabSummary({
+  items,
+  menu,
+}: {
+  items: { label: string; value: string }[];
+  menu?: { label: string; onSelect: () => void }[];
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border bg-card px-4 py-3">
+      {items.map((item) => (
+        <span key={item.label} className="text-xs text-muted-foreground">
+          {item.label} <span className="font-semibold tabular-nums text-foreground">{item.value}</span>
+        </span>
+      ))}
+      {menu && menu.length > 0 && (
+        <div className="ml-auto">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon" className="size-7" aria-label="부가 조작">
+                <MoreHorizontal className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {menu.map((item) => (
+                <DropdownMenuItem key={item.label} onSelect={item.onSelect}>
+                  {item.label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 편집 영역 + 오른쪽 상시 인스펙터 (기획 B5). 좁은 화면에서는 인스펙터가 아래로 내려간다. */
+function EditorWithInspector({
+  children,
+  inspector,
+}: {
+  children: ReactNode;
+  inspector: ReactNode;
+}) {
+  return (
+    <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+      <div className="min-w-0 space-y-6">{children}</div>
+      <div className="lg:sticky lg:top-20 lg:self-start">{inspector}</div>
+    </div>
+  );
 }
 
 /* ─────────────── 변경 전 영향 확인 다이얼로그 (V14-①) ─────────────── */
@@ -560,12 +662,15 @@ function OrgNodeEditor({
   action,
   units,
   busy,
+  impactBadge,
   onCancel,
   onSubmit,
 }: {
   action: OrgAction;
   units: OrgUnit[];
   busy: boolean;
+  /** 저장 버튼 옆에 붙는 영향 인원 표시 — 규모를 알고 누르게 한다 (P11). */
+  impactBadge?: ReactNode;
   onCancel: () => void;
   onSubmit: (values: { name: string; level: string; parentId: string | null }) => void;
 }) {
@@ -627,6 +732,7 @@ function OrgNodeEditor({
       >
         {kind === "child" ? "추가" : "저장"}
       </Button>
+      {impactBadge}
       <Button size="sm" variant="ghost" className="h-8" onClick={onCancel}>
         <X className="size-4" />
         취소
@@ -639,18 +745,24 @@ function OrgTree({
   units,
   action,
   busy,
+  selectedId,
+  impactBadge,
   onAction,
   onCancel,
   onSubmit,
   onDelete,
+  onSelect,
 }: {
   units: OrgUnit[];
   action: OrgAction | null;
   busy: boolean;
+  selectedId: string | null;
+  impactBadge?: ReactNode;
   onAction: (action: OrgAction) => void;
   onCancel: () => void;
   onSubmit: (values: { name: string; level: string; parentId: string | null }) => void;
   onDelete: (unit: OrgUnit) => void;
+  onSelect: (unit: OrgUnit) => void;
 }) {
   const byParent = new Map<string, OrgUnit[]>();
   for (const unit of units) {
@@ -666,9 +778,15 @@ function OrgTree({
     return (
       <ul className={depth === 0 ? "space-y-1" : "mt-1 space-y-1 border-l pl-4"}>
         {children.map((unit) => (
-          <li key={unit.id}>
+          <li key={unit.id} id={`org-${unit.id}`} className="scroll-mt-24">
             <div className="group flex items-center gap-2">
-              <span className="text-sm">
+              <button
+                type="button"
+                onClick={() => onSelect(unit)}
+                className={`rounded px-1 text-left text-sm hover:bg-secondary ${
+                  unit.id === selectedId ? "bg-primary/10 font-semibold ring-1 ring-primary" : ""
+                }`}
+              >
                 {unit.name}
                 {unit.level && (
                   <span className="ml-2 text-xs text-muted-foreground">{unit.level}</span>
@@ -676,7 +794,7 @@ function OrgTree({
                 {depth === 0 && unit.companies?.name && (
                   <span className="ml-2 text-xs text-primary">{unit.companies.name}</span>
                 )}
-              </span>
+              </button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button
@@ -711,6 +829,7 @@ function OrgTree({
                 action={action}
                 units={units}
                 busy={busy}
+                impactBadge={impactBadge}
                 onCancel={onCancel}
                 onSubmit={onSubmit}
               />
@@ -770,20 +889,71 @@ function buildCanvasRollup(overview: OrgOverview | undefined, units: OrgUnit[]):
   return rollup;
 }
 
-function OrgTab() {
+/** 선택한 조직(하위 포함)의 인원 진행 상태 — 노드를 눌렀을 때 옆에 보여 준다 (P6). */
+function orgMemberStats(
+  overview: OrgOverview | undefined,
+  units: OrgUnit[],
+  orgId: string | null,
+) {
+  if (!overview || !orgId) return null;
+  const childIds = new Map<string, string[]>();
+  for (const unit of units) {
+    if (!unit.parent_id) continue;
+    const list = childIds.get(unit.parent_id);
+    if (list) list.push(unit.id);
+    else childIds.set(unit.parent_id, [unit.id]);
+  }
+  const scope = new Set<string>();
+  const queue = [orgId];
+  while (queue.length > 0) {
+    const cursor = queue.pop()!;
+    scope.add(cursor);
+    queue.push(...(childIds.get(cursor) ?? []));
+  }
+
+  const stats = { total: 0, done: 0, writing: 0, notStarted: 0 };
+  for (const person of overview.participants) {
+    if (person.role !== "respondent" || !person.org_unit_id || !scope.has(person.org_unit_id)) {
+      continue;
+    }
+    stats.total += 1;
+    if (ORG_DONE_STATUSES.includes(person.account_status)) stats.done += 1;
+    else if (person.account_status === "작성중" || person.account_status === "반려") {
+      stats.writing += 1;
+    } else stats.notStarted += 1;
+  }
+  return stats;
+}
+
+function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
   const { companyId } = useCompanyScope();
   const queryClient = useQueryClient();
   const [action, setAction] = useState<OrgAction | null>(null);
   const [newRoot, setNewRoot] = useState("");
-  const [orgView, setOrgView] = useState<"tree" | "canvas">("tree");
+  const [orgView, setOrgView] = usePersistedState<"tree" | "canvas">("master-org-view", "tree");
   const [pending, setPending] = useState<PendingConfirm | null>(null);
+  const [selectedOrgId, setSelectedOrgId] = useState<string | null>(highlightOrgId);
+  const [notifyOnSave, setNotifyOnSave] = usePersistedState("master-notify-on-save", true);
   const gate = makeImpactGate(setPending);
+  const narrow = useNarrowScreen();
+  // 좁은 화면에서는 캔버스를 쓰지 않고 트리 목록으로 대체한다.
+  const effectiveView = narrow ? "tree" : orgView;
 
-  // 제출률 링 데이터. 캔버스를 열 때만 불러온다 (dashboard.functions 재사용, 수정 없음).
+  // 딥링크(?org=)로 들어오면 그 조직을 골라 두고 트리에서 위치를 잡는다.
+  useEffect(() => {
+    if (!highlightOrgId) return;
+    setSelectedOrgId(highlightOrgId);
+    const timer = setTimeout(() => {
+      document.getElementById(`org-${highlightOrgId}`)?.scrollIntoView({ block: "center" });
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [highlightOrgId]);
+
+  // 제출률 링·선택 조직 요약에 쓰는 데이터 (dashboard.functions 재사용, 수정 없음).
   const { data: overview } = useQuery({
     queryKey: ["org-overview"],
     queryFn: async () => getOrgOverview({ headers: await authHeaders() }),
-    enabled: orgView === "canvas",
+    enabled: effectiveView === "canvas" || selectedOrgId !== null,
   });
 
   const { data: units } = useQuery({
@@ -816,17 +986,39 @@ function OrgTab() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  // 지금 편집 중인 변경. 하위 추가(child)는 새로 만드는 것이라 영향받는 인원이 없다.
+  const impactTarget = useMemo<ImpactTarget | null>(() => {
+    if (!action || action.kind === "child") return null;
+    return {
+      kind: action.kind === "rename" ? "org_rename" : "org_move",
+      id: action.unit.id,
+      label: action.unit.name,
+      field: "org_text",
+      note:
+        action.kind === "rename"
+          ? `소속 「${action.unit.name}」 의 이름이 바뀌었습니다`
+          : `소속 「${action.unit.name}」 의 상위 조직이 바뀌었습니다`,
+    };
+  }, [action]);
+
+  const { data: audience, isFetching: audienceLoading } = useImpactAudience(impactTarget);
+
   function submitAction(values: { name: string; level: string; parentId: string | null }) {
     if (!action) return;
     const { kind, unit } = action;
+    // 저장 성공 시점의 대상·영향 인원을 그대로 쓴다 — 저장 뒤에는 소속 이름이 이미 바뀌어 있다.
+    const target = impactTarget;
+    const affected = audience;
     const run = () =>
       edit.mutate(async () => {
         const headers = await authHeaders();
         if (kind === "rename") {
-          return renameOrgUnit({
+          const result = await renameOrgUnit({
             data: { id: unit.id, name: values.name, level: values.level },
             headers,
           });
+          if (result.ok && notifyOnSave && target) await scheduleImpactNotice(target, affected);
+          return result;
         }
         if (kind === "child") {
           return createOrgUnit({
@@ -839,7 +1031,12 @@ function OrgTab() {
             headers,
           });
         }
-        return moveOrgUnit({ data: { id: unit.id, parentId: values.parentId }, headers });
+        const result = await moveOrgUnit({
+          data: { id: unit.id, parentId: values.parentId },
+          headers,
+        });
+        if (result.ok && notifyOnSave && target) await scheduleImpactNotice(target, affected);
+        return result;
       });
     if (kind === "child") {
       run();
@@ -884,65 +1081,133 @@ function OrgTab() {
       confirmLabel: "이동",
       always: true,
       run: () =>
-        edit.mutate(async () =>
-          moveOrgUnit({ data: { id: unit.id, parentId: target.id }, headers: await authHeaders() }),
-        ),
+        edit.mutate(async () => {
+          const headers = await authHeaders();
+          // 끌어 놓기로 옮길 때는 편집 패널을 거치지 않으므로 여기서 영향 인원을 직접 센다.
+          const affected = notifyOnSave
+            ? await inspectImpact({ data: { kind: "org_move", id: unit.id }, headers })
+            : undefined;
+          const result = await moveOrgUnit({ data: { id: unit.id, parentId: target.id }, headers });
+          if (result.ok && affected) {
+            await scheduleImpactNotice(
+              {
+                kind: "org_move",
+                id: unit.id,
+                label: unit.name,
+                field: "org_text",
+                note: `소속 「${unit.name}」 의 상위 조직이 바뀌었습니다`,
+              },
+              affected,
+            );
+          }
+          return result;
+        }),
     });
   }
 
   // 전체 계열사 보기에서는 어느 회사에 붙일지 정할 수 없어 최상위 추가를 막는다.
   const rootCompanyId = companyId === "all" ? "" : companyId;
 
+  const selectedUnit = (units ?? []).find((unit) => unit.id === selectedOrgId) ?? null;
+  const selectedStats = orgMemberStats(overview, units ?? [], selectedOrgId);
+  const rootCount = (units ?? []).filter((unit) => !unit.parent_id).length;
+  const companyCount = new Set((units ?? []).map((unit) => unit.company_id)).size;
+
+  const sections: SectionDef[] = [
+    { id: "org-edit", label: "조직도 편집", count: units?.length ?? 0 },
+    { id: "org-upload", label: "파일로 올리기" },
+  ];
+
   return (
-    <div className="space-y-6">
-      <MappingUploader
-        fields={ORG_FIELDS}
-        templateName="조직도_템플릿.csv"
-        templateCsv={orgTemplateCsv}
-        onRun={async (rows, confirm) =>
-          uploadOrgUnits({
-            data: {
-              confirm,
-              rows: rows.map((r) => ({
-                company: r["company"] ?? "",
-                parent: r["parent"] ?? "",
-                name: r["name"] ?? "",
-                level: r["level"] ?? "",
-                sort: r["sort"] ?? "",
-              })),
-            },
-            headers: await authHeaders(),
-          })
-        }
-        onApplied={() => {
-          void queryClient.invalidateQueries({ queryKey: ["master-org-units"] });
-          void queryClient.invalidateQueries({ queryKey: ["master-status"] });
-        }}
+    <EditorWithInspector
+      inspector={
+        <ImpactInspector
+          target={impactTarget}
+          audience={audience}
+          loading={audienceLoading}
+          notifyOnSave={notifyOnSave}
+          onNotifyOnSaveChange={setNotifyOnSave}
+        />
+      }
+    >
+      <TabSummary
+        items={[
+          { label: "조직", value: `${units?.length ?? 0}개` },
+          { label: "최상위", value: `${rootCount}개` },
+          { label: "계열사", value: `${companyCount}곳` },
+        ]}
+        menu={[
+          {
+            label: "조직도 템플릿 내려받기",
+            onSelect: () => downloadCsv("조직도_템플릿.csv", orgTemplateCsv()),
+          },
+          {
+            label: "파일로 올리기 구획으로 이동",
+            onSelect: () => document.getElementById("org-upload")?.scrollIntoView(),
+          },
+        ]}
       />
 
-      <div className="rounded-xl border bg-card p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
+      <SectionNav sections={sections} />
+
+      {selectedUnit && (
+        <SignalCard
+          tone="neutral"
+          signal={`「${selectedUnit.name}」 에는 하위 조직을 포함해 ${selectedStats?.total ?? 0}명이 배정돼 있습니다`}
+          evidence={
+            selectedStats
+              ? [
+                  `제출 완료 ${selectedStats.done}명 · 작성 중 ${selectedStats.writing}명 · 아직 시작 안 함 ${selectedStats.notStarted}명`,
+                  "하위 조직 인원을 합산한 수치입니다.",
+                ]
+              : ["인원 현황을 불러오는 중입니다."]
+          }
+          scope={selectedUnit.companies?.name ?? "하위 조직 포함"}
+          actions={[
+            { label: "이 조직 이름 변경", onClick: () => setAction({ kind: "rename", unit: selectedUnit }) },
+            {
+              label: "참여자 관리에서 보기",
+              href: "/admin/participants",
+              variant: "outline",
+            },
+            { label: "선택 해제", onClick: () => setSelectedOrgId(null), variant: "ghost" },
+          ]}
+        />
+      )}
+
+      <CollapsibleSection
+        storageKey="master-org"
+        id="org-edit"
+        title="조직도 편집"
+        subtitle="각 조직의 ⋯ 버튼으로 이름 변경·하위 추가·상위 이동·삭제를 합니다."
+        aside={
           <div className="flex items-center gap-2">
-            <p className="text-sm font-medium">조직도 {units ? `(${units.length})` : ""}</p>
-            <div className="flex items-center rounded-lg border p-0.5">
-              <Button
-                size="sm"
-                variant={orgView === "tree" ? "secondary" : "ghost"}
-                className="h-6 px-2 text-xs"
-                onClick={() => setOrgView("tree")}
-              >
-                트리
-              </Button>
-              <Button
-                size="sm"
-                variant={orgView === "canvas" ? "secondary" : "ghost"}
-                className="h-6 px-2 text-xs"
-                onClick={() => setOrgView("canvas")}
-              >
-                캔버스
-              </Button>
-            </div>
+            {!narrow && (
+              <div className="flex items-center rounded-lg border p-0.5">
+                <Button
+                  size="sm"
+                  variant={orgView === "tree" ? "secondary" : "ghost"}
+                  className="h-6 px-2 text-xs"
+                  onClick={() => setOrgView("tree")}
+                >
+                  트리
+                </Button>
+                <Button
+                  size="sm"
+                  variant={orgView === "canvas" ? "secondary" : "ghost"}
+                  className="h-6 px-2 text-xs"
+                  onClick={() => setOrgView("canvas")}
+                >
+                  캔버스
+                </Button>
+              </div>
+            )}
           </div>
+        }
+      >
+        <div className="rounded-xl border bg-card p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm font-medium">조직도 {units ? `(${units.length})` : ""}</p>
           <div className="flex items-center gap-2">
             <Input
               className="h-8 w-40"
@@ -975,53 +1240,106 @@ function OrgTab() {
             </Button>
           </div>
         </div>
-        <p className="mt-1 text-xs text-muted-foreground">
-          각 조직의 ⋯ 버튼으로 이름 변경·하위 추가·상위 이동·삭제를 할 수 있습니다. 하위 조직이나
-          배정 인원이 있는 조직은 삭제되지 않습니다.
-          {companyId === "all" && " 최상위 추가는 계열사를 선택한 뒤 사용하세요."}
-        </p>
-        {orgView === "tree" ? (
-          <div className="mt-3">
-            <OrgTree
-              units={units ?? []}
-              action={action}
-              busy={edit.isPending}
-              onAction={setAction}
-              onCancel={() => setAction(null)}
-              onSubmit={submitAction}
-              onDelete={handleDelete}
+          <p className="mt-1 text-xs text-muted-foreground">
+            하위 조직이나 배정 인원이 있는 조직은 삭제되지 않습니다. 조직 이름을 누르면 그 조직의
+            인원 현황이 위에 나타납니다.
+            {companyId === "all" && " 최상위 추가는 계열사를 선택한 뒤 사용하세요."}
+            {narrow && " 화면이 좁아 캔버스 대신 트리 목록으로 보여 줍니다."}
+          </p>
+          {(units ?? []).length === 0 ? (
+            <EmptyState
+              className="mt-3"
+              kind="nothing"
+              title="아직 등록된 조직이 없습니다"
+              description="위 칸에 최상위 조직명을 넣어 하나 만들거나, 아래 「파일로 올리기」에서 조직도 파일을 올리세요."
             />
-          </div>
-        ) : (
-          <div className="mt-3 space-y-2">
-            {action && (
-              <OrgNodeEditor
-                key={`${action.kind}-${action.unit.id}`}
-                action={action}
+          ) : effectiveView === "tree" ? (
+            <div className="mt-3">
+              <OrgTree
                 units={units ?? []}
+                action={action}
                 busy={edit.isPending}
+                selectedId={selectedOrgId}
+                impactBadge={
+                  <ImpactCountBadge audience={audience} loading={audienceLoading} />
+                }
+                onAction={setAction}
                 onCancel={() => setAction(null)}
                 onSubmit={submitAction}
+                onDelete={handleDelete}
+                onSelect={(unit) => setSelectedOrgId(unit.id)}
               />
-            )}
-            <OrgCanvas
-              units={units ?? []}
-              rollup={canvasRollup}
-              busy={edit.isPending}
-              onAction={setAction}
-              onDelete={handleDelete}
-              onDropMove={handleDropMove}
-            />
-            <p className="text-xs text-muted-foreground">
-              휠로 확대·축소, 빈 곳을 끌어 이동합니다. 노드를 다른 노드 위에 끌어 놓으면 그 조직의
-              하위로 이동합니다. 링은 하위 조직을 합산한 제출률입니다.
-            </p>
-          </div>
-        )}
-      </div>
+            </div>
+          ) : (
+            <div className="mt-3 space-y-2">
+              {action && (
+                <OrgNodeEditor
+                  key={`${action.kind}-${action.unit.id}`}
+                  action={action}
+                  units={units ?? []}
+                  busy={edit.isPending}
+                  impactBadge={
+                    <ImpactCountBadge audience={audience} loading={audienceLoading} />
+                  }
+                  onCancel={() => setAction(null)}
+                  onSubmit={submitAction}
+                />
+              )}
+              <OrgCanvas
+                units={units ?? []}
+                rollup={canvasRollup}
+                busy={edit.isPending}
+                selectedId={selectedOrgId}
+                onAction={setAction}
+                onDelete={handleDelete}
+                onDropMove={handleDropMove}
+                onSelect={(unit) => setSelectedOrgId(unit.id)}
+              />
+              <p className="text-xs text-muted-foreground">
+                휠이나 오른쪽 위 버튼으로 확대·축소·화면 맞춤, 빈 곳을 끌어 이동합니다. 노드를 누르면
+                그 조직의 인원 현황이 위에 나타나고, 다른 노드 위에 끌어 놓으면 그 조직의 하위로
+                이동합니다. 링은 하위 조직을 합산한 제출률입니다.
+              </p>
+            </div>
+          )}
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        storageKey="master-org"
+        id="org-upload"
+        title="파일로 올리기"
+        subtitle="조직도 파일을 올려 전체를 교체합니다. 반영 전 백업이 변경 기록에 남습니다."
+        defaultCollapsed
+      >
+        <MappingUploader
+          fields={ORG_FIELDS}
+          templateName="조직도_템플릿.csv"
+          templateCsv={orgTemplateCsv}
+          onRun={async (rows, confirm) =>
+            uploadOrgUnits({
+              data: {
+                confirm,
+                rows: rows.map((r) => ({
+                  company: r["company"] ?? "",
+                  parent: r["parent"] ?? "",
+                  name: r["name"] ?? "",
+                  level: r["level"] ?? "",
+                  sort: r["sort"] ?? "",
+                })),
+              },
+              headers: await authHeaders(),
+            })
+          }
+          onApplied={() => {
+            void queryClient.invalidateQueries({ queryKey: ["master-org-units"] });
+            void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+          }}
+        />
+      </CollapsibleSection>
 
       <ImpactConfirmDialog pending={pending} onClose={() => setPending(null)} />
-    </div>
+    </EditorWithInspector>
   );
 }
 
@@ -1054,11 +1372,14 @@ const EMPTY_JOB_EDIT: JobEdit = {
 function JobRowEditor({
   initial,
   busy,
+  impactBadge,
   onCancel,
   onSubmit,
 }: {
   initial: JobEdit;
   busy: boolean;
+  /** 저장 버튼 옆 영향 인원 표시 (P11). */
+  impactBadge?: ReactNode;
   onCancel: () => void;
   onSubmit: (values: JobEdit) => void;
 }) {
@@ -1087,6 +1408,7 @@ function JobRowEditor({
       <Button size="sm" className="h-8" disabled={busy || !filled} onClick={() => onSubmit(values)}>
         저장
       </Button>
+      {impactBadge}
       <Button size="sm" variant="ghost" className="h-8" onClick={onCancel}>
         <X className="size-4" />
         취소
@@ -1095,11 +1417,30 @@ function JobRowEditor({
   );
 }
 
-function JobCatalogList() {
+function JobCatalogList({
+  highlightJobId,
+  audience,
+  audienceLoading,
+  notifyOnSave,
+  onEditingChange,
+}: {
+  highlightJobId: string | null;
+  audience: ReturnType<typeof useImpactAudience>["data"];
+  audienceLoading: boolean;
+  notifyOnSave: boolean;
+  /** 편집 중인 행을 위 탭으로 올려 인스펙터가 같은 대상을 보게 한다. */
+  onEditingChange: (editing: JobEdit | null) => void;
+}) {
   const queryClient = useQueryClient();
-  const [editing, setEditing] = useState<JobEdit | null>(null);
+  const [editing, setEditingState] = useState<JobEdit | null>(null);
+  const [openGroups, setOpenGroups] = useState<string[]>([]);
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const gate = makeImpactGate(setPending);
+
+  const setEditing = (next: JobEdit | null) => {
+    setEditingState(next);
+    onEditingChange(next);
+  };
 
   const { data: rows } = useQuery({
     queryKey: ["master-job-catalog"],
@@ -1130,10 +1471,25 @@ function JobCatalogList() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  // 딥링크(?job=)로 들어오면 그 직무가 든 직군을 펼치고 위치를 잡는다.
+  useEffect(() => {
+    if (!highlightJobId) return;
+    const row = (rows ?? []).find((r) => r.id === highlightJobId);
+    if (!row) return;
+    setOpenGroups((prev) => (prev.includes(row.job_group) ? prev : [...prev, row.job_group]));
+    const timer = setTimeout(() => {
+      document
+        .getElementById(`job-${highlightJobId}`)
+        ?.scrollIntoView({ block: "center", behavior: "smooth" });
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [highlightJobId, rows]);
+
   function save(values: JobEdit) {
+    const affected = audience;
     const run = () =>
-      edit.mutate(async () =>
-        upsertJobCatalogRow({
+      edit.mutate(async () => {
+        const result = await upsertJobCatalogRow({
           data: {
             id: values.id,
             job_group: values.job_group.trim(),
@@ -1143,8 +1499,21 @@ function JobCatalogList() {
             companyIds: [],
           },
           headers: await authHeaders(),
-        }),
-      );
+        });
+        if (result.ok && values.id && notifyOnSave) {
+          await scheduleImpactNotice(
+            {
+              kind: "catalog_row_update",
+              id: values.id,
+              label: values.job_name.trim(),
+              field: "job_name",
+              note: `직무 「${values.job_name.trim()}」 의 분류 정보가 바뀌었습니다`,
+            },
+            affected,
+          );
+        }
+        return result;
+      });
     if (!values.id) {
       run();
       return;
@@ -1174,12 +1543,9 @@ function JobCatalogList() {
   return (
     <div className="space-y-3 rounded-xl border bg-card p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <p className="text-sm font-medium">직무분류표 {rows ? `(${rows.length})` : ""}</p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            직군 &gt; 직렬로 묶어 보여줍니다. 행을 눌러 직군·직렬·직무·정의를 바로 고칠 수 있습니다.
-          </p>
-        </div>
+        <p className="text-xs text-muted-foreground">
+          기존 직무를 고치면 그 직무로 제출한 인원이 오른쪽 인스펙터에 나타납니다.
+        </p>
         <Button
           size="sm"
           variant="outline"
@@ -1201,9 +1567,18 @@ function JobCatalogList() {
       )}
 
       {grouped.length === 0 ? (
-        <p className="text-sm text-muted-foreground">등록된 직무가 없습니다.</p>
+        <EmptyState
+          kind="nothing"
+          title="등록된 직무가 없습니다"
+          description="「직무 추가」로 한 건씩 넣거나, 위의 AI 가안·파일 올리기로 한 번에 채울 수 있습니다."
+        />
       ) : (
-        <Accordion type="multiple" className="w-full">
+        <Accordion
+          type="multiple"
+          className="w-full"
+          value={openGroups}
+          onValueChange={setOpenGroups}
+        >
           {grouped.map(([group, seriesMap]) => {
             const count = [...seriesMap.values()].reduce((sum, list) => sum + list.length, 0);
             return (
@@ -1224,13 +1599,19 @@ function JobCatalogList() {
                             key={row.id}
                             initial={editing}
                             busy={edit.isPending}
+                            impactBadge={
+                              <ImpactCountBadge audience={audience} loading={audienceLoading} />
+                            }
                             onCancel={() => setEditing(null)}
                             onSubmit={save}
                           />
                         ) : (
                           <div
                             key={row.id}
-                            className="flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-xs"
+                            id={`job-${row.id}`}
+                            className={`flex scroll-mt-24 flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-xs ${
+                              row.id === highlightJobId ? "border-primary ring-1 ring-primary" : ""
+                            }`}
                           >
                             <span className="font-medium">{row.job_name}</span>
                             <span className="flex-1 text-muted-foreground">
@@ -1734,10 +2115,41 @@ function JobDraftPanel({ onApplied }: { onApplied: () => void }) {
   );
 }
 
-function JobTab() {
+function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
   const queryClient = useQueryClient();
   const [suggestions, setSuggestions] = useState<MappingSuggestion[] | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [editingJob, setEditingJob] = useState<JobEdit | null>(null);
+  const [notifyOnSave, setNotifyOnSave] = usePersistedState("master-notify-on-save", true);
+
+  // 요약 스트립용. 목록과 같은 키라 요청은 한 번만 나간다.
+  const { data: catalogRows } = useQuery({
+    queryKey: ["master-job-catalog"],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("job_catalog")
+        .select("id, job_group, job_series, job_name, definition")
+        .order("job_group")
+        .order("job_series")
+        .order("job_name");
+      if (error) throw error;
+      return data as JobRow[];
+    },
+  });
+
+  // 기존 행을 고칠 때만 영향받는 인원이 있다. 새 행 추가는 아직 아무 응답과도 연결돼 있지 않다.
+  const impactTarget = useMemo<ImpactTarget | null>(() => {
+    if (!editingJob?.id) return null;
+    return {
+      kind: "catalog_row_update",
+      id: editingJob.id,
+      label: editingJob.job_name,
+      field: "job_name",
+      note: `직무 「${editingJob.job_name}」 의 분류 정보가 바뀌었습니다`,
+    };
+  }, [editingJob]);
+
+  const { data: audience, isFetching: audienceLoading } = useImpactAudience(impactTarget);
 
   const suggest = useMutation({
     mutationFn: async () => suggestResponseMapping({ headers: await authHeaders() }),
@@ -1766,48 +2178,138 @@ function JobTab() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
+  const invalidateCatalog = () => {
+    setSuggestions(null);
+    void queryClient.invalidateQueries({ queryKey: ["master-job-catalog"] });
+    void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+    void queryClient.invalidateQueries({ queryKey: ["catalog-versions"] });
+  };
+
+  const groupCount = new Set((catalogRows ?? []).map((row) => row.job_group)).size;
+  const seriesCount = new Set(
+    (catalogRows ?? []).map((row) => `${row.job_group}/${row.job_series}`),
+  ).size;
+  const withoutDefinition = (catalogRows ?? []).filter(
+    (row) => (row.definition ?? "").trim() === "",
+  ).length;
+
+  const sections: SectionDef[] = [
+    { id: "job-list", label: "직무분류표", count: catalogRows?.length ?? 0 },
+    { id: "job-draft", label: "AI 가안" },
+    { id: "job-upload", label: "파일로 올리기" },
+    { id: "job-versions", label: "버전 관리" },
+    { id: "job-mapping", label: "응답 연결 제안" },
+  ];
+
   return (
-    <div className="space-y-6">
-      <MappingUploader
-        fields={JOB_FIELDS}
-        templateName="직무분류_템플릿.csv"
-        templateCsv={jobCatalogTemplateCsv}
-        onRun={async (rows, confirm) =>
-          uploadJobCatalog({
-            data: {
-              confirm,
-              rows: rows.map((r) => ({
-                job_group: r["job_group"] ?? "",
-                job_series: r["job_series"] ?? "",
-                job_name: r["job_name"] ?? "",
-                definition: r["definition"] ?? "",
-                companies: r["companies"] ?? "",
-              })),
-            },
-            headers: await authHeaders(),
-          })
-        }
-        onApplied={() => {
-          setSuggestions(null);
-          void queryClient.invalidateQueries({ queryKey: ["master-job-catalog"] });
-          void queryClient.invalidateQueries({ queryKey: ["master-status"] });
-          void queryClient.invalidateQueries({ queryKey: ["catalog-versions"] });
-        }}
+    <EditorWithInspector
+      inspector={
+        <ImpactInspector
+          target={impactTarget}
+          audience={audience}
+          loading={audienceLoading}
+          notifyOnSave={notifyOnSave}
+          onNotifyOnSaveChange={setNotifyOnSave}
+        />
+      }
+    >
+      <TabSummary
+        items={[
+          { label: "직무", value: `${catalogRows?.length ?? 0}건` },
+          { label: "직군", value: `${groupCount}개` },
+          { label: "직렬", value: `${seriesCount}개` },
+          { label: "정의 없음", value: `${withoutDefinition}건` },
+        ]}
+        menu={[
+          {
+            label: "직무분류 템플릿 내려받기",
+            onSelect: () => downloadCsv("직무분류_템플릿.csv", jobCatalogTemplateCsv()),
+          },
+          {
+            label: "버전 관리 구획으로 이동",
+            onSelect: () => document.getElementById("job-versions")?.scrollIntoView(),
+          },
+          {
+            label: "파일로 올리기 구획으로 이동",
+            onSelect: () => document.getElementById("job-upload")?.scrollIntoView(),
+          },
+        ]}
       />
 
-      <JobDraftPanel
-        onApplied={() => {
-          setSuggestions(null);
-          void queryClient.invalidateQueries({ queryKey: ["master-job-catalog"] });
-          void queryClient.invalidateQueries({ queryKey: ["master-status"] });
-          void queryClient.invalidateQueries({ queryKey: ["catalog-versions"] });
-        }}
-      />
+      <SectionNav sections={sections} />
 
-      <JobCatalogList />
+      <CollapsibleSection
+        storageKey="master-job"
+        id="job-list"
+        title="직무분류표"
+        subtitle="직군 > 직렬로 묶어 보여줍니다. 행을 눌러 바로 고칠 수 있습니다."
+      >
+        <JobCatalogList
+          highlightJobId={highlightJobId}
+          audience={audience}
+          audienceLoading={audienceLoading}
+          notifyOnSave={notifyOnSave}
+          onEditingChange={setEditingJob}
+        />
+      </CollapsibleSection>
 
-      <CatalogVersionPanel />
+      <CollapsibleSection
+        storageKey="master-job"
+        id="job-draft"
+        title="AI 직무분류 가안"
+        subtitle="조직도·직급 분포를 근거로 직군 체계를 제안합니다."
+        defaultCollapsed
+      >
+        <JobDraftPanel onApplied={invalidateCatalog} />
+      </CollapsibleSection>
 
+      <CollapsibleSection
+        storageKey="master-job"
+        id="job-upload"
+        title="파일로 올리기"
+        subtitle="직무분류 파일을 올려 전체를 교체합니다. 교체 직전 버전이 자동 저장됩니다."
+        defaultCollapsed
+      >
+        <MappingUploader
+          fields={JOB_FIELDS}
+          templateName="직무분류_템플릿.csv"
+          templateCsv={jobCatalogTemplateCsv}
+          onRun={async (rows, confirm) =>
+            uploadJobCatalog({
+              data: {
+                confirm,
+                rows: rows.map((r) => ({
+                  job_group: r["job_group"] ?? "",
+                  job_series: r["job_series"] ?? "",
+                  job_name: r["job_name"] ?? "",
+                  definition: r["definition"] ?? "",
+                  companies: r["companies"] ?? "",
+                })),
+              },
+              headers: await authHeaders(),
+            })
+          }
+          onApplied={invalidateCatalog}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        storageKey="master-job"
+        id="job-versions"
+        title="버전 관리"
+        subtitle="교체·복원 전 저장본을 만들고 서로 비교합니다."
+        defaultCollapsed
+      >
+        <CatalogVersionPanel />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        storageKey="master-job"
+        id="job-mapping"
+        title="기존 응답 연결 제안"
+        subtitle="자유 입력된 직군·직렬·직무를 직무분류표 항목과 대조합니다."
+        defaultCollapsed
+      >
       <div className="space-y-3 rounded-xl border bg-card p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
@@ -1895,7 +2397,8 @@ function JobTab() {
           </>
         )}
       </div>
-    </div>
+      </CollapsibleSection>
+    </EditorWithInspector>
   );
 }
 
@@ -2232,15 +2735,52 @@ function DutyTab() {
   const headers = Object.keys(rows[0] ?? {});
   const ready = targetCompany !== "" && orgName.trim() !== "" && rows.length > 0;
 
+  const chartRowTotal = (charts ?? []).reduce((sum, chart) => sum + chart.rowCount, 0);
+  const sections: SectionDef[] = [
+    { id: "duty-draft", label: "AI 가안" },
+    { id: "duty-upload", label: "파일로 올리기" },
+    { id: "duty-list", label: "올라온 업무분장표", count: charts?.length ?? 0 },
+  ];
+
   return (
     <div className="space-y-6">
-      <DutyDraftPanel
-        onApplied={() => {
-          void queryClient.invalidateQueries({ queryKey: ["duty-charts"] });
-          void queryClient.invalidateQueries({ queryKey: ["master-status"] });
-        }}
+      <TabSummary
+        items={[
+          { label: "업무분장표", value: `${charts?.length ?? 0}건` },
+          { label: "총 행", value: `${chartRowTotal}행` },
+          { label: "회사", value: `${companies?.length ?? 0}곳` },
+        ]}
+        menu={[
+          {
+            label: "올라온 업무분장표로 이동",
+            onSelect: () => document.getElementById("duty-list")?.scrollIntoView(),
+          },
+        ]}
       />
 
+      <SectionNav sections={sections} />
+
+      <CollapsibleSection
+        storageKey="master-duty"
+        id="duty-draft"
+        title="AI 업무분장 가안"
+        subtitle="조직별 「주요 업무 → 세부 업무」 초안을 만들어 검토 후 반영합니다."
+      >
+        <DutyDraftPanel
+          onApplied={() => {
+            void queryClient.invalidateQueries({ queryKey: ["duty-charts"] });
+            void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+          }}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        storageKey="master-duty"
+        id="duty-upload"
+        title="파일로 올리기"
+        subtitle="회사·조직을 정해 자유 양식 그대로 올립니다."
+        defaultCollapsed
+      >
       <div className="space-y-4 rounded-xl border bg-card p-4">
         <p className="text-xs text-muted-foreground">
           자유 양식 그대로 업로드합니다. 모든 열이 보존되며 같은 회사·조직명으로 다시 올리면 이전
@@ -2309,13 +2849,21 @@ function DutyTab() {
         )}
         {report && <ReportPanel report={report} />}
       </div>
+      </CollapsibleSection>
 
+      <CollapsibleSection
+        storageKey="master-duty"
+        id="duty-list"
+        title="올라온 업무분장표"
+        subtitle="같은 회사·조직명으로 다시 올리면 이전 업로드를 교체합니다."
+      >
       <div className="space-y-3">
-        <p className="text-sm font-medium">
-          업로드된 업무분장표 {charts ? `(${charts.length})` : ""}
-        </p>
         {(charts ?? []).length === 0 ? (
-          <p className="text-sm text-muted-foreground">아직 업로드된 업무분장표가 없습니다.</p>
+          <EmptyState
+            kind="nothing"
+            title="아직 올라온 업무분장표가 없습니다"
+            description="위 「AI 업무분장 가안」으로 초안을 만들거나, 「파일로 올리기」에서 조직별 파일을 올리세요."
+          />
         ) : (
           (charts ?? []).map((chart) => (
             <div key={chart.id} className="rounded-xl border bg-card p-4">
@@ -2341,6 +2889,7 @@ function DutyTab() {
           ))
         )}
       </div>
+      </CollapsibleSection>
     </div>
   );
 }
@@ -2364,6 +2913,19 @@ function StatusTab() {
 
   return (
     <div className="space-y-6">
+      <SectionNav
+        sections={[
+          { id: "status-counts", label: "기준 정보 건수" },
+          { id: "status-uploads", label: "최근 업로드" },
+        ]}
+      />
+
+      <CollapsibleSection
+        storageKey="master-status"
+        id="status-counts"
+        title="기준 정보 건수"
+        subtitle="지금 시스템에 들어 있는 기준 정보의 규모입니다."
+      >
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {cards.map((card) => (
           <div key={card.label} className="rounded-xl border bg-card p-4 shadow-sm">
@@ -2372,7 +2934,14 @@ function StatusTab() {
           </div>
         ))}
       </div>
+      </CollapsibleSection>
 
+      <CollapsibleSection
+        storageKey="master-status"
+        id="status-uploads"
+        title="최근 업로드"
+        subtitle="반영 전 백업은 변경 기록에 남아 되돌리기 지점으로 쓸 수 있습니다."
+      >
       <div className="rounded-xl border bg-card p-4">
         <p className="text-sm font-medium">최근 업로드</p>
         {(data?.lastUploads ?? []).length === 0 ? (
@@ -2393,6 +2962,7 @@ function StatusTab() {
         반영 전 백업이 변경 기록에 저장됩니다. 잘못 반영한 경우 변경 기록의 백업을 되돌리기 지점으로
         사용하세요.
       </p>
+      </CollapsibleSection>
     </div>
   );
 }
@@ -2400,6 +2970,12 @@ function StatusTab() {
 /* ───────────────────────────── 페이지 ───────────────────────────── */
 
 function MasterPage() {
+  const search = Route.useSearch();
+  const navigate = useNavigate({ from: Route.fullPath });
+
+  // 지금 보고 있는 탭은 URL 이 정한다. 직무 딥링크로 들어오면 직무분류 탭이 열린다 (D4).
+  const tab: MasterTab = search.tab ?? (search.job ? "job" : "org");
+
   return (
     <div className="space-y-6">
       <div>
@@ -2409,7 +2985,15 @@ function MasterPage() {
         </p>
       </div>
 
-      <Tabs defaultValue="org">
+      <Tabs
+        value={tab}
+        onValueChange={(value) =>
+          void navigate({
+            search: (prev) => ({ ...prev, tab: value as MasterTab }),
+            replace: true,
+          })
+        }
+      >
         <TabsList className="grid w-full grid-cols-2 sm:w-auto sm:grid-cols-4">
           <TabsTrigger value="org">조직도</TabsTrigger>
           <TabsTrigger value="job">직무분류</TabsTrigger>
@@ -2417,10 +3001,10 @@ function MasterPage() {
           <TabsTrigger value="status">현황</TabsTrigger>
         </TabsList>
         <TabsContent value="org" className="mt-4">
-          <OrgTab />
+          <OrgTab highlightOrgId={search.org ?? null} />
         </TabsContent>
         <TabsContent value="job" className="mt-4">
-          <JobTab />
+          <JobTab highlightJobId={search.job ?? null} />
         </TabsContent>
         <TabsContent value="duty" className="mt-4">
           <DutyTab />

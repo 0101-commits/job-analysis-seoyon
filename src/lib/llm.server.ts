@@ -29,9 +29,7 @@ function proxyFetch(url: string, init: RequestInit): Promise<Response> {
   // nitro cloudflare 프리셋이 매 요청 globalThis.__env__ = env 를 수행한다. 우리 server.ts 스태시는 보조.
   const env = (g["__env__"] ?? g["__CF_ENV__"]) as Record<string, unknown> | undefined;
   const bound = env?.["ELIZAX_PROXY"] as BoundFetcher | undefined;
-  return typeof bound?.fetch === "function"
-    ? bound.fetch(url, init)
-    : fetch(url, init);
+  return typeof bound?.fetch === "function" ? bound.fetch(url, init) : fetch(url, init);
 }
 
 export async function callLLM({
@@ -87,19 +85,45 @@ export async function callLLM({
   return text;
 }
 
-/** 모델이 설명문을 덧붙여도 첫 괄호~마지막 괄호만 잘라 파싱한다. */
+/**
+ * AI 응답 형식 오류의 식별 이름.
+ *
+ * 호출자(예: 직무 가안 생성의 직렬 분할 재시도)는 "응답이 잘렸는지"를 판단해야 한다.
+ * 화면 문구는 실무 표현으로 바뀔 수 있으므로 문구가 아니라 이 이름으로 식별한다.
+ */
+export const AI_FORMAT_ERROR = "AiResponseFormatError";
+
+/** 응답 형식(잘림·형식 오류) 때문에 실패한 호출인지. 재시도 판단은 이 함수로만 한다. */
+export function isAiFormatError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === AI_FORMAT_ERROR) return true;
+  // 다른 모듈이 직접 던진 형식 오류도 같은 취급 — 문구 기반 판정을 이 한 곳에 모아 둔다.
+  return /^AI 응답 .*실패/.test(err.message);
+}
+
+function formatError(message: string): Error {
+  const err = new Error(message);
+  err.name = AI_FORMAT_ERROR;
+  return err;
+}
+
+/** 모델이 설명문을 덧붙여도 첫 괄호~마지막 괄호만 잘라 읽는다. */
 export function parseJsonLoose<T>(text: string): T {
   const starts = [text.indexOf("["), text.indexOf("{")].filter((i) => i >= 0);
   const ends = [text.lastIndexOf("]"), text.lastIndexOf("}")];
   const start = starts.length ? Math.min(...starts) : -1;
   const end = Math.max(...ends);
   if (start < 0 || end <= start) {
-    throw new Error(`AI 응답 파싱 실패: JSON 을 찾을 수 없습니다. ${text.slice(0, 200)}`);
+    throw formatError(
+      `AI 응답 읽어들이기 실패: 결과 형식을 찾을 수 없습니다. ${text.slice(0, 200)}`,
+    );
   }
   try {
     return JSON.parse(text.slice(start, end + 1)) as T;
   } catch (err) {
-    throw new Error(`AI 응답 파싱 실패: ${err instanceof Error ? err.message : "형식 오류"}`);
+    throw formatError(
+      `AI 응답 읽어들이기 실패: ${err instanceof Error ? err.message : "형식 오류"}`,
+    );
   }
 }
 

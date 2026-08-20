@@ -2,6 +2,7 @@
 import { Plus, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -13,11 +14,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { COPY } from "@/lib/glossary";
 
 import type {
   Education,
   LanguageItem,
   LicenseItem,
+  NotApplicable,
   RequirementsFormProps,
   RequirementsValue,
 } from "./types";
@@ -45,12 +48,59 @@ const PROFICIENCIES = [
   "3년 미만",
   "5년 미만",
   "5년 이상",
+  // 회사에 정해진 기준이 없을 때 고를 것이 없어 칸을 비워 두던 자리 (기획 C5).
+  "기준 없음",
 ];
 
 /** 프리셋에 없는 값이면 Select 는 "직접 입력"으로 표시하고 옆 입력칸에 실제 값을 담는다. */
 function selectValue(raw: string, presets: string[]): string {
   if (raw === "") return "";
   return presets.includes(raw) ? raw : CUSTOM;
+}
+
+/**
+ * 「해당 없음」 경로 (기획 C5).
+ *
+ * 빈 목록은 "아직 안 적었다"와 "적을 것이 없다"를 구분하지 못해, 참여자는 넘어가도 되는지
+ * 알 수 없고 관리자는 미작성으로 읽는다. 판단이 끝났다는 사실을 사유와 함께 남긴다.
+ */
+function NotApplicableToggle({
+  id,
+  mark,
+  label,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  mark: NotApplicable | null;
+  label: string;
+  disabled: boolean;
+  onChange: (next: NotApplicable | null) => void;
+}) {
+  return (
+    <div className="space-y-2 rounded-lg border bg-background p-3">
+      <div className="flex items-start gap-2">
+        <Checkbox
+          id={id}
+          disabled={disabled}
+          checked={mark !== null}
+          onCheckedChange={(c) => onChange(c === true ? { na: true, reason: "" } : null)}
+        />
+        <Label htmlFor={id} className="text-xs leading-snug font-normal">
+          {COPY.notApplicable} — {label}
+        </Label>
+      </div>
+      {mark ? (
+        <Input
+          value={mark.reason}
+          disabled={disabled}
+          placeholder={COPY.notApplicableReason}
+          aria-label={COPY.notApplicableReason}
+          onChange={(e) => onChange({ na: true, reason: e.target.value })}
+        />
+      ) : null}
+    </div>
+  );
 }
 
 export function RequirementsForm({ value, onChange, disabled = false }: RequirementsFormProps) {
@@ -63,7 +113,7 @@ export function RequirementsForm({ value, onChange, disabled = false }: Requirem
     patch({ languages: value.languages.map((l, i) => (i === index ? { ...l, ...part } : l)) });
 
   return (
-    <div className="space-y-6">
+    <div id="field-requirements" className="scroll-mt-28 space-y-6">
       <div className="sticky top-0 z-10 rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm">
         본인의 스펙이 아니라, 이 직무를 새로 맡을 사람에게 필요한 최소 기준을 적어 주세요.
       </div>
@@ -112,7 +162,14 @@ export function RequirementsForm({ value, onChange, disabled = false }: Requirem
 
       <section className="space-y-2">
         <Label>자격증</Label>
-        <ul className="space-y-2">
+        <NotApplicableToggle
+          id="licenses-na"
+          mark={value.licensesNa}
+          label="이 직무에 필요한 자격증 기준이 없습니다"
+          disabled={disabled}
+          onChange={(next) => patch({ licensesNa: next, ...(next ? { licenses: [] } : {}) })}
+        />
+        <ul className={value.licensesNa ? "hidden" : "space-y-2"}>
           {value.licenses.map((lic, i) => (
             <li key={i} className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_120px_140px_auto]">
               <Input
@@ -160,7 +217,7 @@ export function RequirementsForm({ value, onChange, disabled = false }: Requirem
           type="button"
           variant="outline"
           size="sm"
-          disabled={disabled}
+          disabled={disabled || value.licensesNa !== null}
           onClick={() =>
             patch({ licenses: [...value.licenses, { name: "", kind: "필수", grade: "" }] })
           }
@@ -172,11 +229,21 @@ export function RequirementsForm({ value, onChange, disabled = false }: Requirem
 
       <section className="space-y-2">
         <Label>어학</Label>
-        <ul className="space-y-2">
+        <NotApplicableToggle
+          id="languages-na"
+          mark={value.languagesNa}
+          label="이 직무에 필요한 어학 기준이 없습니다"
+          disabled={disabled}
+          onChange={(next) => patch({ languagesNa: next, ...(next ? { languages: [] } : {}) })}
+        />
+        <ul className={value.languagesNa ? "hidden" : "space-y-2"}>
           {value.languages.map((lang, i) => {
             const preset = selectValue(lang.level, LANGUAGE_LEVELS);
             return (
-              <li key={i} className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_160px_minmax(0,1fr)_auto]">
+              <li
+                key={i}
+                className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_160px_minmax(0,1fr)_auto]"
+              >
                 <Input
                   value={lang.language}
                   disabled={disabled}
@@ -230,7 +297,7 @@ export function RequirementsForm({ value, onChange, disabled = false }: Requirem
           type="button"
           variant="outline"
           size="sm"
-          disabled={disabled}
+          disabled={disabled || value.languagesNa !== null}
           onClick={() => patch({ languages: [...value.languages, { language: "", level: "" }] })}
         >
           <Plus className="mr-1 size-4" />

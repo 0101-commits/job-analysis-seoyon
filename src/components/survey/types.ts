@@ -5,7 +5,8 @@ export type Authority = "D" | "R" | "O" | "S";
 export type Ksao = "K" | "S" | "A";
 export type HardSoft = "Hard" | "Soft";
 export type ImproveType = "삭제" | "통폐합" | "빈도감소" | "하위자위양" | "타부서이관" | "강화";
-export type Education = "중졸이하" | "고졸" | "전문대졸" | "학사" | "석사급" | "박사급이상" | "기준없음";
+export type Education =
+  "중졸이하" | "고졸" | "전문대졸" | "학사" | "석사급" | "박사급이상" | "기준없음";
 
 export interface ActivityItem {
   id: string; // DB uuid 또는 임시 id(신규는 crypto.randomUUID())
@@ -45,6 +46,17 @@ export interface LanguageItem {
   level: string; // 기초 회화 / 업무 문서 / 협상 가능 / 공인점수
 }
 
+/**
+ * 「해당 없음」으로 판단이 끝난 항목의 표식 (기획 C5).
+ *
+ * 빈 목록은 "아직 안 적었다"와 "적을 것이 없다"를 구분하지 못한다. 그래서 표식을 따로 남긴다.
+ * 저장은 새 컬럼 없이 기존 jsonb 배열의 첫 원소로 들어간다(survey.data.ts 참고).
+ */
+export interface NotApplicable {
+  na: true;
+  reason: string;
+}
+
 export interface RequirementsValue {
   education: Education | null;
   majorsRequired: string;
@@ -52,7 +64,11 @@ export interface RequirementsValue {
   licenses: LicenseItem[];
   languages: LanguageItem[];
   trainings: string;
-  proficiency: string; // 6개월↓/1년↓/2년↓/3년↓/5년↓/직접입력
+  proficiency: string; // 6개월↓/1년↓/2년↓/3년↓/5년↓/기준없음/직접입력
+  /** 이 직무에 필요한 자격증 기준이 없다고 확정한 경우. null = 아직 판단하지 않음. */
+  licensesNa: NotApplicable | null;
+  /** 어학 기준 없음. */
+  languagesNa: NotApplicable | null;
 }
 
 export interface ExampleRow {
@@ -67,6 +83,8 @@ export interface TaskGridProps {
   value: TaskItem[];
   onChange: (next: TaskItem[]) => void;
   examples: ExampleRow[]; // field==='task'|'activity' 만 전달됨
+  /** 예시 두 세트 중 「같은 직군」 세트를 고르는 기준. 2단계에서 적은 직군. */
+  jobGroup?: string;
   disabled?: boolean;
   /** 과업 삭제 직전 확인. false 를 반환하면 삭제를 취소한다(연결된 스킬 경고용). */
   confirmRemove?: (task: TaskItem) => boolean;
@@ -77,6 +95,7 @@ export interface SkillGridProps {
   onChange: (next: SkillItem[]) => void;
   tasks: Pick<TaskItem, "id" | "name">[];
   examples: ExampleRow[]; // field==='skill'
+  jobGroup?: string;
   disabled?: boolean;
 }
 

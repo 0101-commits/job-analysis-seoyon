@@ -1,9 +1,10 @@
 // 조직도 노드 캔버스 (V5). 신규 의존성 없이 SVG 엣지 + 절대배치 카드로 그린다.
 // 휠 줌 · 배경 드래그 팬 · 노드를 다른 노드에 드롭하면 상위 이동(검증·확인은 부모가 담당).
 // 캔버스는 보조 뷰다 — 동일 기능의 트리 뷰(OrgTree)가 항상 함께 제공된다.
-import { useEffect, useMemo, useRef, useState } from "react";
-import { MoreHorizontal } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Maximize2, MoreHorizontal, ZoomIn, ZoomOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { usePersistedState } from "@/hooks/use-persisted-ui";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -129,24 +130,64 @@ function SubmitRing({ stats }: { stats: { total: number; done: number } | undefi
   );
 }
 
+type View = { x: number; y: number; k: number };
+
+const DEFAULT_VIEW: View = { x: 24, y: 24, k: 1 };
+const MIN_K = 0.2;
+const MAX_K = 2.5;
+
 export function OrgCanvas({
   units,
   rollup,
   busy,
+  selectedId = null,
   onAction,
   onDelete,
   onDropMove,
+  onSelect,
 }: {
   units: CanvasUnit[];
   rollup: CanvasRollup | null;
   busy: boolean;
+  /** 지금 보고 있는 조직 — 테두리로 표시하고, 밖에서 바뀌면 그 노드로 화면을 옮긴다. */
+  selectedId?: string | null;
   onAction: (action: CanvasAction) => void;
   onDelete: (unit: CanvasUnit) => void;
   onDropMove: (unit: CanvasUnit, target: CanvasUnit) => void;
+  /** 노드를 (끌지 않고) 누르면 부른다 — 그 조직의 인원·진행 상태를 옆에 보여 주기 위함. */
+  onSelect?: (unit: CanvasUnit) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [view, setView] = useState({ x: 24, y: 24, k: 1 });
+  const [view, setView] = useState<View>(DEFAULT_VIEW);
   const [box, setBox] = useState({ w: 800, h: 480 });
+  // 확대·위치는 다시 들어왔을 때 그대로여야 한다. 다만 끄는 동안 매 프레임 저장하지는 않는다.
+  const [savedView, setSavedView, viewRestored] = usePersistedState<View>(
+    "master-canvas-view",
+    DEFAULT_VIEW,
+  );
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const restoredRef = useRef(false);
+
+  useEffect(() => {
+    if (!viewRestored || restoredRef.current) return;
+    restoredRef.current = true;
+    setView(savedView);
+  }, [viewRestored, savedView]);
+
+  /** 조작이 멎은 뒤에 한 번만 저장한다. */
+  const rememberView = useCallback(
+    (next: View) => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      saveTimer.current = setTimeout(() => setSavedView(next), 400);
+    },
+    [setSavedView],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, []);
   const [drag, setDrag] = useState<{
     id: string;
     dx: number;
@@ -170,14 +211,64 @@ export function OrgCanvas({
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
       setView((v) => {
-        const k = Math.min(2.5, Math.max(0.2, v.k * Math.exp(-e.deltaY * 0.0015)));
-        return { k, x: mx - ((mx - v.x) * k) / v.k, y: my - ((my - v.y) * k) / v.k };
+        const k = Math.min(MAX_K, Math.max(MIN_K, v.k * Math.exp(-e.deltaY * 0.0015)));
+        const next = { k, x: mx - ((mx - v.x) * k) / v.k, y: my - ((my - v.y) * k) / v.k };
+        rememberView(next);
+        return next;
       });
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     setBox({ w: el.clientWidth, h: el.clientHeight });
     return () => el.removeEventListener("wheel", onWheel);
-  }, []);
+  }, [rememberView]);
+
+  /** 화면 가운데를 기준으로 한 단계 확대·축소. */
+  const zoomBy = useCallback(
+    (factor: number) => {
+      const el = containerRef.current;
+      const mx = (el?.clientWidth ?? box.w) / 2;
+      const my = (el?.clientHeight ?? box.h) / 2;
+      setView((v) => {
+        const k = Math.min(MAX_K, Math.max(MIN_K, v.k * factor));
+        const next = { k, x: mx - ((mx - v.x) * k) / v.k, y: my - ((my - v.y) * k) / v.k };
+        rememberView(next);
+        return next;
+      });
+    },
+    [box.w, box.h, rememberView],
+  );
+
+  /** 조직도 전체가 한눈에 들어오게 맞춘다. */
+  const fitToScreen = useCallback(() => {
+    const el = containerRef.current;
+    const w = el?.clientWidth ?? box.w;
+    const h = el?.clientHeight ?? box.h;
+    const k = Math.min(MAX_K, Math.max(MIN_K, Math.min((w - 32) / width, (h - 32) / height, 1)));
+    const next = { k, x: (w - width * k) / 2, y: 16 };
+    setView(next);
+    rememberView(next);
+  }, [box.w, box.h, width, height, rememberView]);
+
+  // 딥링크(?org=)나 옆 목록에서 고른 조직으로 화면을 옮긴다.
+  useEffect(() => {
+    if (!selectedId) return;
+    const q = pos.get(selectedId);
+    if (!q) return;
+    const el = containerRef.current;
+    const w = el?.clientWidth ?? box.w;
+    const h = el?.clientHeight ?? box.h;
+    setView((v) => {
+      const next = {
+        k: v.k,
+        x: w / 2 - (q.x + NODE_W / 2) * v.k,
+        y: h / 2 - (q.y + NODE_H / 2) * v.k,
+      };
+      rememberView(next);
+      return next;
+    });
+    // pos 는 조직 목록이 바뀔 때마다 새로 만들어진다. 이동은 선택이 바뀔 때만 한다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
 
   function toCanvas(clientX: number, clientY: number) {
     const rect = containerRef.current!.getBoundingClientRect();
@@ -210,6 +301,7 @@ export function OrgCanvas({
     setView((v) => ({ ...v, x: p.ox + (e.clientX - p.sx), y: p.oy + (e.clientY - p.sy) }));
   }
   function onBgPointerUp() {
+    if (panRef.current) rememberView(view);
     panRef.current = null;
   }
 
@@ -234,7 +326,11 @@ export function OrgCanvas({
     const d = dragRef.current;
     dragRef.current = null;
     if (!d) return;
-    if (!d.moved) return; // 클릭 — 메뉴는 ⋯ 버튼이 담당
+    if (!d.moved) {
+      // 끌지 않은 누름 = 선택. 편집 메뉴는 ⋯ 버튼이 담당한다.
+      onSelect?.(d.unit);
+      return;
+    }
     const target = hitTest(e.clientX, e.clientY, d.unit.id);
     setDrag(null);
     if (target && target.id !== d.unit.parent_id && !busy) onDropMove(d.unit, target);
@@ -310,9 +406,11 @@ export function OrgCanvas({
           return (
             <div
               key={unit.id}
-              className={`absolute select-none rounded-lg border bg-card p-2 shadow-sm ${
+              className={`absolute cursor-pointer select-none rounded-lg border bg-card p-2 shadow-sm ${
                 dragging ? "z-10 opacity-80 ring-2 ring-primary" : ""
-              } ${isOver ? "ring-2 ring-primary" : ""}`}
+              } ${isOver ? "ring-2 ring-primary" : ""} ${
+                unit.id === selectedId ? "border-primary ring-2 ring-primary/60" : ""
+              }`}
               style={{
                 left: q.x,
                 top: q.y,
@@ -365,6 +463,42 @@ export function OrgCanvas({
             </div>
           );
         })}
+      </div>
+
+      <div className="absolute right-2 top-2 flex items-center gap-1 rounded-lg border bg-card/90 p-0.5 shadow-sm">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-7"
+          aria-label="축소"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => zoomBy(1 / 1.25)}
+        >
+          <ZoomOut className="size-4" />
+        </Button>
+        <span className="w-10 text-center text-[11px] tabular-nums text-muted-foreground">
+          {Math.round(view.k * 100)}%
+        </span>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-7"
+          aria-label="확대"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => zoomBy(1.25)}
+        >
+          <ZoomIn className="size-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-xs"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={fitToScreen}
+        >
+          <Maximize2 className="size-4" />
+          화면 맞춤
+        </Button>
       </div>
 
       {units.length > MINIMAP_AT && (

@@ -7,6 +7,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 
+import { LabelWithHint } from "@/components/FieldHint";
+
+import { ExamplePopover } from "./ExamplePopover";
 import { AutoTextarea, Hint, HowToBox, uid } from "./TaskGrid";
 import type { HardSoft, Ksao, SkillGridProps, SkillItem } from "./types";
 
@@ -25,15 +28,16 @@ const HARD_SOFT: { value: HardSoft; hint: string }[] = [
 export function SkillHowTo({ skillCount }: { skillCount?: number | undefined }) {
   return (
     <HowToBox
+      sectionId="step5"
       note={
         skillCount === undefined
           ? undefined
-          : `스킬 3개 이상 필수, 5개 이상 권장 — 현재 ${skillCount}개`
+          : `필요 역량 3개 이상 필수, 5개 이상 권장 — 현재 ${skillCount}개`
       }
       steps={[
         "이 직무를 제대로 하려면 필요한 지식·기술·태도를 3개 이상 적습니다(5개 이상 권장).",
-        "각 스킬이 지식·기술·태도 중 무엇인지, Hard 인지 Soft 인지 고릅니다.",
-        "그 스킬이 쓰이는 과업을 연결합니다. 특정 과업과 무관하면 「직무 공통 스킬」을 고릅니다.",
+        "각 항목이 지식·기술·태도 중 무엇인지, Hard 인지 Soft 인지 고릅니다.",
+        "그 역량이 쓰이는 과업을 연결합니다. 특정 과업과 무관하면 「직무 공통 역량」을 고릅니다.",
         "자격요건 탭의 학력·자격은 '내 스펙'이 아니라 '이 직무에 필요한 기준'으로 적습니다.",
       ]}
       sections={[
@@ -50,7 +54,14 @@ export function SkillHowTo({ skillCount }: { skillCount?: number | undefined }) 
   );
 }
 
-export function SkillGrid({ value, onChange, tasks, disabled = false }: SkillGridProps) {
+export function SkillGrid({
+  value,
+  onChange,
+  tasks,
+  examples,
+  jobGroup = "",
+  disabled = false,
+}: SkillGridProps) {
   const patch = (id: string, part: Partial<SkillItem>) => {
     onChange(value.map((s) => (s.id === id ? { ...s, ...part } : s)));
   };
@@ -82,21 +93,29 @@ export function SkillGrid({ value, onChange, tasks, disabled = false }: SkillGri
 
   return (
     <div className="space-y-4">
-      <p className="text-sm text-muted-foreground">
-        이 직무를 제대로 수행하는 데 필요한 지식·기술·능력을 3개 이상 적어 주세요.
-      </p>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+          이 직무를 제대로 수행하는 데 필요한 지식·기술·능력을 3개 이상 적어 주세요.
+        </p>
+        <LabelWithHint term="필요 역량">필요 역량이란</LabelWithHint>
+        <ExamplePopover examples={examples} jobGroup={jobGroup} fields={["skill"]} />
+      </div>
       {unlinked > 0 ? (
         <p className="rounded-lg bg-secondary p-3 text-xs text-muted-foreground">
-          관련 과업을 아직 고르지 않은 스킬이 {unlinked}개 있습니다. 특정 과업과 무관한 스킬이라면
-          「특정 과업과 무관 (직무 공통 스킬)」을 골라 주세요.
+          관련 과업을 아직 고르지 않은 항목이 {unlinked}개 있습니다. 특정 과업과 무관한 역량이라면
+          「특정 과업과 무관 (직무 공통 역량)」을 골라 주세요.
         </p>
       ) : null}
 
-      <ul className="space-y-4">
+      <ul id="field-skills" className="scroll-mt-28 space-y-4">
         {value.map((skill, index) => {
           const generalId = `skill-${skill.id}-general`;
           return (
-            <li key={skill.id} className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-5">
+            <li
+              key={skill.id}
+              id={`skill-${skill.id}`}
+              className="space-y-4 rounded-xl border bg-card p-4 shadow-sm scroll-mt-28 sm:p-5"
+            >
               <div className="flex items-start gap-2">
                 <span className="mt-2 text-sm font-semibold text-muted-foreground">
                   {index + 1}
@@ -105,7 +124,7 @@ export function SkillGrid({ value, onChange, tasks, disabled = false }: SkillGri
                   value={skill.name}
                   disabled={disabled}
                   className="min-w-0 flex-1"
-                  aria-label={`${index + 1}번째 스킬명`}
+                  aria-label={`${index + 1}번째 필요 역량 이름`}
                   placeholder="예: 통계적 공정관리(SPC)"
                   onChange={(e) => patch(skill.id, { name: e.target.value })}
                 />
@@ -115,8 +134,8 @@ export function SkillGrid({ value, onChange, tasks, disabled = false }: SkillGri
                   size="icon"
                   disabled={disabled}
                   onClick={() => onChange(value.filter((s) => s.id !== skill.id))}
-                  title="스킬 삭제"
-                  aria-label="스킬 삭제"
+                  title="필요 역량 삭제"
+                  aria-label="필요 역량 삭제"
                 >
                   <Trash2 className="size-4 text-destructive" />
                 </Button>
@@ -197,7 +216,7 @@ export function SkillGrid({ value, onChange, tasks, disabled = false }: SkillGri
               <div className="space-y-2">
                 <Label className="flex items-center gap-1">
                   관련 과업
-                  <Hint text="이 스킬이 필요한 과업을 모두 고르세요. 특정 과업에 묶이지 않는 스킬이면 「특정 과업과 무관」을 고릅니다." />
+                  <Hint text="이 역량이 필요한 과업을 모두 고르세요. 특정 과업에 묶이지 않으면 「특정 과업과 무관」을 고릅니다." />
                 </Label>
                 <div className="flex items-start gap-2 rounded-lg border bg-background p-2">
                   <Checkbox
@@ -212,7 +231,7 @@ export function SkillGrid({ value, onChange, tasks, disabled = false }: SkillGri
                     }
                   />
                   <Label htmlFor={generalId} className="text-xs font-normal leading-snug">
-                    특정 과업과 무관 (직무 공통 스킬)
+                    특정 과업과 무관 (직무 공통 역량)
                   </Label>
                 </div>
                 {tasks.length === 0 ? (
@@ -253,7 +272,7 @@ export function SkillGrid({ value, onChange, tasks, disabled = false }: SkillGri
 
       <Button type="button" variant="outline" disabled={disabled} onClick={addSkill}>
         <Plus className="mr-1 size-4" />
-        스킬 추가
+        필요 역량 추가
       </Button>
     </div>
   );

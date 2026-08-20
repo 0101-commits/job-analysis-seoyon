@@ -1,23 +1,11 @@
 import { useMemo, useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
-import {
-  AlertTriangle,
-  Check,
-  ClipboardCopy,
-  Copy,
-  Loader2,
-  Send,
-  Sparkles,
-  Wand2,
-} from "lucide-react";
+import { AlertTriangle, Check, ClipboardCopy, Copy, Loader2, Sparkles } from "lucide-react";
 
-import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Select,
   SelectContent,
@@ -25,29 +13,32 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { EmptyState } from "@/components/EmptyState";
+import { SectionNav } from "@/components/SectionNav";
 import { useCompanyScope } from "@/components/CompanyContext";
-import { readableValue, targetLabel } from "@/components/survey/AiSuggestionCards";
 import {
   aiProxyStatus,
   applyMerge,
-  applySuggestion,
-  confirmAiDrafts,
   detectPoorResponses,
-  draftMissingFields,
-  listSuggestions,
+  listPendingSuggestions,
   pingProxy,
-  requestReview,
-  scanTypos,
   suggestMerges,
 } from "@/lib/ai.functions";
 
+/**
+ * AI 일괄 점검 — 여러 건을 한 번에 훑는 자리.
+ *
+ * 한 건을 판단하며 쓰는 AI(오탈자 검수·부실 점검·빈 항목 초안·표기 통일)는 검토 화면의
+ * 판단 패널로 옮겼다(A2). 여기 남는 것은 "전 응답을 훑어 대상 목록을 만드는 일"뿐이고,
+ * 목록의 각 행은 그 응답의 검토 화면(`/admin/review?response=<id>`)으로 곧장 들어간다(P6).
+ */
 export const Route = createFileRoute("/_authenticated/admin/ai")({
   head: () => ({
     meta: [
-      { title: "AI 도구 | 서연 그룹 업무조사" },
-      { name: "description", content: "업무기술서 자동 정리 등 AI 보조 기능을 제공합니다." },
-      { property: "og:title", content: "AI 도구 | 서연 그룹 업무조사" },
-      { property: "og:description", content: "업무기술서 자동 정리 등 AI 보조 기능을 제공합니다." },
+      { title: "AI 일괄 점검 | 서연 그룹 업무조사" },
+      { name: "description", content: "전 응답을 훑어 손봐야 할 건을 찾습니다." },
+      { property: "og:title", content: "AI 일괄 점검 | 서연 그룹 업무조사" },
+      { property: "og:description", content: "전 응답을 훑어 손봐야 할 건을 찾습니다." },
     ],
   }),
   component: AiPage,
@@ -66,52 +57,14 @@ async function copyText(text: string, label: string) {
   }
 }
 
-/** 제출된 응답 목록 (계열사 스코프 반영) */
-function useSubmittedResponses(companyId: string) {
-  return useQuery({
-    queryKey: ["ai-submitted-responses", companyId],
-    queryFn: async () => {
-      let q = supabase
-        .from("responses")
-        .select("id, job_name, status, submitted_at, participants(name, emp_no)")
-        .eq("status", "submitted")
-        .order("submitted_at", { ascending: false });
-      if (companyId !== "all") q = q.eq("company_id", companyId);
-      const { data, error } = await q;
-      if (error) throw error;
-      return data ?? [];
-    },
-  });
-}
-
-function ResponsePicker({
-  companyId,
-  value,
-  onChange,
-}: {
-  companyId: string;
-  value: string;
-  onChange: (id: string) => void;
-}) {
-  const { data, isLoading } = useSubmittedResponses(companyId);
-  const rows = data ?? [];
-
+/** 해당 응답의 검토 화면으로 바로 들어가는 링크 (딥링크 규약). */
+function ReviewLink({ responseId, label }: { responseId: string; label: string }) {
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <Select value={value} onValueChange={onChange}>
-        <SelectTrigger className="w-full sm:w-[360px]" aria-label="응답 선택">
-          <SelectValue placeholder={isLoading ? "불러오는 중..." : "제출된 응답 선택"} />
-        </SelectTrigger>
-        <SelectContent>
-          {rows.map((r) => (
-            <SelectItem key={r.id} value={r.id}>
-              {r.participants?.name ?? "이름없음"} · {r.job_name ?? "직무명 미기재"}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      <span className="text-xs text-muted-foreground">제출 {rows.length}건</span>
-    </div>
+    <Button asChild size="sm" variant="outline">
+      <Link to="/admin/review" search={{ response: responseId }}>
+        {label}
+      </Link>
+    </Button>
   );
 }
 
@@ -137,12 +90,19 @@ function AiPage() {
     },
   });
 
+  const pendingQuery = useQuery({
+    queryKey: ["ai-pending-suggestions", scope],
+    queryFn: () => listPendingSuggestions({ data: { companyId: scope } }),
+  });
+  const pendingGroups = pendingQuery.data?.groups ?? [];
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <div>
-        <h1 className="text-xl font-bold sm:text-2xl">AI 도구</h1>
+        <h1 className="text-xl font-bold sm:text-2xl">AI 일괄 점검</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          업무기술서 오탈자 검수, 부실 응답 탐지, 빈 항목 초안, 표기 병합을 지원합니다.
+          전 응답을 훑어 손봐야 할 건을 찾습니다. 한 건을 고치는 일은 각 행의 [검토 화면 열기]에서
+          합니다.
         </p>
       </div>
 
@@ -173,215 +133,75 @@ function AiPage() {
         </Button>
       </div>
 
-      <Tabs defaultValue="typos">
-        <TabsList className="flex w-full flex-wrap justify-start">
-          <TabsTrigger value="typos">오타 검수</TabsTrigger>
-          <TabsTrigger value="poor">부실 응답</TabsTrigger>
-          <TabsTrigger value="fill">자동 채움</TabsTrigger>
-          <TabsTrigger value="merge">표기 병합</TabsTrigger>
-        </TabsList>
+      <SectionNav
+        sections={[
+          { id: "sweep-pending", label: "미결 AI 제안", count: pendingGroups.length },
+          { id: "sweep-poor", label: "부실 응답 스윕" },
+          { id: "sweep-merge", label: "표기 통일" },
+        ]}
+      />
 
-        <TabsContent value="typos" className="mt-4">
-          <TypoTab companyId={companyId} onProxyError={setProxyError} />
-        </TabsContent>
-        <TabsContent value="poor" className="mt-4">
-          <PoorTab scope={scope} onProxyError={setProxyError} />
-        </TabsContent>
-        <TabsContent value="fill" className="mt-4">
-          <FillTab companyId={companyId} onProxyError={setProxyError} />
-        </TabsContent>
-        <TabsContent value="merge" className="mt-4">
-          <MergeTab scope={scope} onProxyError={setProxyError} />
-        </TabsContent>
-      </Tabs>
+      <section id="sweep-pending" className="scroll-mt-20 space-y-3">
+        <h2 className="text-base font-semibold">미결 AI 제안</h2>
+        <p className="text-sm text-muted-foreground">
+          아직 수락·거절되지 않은 제안이 남은 응답입니다. 제안이 남아 있으면 승인 게이트가 막힐 수
+          있습니다.
+        </p>
+        {pendingQuery.isLoading ? (
+          <p className="text-sm text-muted-foreground">불러오는 중...</p>
+        ) : pendingGroups.length === 0 ? (
+          <EmptyState
+            kind="nothing"
+            title="미결 제안이 없습니다"
+            description="모든 AI 제안이 처리됐습니다. 새 제안은 검토 화면의 AI 점검에서 만듭니다."
+          />
+        ) : (
+          <ul className="space-y-2">
+            {pendingGroups.map((g) => (
+              <li
+                key={g.responseId}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-card p-4"
+              >
+                <div className="min-w-0">
+                  <p className="font-semibold">
+                    {g.name}
+                    <span className="ml-2 text-xs font-normal text-muted-foreground">
+                      {g.jobName}
+                    </span>
+                  </p>
+                  <div className="mt-1 flex flex-wrap gap-1.5">
+                    {Object.entries(g.kinds).map(([kind, count]) => (
+                      <Badge key={kind} variant="outline">
+                        {kind} {count}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+                <ReviewLink responseId={g.responseId} label="검토 화면 열기" />
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section id="sweep-poor" className="scroll-mt-20 space-y-3">
+        <h2 className="text-base font-semibold">부실 응답 스윕</h2>
+        <PoorSweep scope={scope} onProxyError={setProxyError} />
+      </section>
+
+      <section id="sweep-merge" className="scroll-mt-20 space-y-3">
+        <h2 className="text-base font-semibold">표기 통일</h2>
+        <MergeSweep scope={scope} onProxyError={setProxyError} />
+      </section>
     </div>
   );
 }
 
 type ProxyErrorSetter = (message: string | null) => void;
 
-/* ① 오타 검수 ------------------------------------------------------------ */
+/* 부실 응답 스윕 — 결과의 각 건은 검토 화면으로 넘긴다. */
 
-function TypoTab({
-  companyId,
-  onProxyError,
-}: {
-  companyId: string;
-  onProxyError: ProxyErrorSetter;
-}) {
-  const queryClient = useQueryClient();
-  const [responseId, setResponseId] = useState("");
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-
-  const suggestionsQuery = useQuery({
-    queryKey: ["ai-suggestions", responseId, "오타"],
-    queryFn: () => listSuggestions({ data: { responseId, kind: "오타" } }),
-    enabled: Boolean(responseId),
-  });
-
-  const rows = suggestionsQuery.data ?? [];
-  const pending = rows.filter((r) => r.status === "제안");
-  const history = rows.filter((r) => r.status !== "제안");
-
-  const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: ["ai-suggestions", responseId, "오타"] });
-
-  const scanMutation = useMutation({
-    mutationFn: () => scanTypos({ data: { responseId } }),
-    onSuccess: (res) => {
-      onProxyError(null);
-      setSelected(new Set());
-      toast.success(
-        res.inserted > 0
-          ? `제안 ${res.inserted}건을 찾았습니다.`
-          : "수정할 부분을 찾지 못했습니다.",
-      );
-      void invalidate();
-    },
-    onError: (err) => {
-      const message = errorMessage(err);
-      if (message.includes("AI")) onProxyError(message);
-      toast.error(message);
-    },
-  });
-
-  const applyMutation = useMutation({
-    mutationFn: async (ids: string[]) => {
-      let ok = 0;
-      for (const id of ids) {
-        await applySuggestion({ data: { suggestionId: id } });
-        ok += 1;
-      }
-      return ok;
-    },
-    onSuccess: (ok) => {
-      toast.success(`${ok}건을 응답에 반영했습니다.`);
-      setSelected(new Set());
-      void invalidate();
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-
-  // 오타 검수는 경로 A(관리자 직접 반영) 전용 — 응답자 검토 요청(경로 B)은 제공하지 않는다.
-  const busy = scanMutation.isPending || applyMutation.isPending;
-  const selectedIds = [...selected];
-
-  function toggle(id: string) {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
-  return (
-    <div className="space-y-4">
-      <div className="rounded-xl border bg-card p-4">
-        <ResponsePicker companyId={companyId} value={responseId} onChange={setResponseId} />
-        <Button
-          className="mt-3"
-          disabled={!responseId || busy}
-          onClick={() => scanMutation.mutate()}
-        >
-          {scanMutation.isPending ? (
-            <Loader2 className="size-4 animate-spin" />
-          ) : (
-            <Sparkles className="size-4" />
-          )}
-          오탈자 스캔 실행
-        </Button>
-      </div>
-
-      {pending.length > 0 && (
-        <div className="space-y-3 rounded-xl border bg-card p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-sm font-semibold">검토 대기 {pending.length}건</p>
-            <div className="flex flex-wrap gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={busy || selectedIds.length === 0}
-                onClick={() => applyMutation.mutate(selectedIds)}
-              >
-                {applyMutation.isPending ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <Check className="size-4" />
-                )}
-                관리자가 바로 수정
-              </Button>
-            </div>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            오타 검수는 관리자가 바로 고치는 기능입니다. 작성자에게 확인을 받아야 하면 자동 채움
-            탭을 사용하세요.
-          </p>
-
-          <ul className="space-y-3">
-            {pending.map((s) => (
-              <li key={s.id} className="rounded-lg border p-3">
-                <div className="flex items-start gap-3">
-                  <Checkbox
-                    checked={selected.has(s.id)}
-                    onCheckedChange={() => toggle(s.id)}
-                    aria-label={`${targetLabel(s.target)} 선택`}
-                  />
-                  <div className="min-w-0 flex-1 space-y-2">
-                    <p className="text-xs font-medium text-muted-foreground">
-                      {targetLabel(s.target)}
-                    </p>
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <p className="rounded bg-secondary p-2 text-sm">{s.original_value ?? "—"}</p>
-                      <p className="rounded border border-primary/30 bg-primary-soft/40 p-2 text-sm">
-                        {s.suggested_value}
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() => applyMutation.mutate([s.id])}
-                      >
-                        바로 수정
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {history.length > 0 && (
-        <div className="rounded-xl border bg-card p-4">
-          <p className="text-sm font-semibold">반영 이력 {history.length}건</p>
-          <ul className="mt-3 space-y-2 text-sm">
-            {history.map((s) => (
-              <li key={s.id} className="flex flex-wrap items-center gap-2 border-t pt-2">
-                <Badge variant="outline">{s.status}</Badge>
-                <span className="text-xs text-muted-foreground">{targetLabel(s.target)}</span>
-                <span className="min-w-0 flex-1 truncate">{s.suggested_value}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {responseId && !suggestionsQuery.isLoading && rows.length === 0 && (
-        <p className="rounded-xl border border-dashed bg-card p-6 text-center text-sm text-muted-foreground">
-          아직 이 응답에 대한 오타 제안이 없습니다. 스캔을 실행하세요.
-        </p>
-      )}
-    </div>
-  );
-}
-
-/* ② 부실 응답 ------------------------------------------------------------ */
-
-function PoorTab({
+function PoorSweep({
   scope,
   onProxyError,
 }: {
@@ -404,7 +224,7 @@ function PoorTab({
   const candidates = mutation.data?.candidates ?? [];
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
       <div className="rounded-xl border bg-card p-4">
         <p className="text-sm text-muted-foreground">
           제출 상태 응답 최대 30건을 검사해 과업·활동이 부실한 응답을 찾고 반려 사유 초안을
@@ -420,18 +240,31 @@ function PoorTab({
         </Button>
       </div>
 
-      {mutation.isSuccess && candidates.length === 0 && (
-        <p className="rounded-xl border border-dashed bg-card p-6 text-center text-sm text-muted-foreground">
-          부실 의심 응답이 없습니다.
+      {mutation.isError && (
+        <p className="rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+          스캔 실패 — {errorMessage(mutation.error)}
         </p>
+      )}
+
+      {mutation.isSuccess && candidates.length === 0 && (
+        <EmptyState
+          kind="nothing"
+          title="부실 의심 응답이 없습니다"
+          description="검사한 범위에서는 판정 기준에 걸리는 응답을 찾지 못했습니다."
+        />
       )}
 
       <ul className="space-y-3">
         {candidates.map((c) => (
           <li key={c.responseId} className="rounded-xl border bg-card p-4">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-sm font-semibold">{c.name || "이름없음"}</span>
-              <span className="text-xs text-muted-foreground">{c.jobName || "직무명 미기재"}</span>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-semibold">{c.name || "이름없음"}</span>
+                <span className="text-xs text-muted-foreground">
+                  {c.jobName || "직무명 미기재"}
+                </span>
+              </div>
+              <ReviewLink responseId={c.responseId} label="검토 화면 열기" />
             </div>
             <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
               {c.issues.map((issue, i) => (
@@ -458,241 +291,9 @@ function PoorTab({
   );
 }
 
-/* ③ 자동 채움 ------------------------------------------------------------ */
+/* 표기 통일 — 전사 범위 작업이라 일괄 점검 화면에 남긴다. */
 
-function FillTab({
-  companyId,
-  onProxyError,
-}: {
-  companyId: string;
-  onProxyError: ProxyErrorSetter;
-}) {
-  const queryClient = useQueryClient();
-  const [responseId, setResponseId] = useState("");
-  const [target, setTarget] = useState<"skills" | "requirements">("skills");
-
-  const suggestionsQuery = useQuery({
-    queryKey: ["ai-suggestions", responseId, "자동채움"],
-    queryFn: () => listSuggestions({ data: { responseId, kind: "자동채움" } }),
-    enabled: Boolean(responseId),
-  });
-
-  const rows = suggestionsQuery.data ?? [];
-  const drafts = rows.filter((r) => r.status === "제안");
-  const sent = rows.filter((r) => r.status !== "제안");
-
-  const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: ["ai-suggestions", responseId, "자동채움"] });
-
-  const draftMutation = useMutation({
-    mutationFn: () => draftMissingFields({ data: { responseId, target } }),
-    onSuccess: (res) => {
-      onProxyError(null);
-      toast.success(
-        res.inserted > 0 ? `초안 ${res.inserted}건을 만들었습니다.` : "채울 빈 항목이 없습니다.",
-      );
-      void invalidate();
-    },
-    onError: (err) => {
-      const message = errorMessage(err);
-      if (message.includes("AI")) onProxyError(message);
-      toast.error(message);
-    },
-  });
-
-  const reviewMutation = useMutation({
-    mutationFn: (ids: string[]) => requestReview({ data: { suggestionIds: ids } }),
-    onSuccess: (res) => {
-      toast.success(`${res.requested}건을 작성자 확인으로 넘겼습니다.`);
-      void invalidate();
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-
-  // 응답에 남은 'AI 초안' 표시 건수. 이 표시가 남아 있으면 응답을 승인할 수 없다.
-  const draftCountKey = ["ai-draft-marks", responseId];
-  const draftCountQuery = useQuery({
-    queryKey: draftCountKey,
-    queryFn: async () => {
-      const [skills, reqs] = await Promise.all([
-        supabase
-          .from("response_skills")
-          .select("id", { count: "exact", head: true })
-          .eq("response_id", responseId)
-          .eq("ai_draft", true),
-        supabase
-          .from("response_requirements")
-          .select("response_id", { count: "exact", head: true })
-          .eq("response_id", responseId)
-          .eq("ai_draft", true),
-      ]);
-      return (skills.count ?? 0) + (reqs.count ?? 0);
-    },
-    enabled: Boolean(responseId),
-  });
-  const draftMarks = draftCountQuery.data ?? 0;
-
-  const confirmMutation = useMutation({
-    mutationFn: () => confirmAiDrafts({ data: { responseId } }),
-    onSuccess: (res) => {
-      toast.success(`AI 초안 표시 ${res.confirmed}건을 확정했습니다.`);
-      void invalidate();
-      void queryClient.invalidateQueries({ queryKey: draftCountKey });
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-
-  return (
-    <div className="space-y-4">
-      <div className="space-y-3 rounded-xl border bg-card p-4">
-        <ResponsePicker companyId={companyId} value={responseId} onChange={setResponseId} />
-        <div className="flex flex-wrap items-center gap-2">
-          <Select value={target} onValueChange={(v) => setTarget(v as "skills" | "requirements")}>
-            <SelectTrigger className="w-[200px]" aria-label="채울 항목">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="skills">스킬</SelectItem>
-              <SelectItem value="requirements">자격요건</SelectItem>
-            </SelectContent>
-          </Select>
-          <Button
-            disabled={!responseId || draftMutation.isPending}
-            onClick={() => draftMutation.mutate()}
-          >
-            {draftMutation.isPending ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : (
-              <Wand2 className="size-4" />
-            )}
-            초안 생성
-          </Button>
-          <Button
-            variant="outline"
-            disabled={!responseId || draftMarks === 0 || confirmMutation.isPending}
-            onClick={() => {
-              if (
-                !window.confirm(
-                  `AI 초안 표시 ${draftMarks}건을 확정합니다. 확정해야 이 응답을 승인할 수 있습니다.`,
-                )
-              )
-                return;
-              confirmMutation.mutate();
-            }}
-          >
-            {confirmMutation.isPending ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : (
-              <Check className="size-4" />
-            )}
-            AI 초안 일괄 확정{draftMarks > 0 ? ` ${draftMarks}건` : ""}
-          </Button>
-        </div>
-        {responseId && draftMarks > 0 && (
-          <p className="text-xs text-muted-foreground">
-            이 응답에 AI 초안 표시가 {draftMarks}건 남아 있어 승인할 수 없습니다. 내용을 확인한 뒤
-            확정하세요.
-          </p>
-        )}
-      </div>
-
-      {drafts.length > 0 && (
-        <div className="space-y-3 rounded-xl border bg-card p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-sm font-semibold">초안 미리보기 {drafts.length}건</p>
-            <Button
-              size="sm"
-              disabled={reviewMutation.isPending}
-              onClick={() => reviewMutation.mutate(drafts.map((d) => d.id))}
-            >
-              {reviewMutation.isPending ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <Send className="size-4" />
-              )}
-              작성자에게 확인 요청
-            </Button>
-          </div>
-          <ul className="space-y-2">
-            {drafts.map((d) => (
-              <li key={d.id} className="rounded-lg border p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge className="bg-primary-soft text-accent-foreground">AI 초안</Badge>
-                  <span className="text-xs text-muted-foreground">{targetLabel(d.target)}</span>
-                </div>
-                <p className="mt-2 whitespace-pre-wrap text-sm">
-                  {readableValue(d.target, d.suggested_value)}
-                </p>
-                {d.original_value && (
-                  <p className="mt-1 text-xs text-muted-foreground">현재: {d.original_value}</p>
-                )}
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="mt-2"
-                  disabled={reviewMutation.isPending}
-                  onClick={() => reviewMutation.mutate([d.id])}
-                >
-                  이 건만 확인 요청
-                </Button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {sent.length > 0 && (
-        <div className="rounded-xl border bg-card p-4">
-          <p className="text-sm font-semibold">진행 상태 {sent.length}건</p>
-          <ul className="mt-3 space-y-2 text-sm">
-            {sent.map((s) => (
-              <li key={s.id} className="flex flex-wrap items-center gap-2 border-t pt-2">
-                <Badge variant="outline">{s.status}</Badge>
-                <span className="text-xs text-muted-foreground">{targetLabel(s.target)}</span>
-                <span className="min-w-0 flex-1 truncate">
-                  {readableValue(s.target, s.suggested_value)}
-                </span>
-                {(s.status === "수락" || s.status === "수정") && (
-                  <ApplyButton suggestionId={s.id} onDone={invalidate} />
-                )}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ApplyButton({ suggestionId, onDone }: { suggestionId: string; onDone: () => void }) {
-  const mutation = useMutation({
-    mutationFn: () => applySuggestion({ data: { suggestionId } }),
-    onSuccess: () => {
-      toast.success("응답에 반영했습니다.");
-      onDone();
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-  return (
-    <Button
-      size="sm"
-      variant="outline"
-      disabled={mutation.isPending}
-      onClick={() => mutation.mutate()}
-    >
-      {mutation.isPending ? (
-        <Loader2 className="size-4 animate-spin" />
-      ) : (
-        <Check className="size-4" />
-      )}
-      최종 반영
-    </Button>
-  );
-}
-
-/* ④ 표기 병합 ------------------------------------------------------------ */
-
-function MergeTab({
+function MergeSweep({
   scope,
   onProxyError,
 }: {
@@ -712,7 +313,7 @@ function MergeTab({
       toast.success(
         res.clusters.length > 0
           ? `병합 후보 ${res.clusters.length}묶음을 찾았습니다.`
-          : "병합할 표기 변형이 없습니다.",
+          : "통일할 표기 변형이 없습니다.",
       );
     },
     onError: (err) => {
@@ -736,18 +337,18 @@ function MergeTab({
 
   const clusters = scanMutation.data?.clusters ?? [];
   const distinctCount = scanMutation.data?.distinct.length ?? 0;
-  const fieldLabel = useMemo(() => (field === "job_name" ? "직무명" : "스킬명"), [field]);
+  const fieldLabel = useMemo(() => (field === "job_name" ? "직무명" : "역량명"), [field]);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-card p-4">
         <Select value={field} onValueChange={(v) => setField(v as "job_name" | "skill_name")}>
-          <SelectTrigger className="w-[180px]" aria-label="병합 대상 필드">
+          <SelectTrigger className="w-[180px]" aria-label="통일 대상 항목">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="job_name">직무명</SelectItem>
-            <SelectItem value="skill_name">스킬명</SelectItem>
+            <SelectItem value="skill_name">역량명</SelectItem>
           </SelectContent>
         </Select>
         <Button disabled={scanMutation.isPending} onClick={() => scanMutation.mutate()}>
@@ -756,7 +357,7 @@ function MergeTab({
           ) : (
             <Copy className="size-4" />
           )}
-          병합 후보 찾기
+          통일 후보 찾기
         </Button>
         {scanMutation.isSuccess && (
           <span className="text-xs text-muted-foreground">
@@ -765,10 +366,18 @@ function MergeTab({
         )}
       </div>
 
-      {scanMutation.isSuccess && clusters.length === 0 && (
-        <p className="rounded-xl border border-dashed bg-card p-6 text-center text-sm text-muted-foreground">
-          통일이 필요한 표기 변형을 찾지 못했습니다.
+      {scanMutation.isError && (
+        <p className="rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+          점검 실패 — {errorMessage(scanMutation.error)}
         </p>
+      )}
+
+      {scanMutation.isSuccess && clusters.length === 0 && (
+        <EmptyState
+          kind="nothing"
+          title="통일할 표기가 없습니다"
+          description={`${fieldLabel} ${distinctCount}종을 검사했지만 같은 대상을 다르게 적은 표기를 찾지 못했습니다.`}
+        />
       )}
 
       <ul className="space-y-3">

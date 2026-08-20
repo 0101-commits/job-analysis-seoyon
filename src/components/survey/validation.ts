@@ -1,6 +1,6 @@
 // 조사 마법사 ④⑤단계 검증 유틸. 코어(위저드)가 단계 이동 게이트에 사용하고,
 // TaskGrid 는 similarity/findSimilarPairs 를 중복 경고 배지에 재사용한다.
-import type { SkillItem, TaskItem, TaskValidation } from "./types";
+import type { RequirementsValue, SkillItem, TaskItem, TaskValidation } from "./types";
 
 export const SIMILARITY_THRESHOLD = 0.8;
 
@@ -113,19 +113,195 @@ export function validateTasks(tasks: TaskItem[]): TaskValidation {
   return { ok: errors.length === 0, errors, warnings };
 }
 
+/**
+ * 진행 체크리스트 한 줄 (기획 C3).
+ *
+ * 제출 버튼을 눌러야 미완 항목을 알려 주던 흐름을 뒤집는다 — 작성 중에도 무엇이 남았는지
+ * 옆에 항상 띄우고, 누르면 그 자리로 데려간다. 그래서 항목마다 `anchor`(문서 요소 id)를 갖는다.
+ *
+ * `required=false` 는 제출을 막지 않는 권장 항목이라 남은 개수에 세지 않는다.
+ * 값이 없는 필드를 optional 로 두지 않고 빈 문자열로 채운다(호출부의 undefined 분기 제거).
+ */
+export interface ChecklistEntry {
+  id: string;
+  step: number;
+  label: string;
+  /** 무엇이 비었는지 한 줄. 채울 것이 없으면 빈 문자열. */
+  hint: string;
+  done: boolean;
+  required: boolean;
+  /** 스크롤해 갈 요소 id. 빈 문자열이면 단계 이동만 한다. */
+  anchor: string;
+}
+
+export interface ChecklistInput {
+  jobGroup: string;
+  jobSeries: string;
+  jobName: string;
+  definition: string;
+  mission: string;
+  tasks: TaskItem[];
+  skills: SkillItem[];
+  coverage: string | null;
+  requirements: RequirementsValue;
+}
+
+/** 과업 한 건에서 아직 안 채운 항목 이름들. */
+function missingInTask(task: TaskItem): string[] {
+  const missing: string[] = [];
+  if (task.name.trim() === "") missing.push("과업명");
+  if (task.activities.length === 0) missing.push("세부 활동");
+  else if (task.activities.some((a) => a.name.trim() === "")) missing.push("빈 세부 활동");
+  if (task.importance === null) missing.push("중요도");
+  if (task.authority === null) missing.push("책임수준");
+  if (task.transferable === null) missing.push("이관 가능");
+  return missing;
+}
+
+function missingInSkill(skill: SkillItem): string[] {
+  const missing: string[] = [];
+  if (skill.name.trim() === "") missing.push("역량 이름");
+  if (skill.ksao === null) missing.push("구분");
+  if (skill.description.trim() === "") missing.push("한 줄 설명");
+  return missing;
+}
+
+export function buildChecklist(input: ChecklistInput): ChecklistEntry[] {
+  const entries: ChecklistEntry[] = [];
+  const add = (e: ChecklistEntry) => entries.push(e);
+
+  add({
+    id: "info",
+    step: 1,
+    label: "인사정보 확인",
+    hint: "",
+    done: true,
+    required: false,
+    anchor: "",
+  });
+
+  const jobs: [string, string, string][] = [
+    ["job_group", "직군", input.jobGroup],
+    ["job_series", "직렬", input.jobSeries],
+    ["job_name", "직무", input.jobName],
+  ];
+  for (const [key, label, value] of jobs) {
+    add({
+      id: key,
+      step: 2,
+      label,
+      hint: value.trim() === "" ? "아직 비어 있습니다 (권장)" : "",
+      done: value.trim() !== "",
+      required: false,
+      anchor: `field-${key}`,
+    });
+  }
+
+  add({
+    id: "definition",
+    step: 3,
+    label: "직무 정의",
+    hint: input.definition.trim() === "" ? "두세 문장으로 적어 주세요" : "",
+    done: input.definition.trim() !== "",
+    required: true,
+    anchor: "field-definition",
+  });
+  add({
+    id: "mission",
+    step: 3,
+    label: "직무 목적",
+    hint: input.mission.trim() === "" ? "한두 문장으로 적어 주세요" : "",
+    done: input.mission.trim() !== "",
+    required: true,
+    anchor: "field-mission",
+  });
+
+  add({
+    id: "task-count",
+    step: 4,
+    label: `과업 3개 이상 (현재 ${input.tasks.length}개)`,
+    hint: input.tasks.length < 3 ? "5~10개를 권장합니다" : "",
+    done: input.tasks.length >= 3,
+    required: true,
+    anchor: "field-tasks",
+  });
+  input.tasks.forEach((task, i) => {
+    const missing = missingInTask(task);
+    add({
+      id: `task-${task.id}`,
+      step: 4,
+      label: `${i + 1}. ${task.name.trim() || "이름 없는 과업"}`,
+      hint: missing.join(" · "),
+      done: missing.length === 0,
+      required: true,
+      anchor: `task-${task.id}`,
+    });
+  });
+
+  add({
+    id: "skill-count",
+    step: 5,
+    label: `필요 역량 3개 이상 (현재 ${input.skills.length}개)`,
+    hint: input.skills.length < 3 ? "5개 이상을 권장합니다" : "",
+    done: input.skills.length >= 3,
+    required: true,
+    anchor: "field-skills",
+  });
+  input.skills.forEach((skill, i) => {
+    const missing = missingInSkill(skill);
+    add({
+      id: `skill-${skill.id}`,
+      step: 5,
+      label: `${i + 1}. ${skill.name.trim() || "이름 없는 역량"}`,
+      hint: missing.join(" · "),
+      done: missing.length === 0,
+      required: true,
+      anchor: `skill-${skill.id}`,
+    });
+  });
+
+  // 자격요건은 제출을 막지 않는다. 다만 「해당 없음」도 고르지 않은 칸은 비어 있는 것과
+  // 판단이 끝난 것을 구분할 수 없으므로 권장 항목으로 한 줄 남긴다.
+  const req = input.requirements;
+  add({
+    id: "requirements",
+    step: 5,
+    label: "자격요건",
+    hint:
+      req.education === null && req.licenses.length === 0 && req.licensesNa === null
+        ? "학력·자격증 기준을 고르거나 「해당 없음」을 골라 주세요 (권장)"
+        : "",
+    done: req.education !== null || req.licenses.length > 0 || req.licensesNa !== null,
+    required: false,
+    anchor: "field-requirements",
+  });
+
+  add({
+    id: "coverage",
+    step: 6,
+    label: "내 일을 어느 정도 담았는지",
+    hint: input.coverage ? "" : "고르지 않으면 제출할 수 없습니다",
+    done: !!input.coverage,
+    required: true,
+    anchor: "field-coverage",
+  });
+
+  return entries;
+}
+
 export function validateSkills(skills: SkillItem[]): TaskValidation {
   const errors: string[] = [];
 
   if (skills.length < 3) {
-    errors.push("스킬을 3개 이상 작성해야 제출할 수 있습니다(5개 이상 권장)");
+    errors.push("필요 역량을 3개 이상 작성해야 제출할 수 있습니다(5개 이상 권장)");
   }
   skills.forEach((skill, index) => {
-    const name = skill.name.trim() === "" ? `${index + 1}번째 스킬` : `'${skill.name.trim()}'`;
+    const name = skill.name.trim() === "" ? `${index + 1}번째 필요 역량` : `'${skill.name.trim()}'`;
     if (skill.name.trim() === "") {
-      errors.push(`${index + 1}번째 스킬의 이름을 적어 주세요`);
+      errors.push(`${index + 1}번째 필요 역량의 이름을 적어 주세요`);
     }
     if (skill.ksao === null) {
-      errors.push(`${name}의 스킬 구분(지식/기술/태도)을 골라 주세요`);
+      errors.push(`${name}의 구분(지식/기술/태도)을 골라 주세요`);
     }
     if (skill.description.trim() === "") {
       errors.push(`${name}이 어떤 상황에서 쓰이는 능력인지 한 줄 설명을 적어 주세요`);

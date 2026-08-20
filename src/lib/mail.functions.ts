@@ -9,23 +9,28 @@ const filtersSchema = z.object({
   statuses: z.array(z.string()).optional(),
 });
 
-/** 미리보기와 테스트 발송이 함께 쓰는 표본 치환 변수. 초기 비밀번호는 노출하지 않고 마스킹한다. */
+/**
+ * 미리보기와 테스트 발송이 함께 쓰는 표본 치환 변수. 초기 비밀번호는 노출하지 않고 마스킹한다.
+ * `participantId` 를 주면 그 사람으로, 없으면 조건에 맞는 첫 참여자로 치환한다.
+ */
 async function buildSampleVars(
   admin: SupabaseClient<Database>,
   companyId?: string | null,
   origin?: string,
+  participantId?: string | null,
 ) {
   const { appUrl } = await import("@/lib/mailer.server");
   const { buildMailVars } = await import("@/lib/mail-vars");
 
   let query = admin
     .from("participants")
-    .select("name, email, org_text, company_id, companies(name)")
+    .select("id, name, email, org_text, company_id, companies(name)")
     .eq("role", "respondent")
     .not("email", "is", null)
     .order("emp_no")
     .limit(1);
-  if (companyId) query = query.eq("company_id", companyId);
+  if (participantId) query = query.eq("id", participantId);
+  else if (companyId) query = query.eq("company_id", companyId);
   const { data: rows } = await query;
   const sample = rows?.[0] ?? null;
 
@@ -40,6 +45,7 @@ async function buildSampleVars(
   }
 
   return {
+    sampleId: (sample?.id as string | undefined) ?? null,
     sampleName: (sample?.name as string | undefined) ?? null,
     vars: buildMailVars({
       name: sample?.name ?? "홍길동",
@@ -160,6 +166,157 @@ export const previewTemplate = createServerFn({ method: "POST" })
       body,
       html: renderMailHtml(body, vars["접속링크"]),
     };
+  });
+
+export type TemplatePreview = {
+  id: string;
+  name: string;
+  kind: string;
+  updatedAt: string;
+  subject: string;
+  html: string;
+  /** 치환되지 않고 남은 `{항목}` — 하나라도 있으면 발송 전에 고쳐야 한다. */
+  unreplaced: string[];
+};
+
+/**
+ * 등록된 모든 템플릿을 한 사람 기준으로 한꺼번에 렌더한다 (기획 B6).
+ * 발송 전에 실물을 눈으로 확인하고 승인하는 화면이 쓴다. 초기 비밀번호는 마스킹된다.
+ */
+export const previewAllTemplates = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        participantId: z.string().uuid().nullable().optional(),
+        companyId: z.string().uuid().nullable().optional(),
+        origin: z.string().url().optional(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { renderMailHtml } = await import("@/lib/mailer.server");
+    const { findUnreplacedTokens, renderMailText } = await import("@/lib/mail-vars");
+
+    const { sampleId, sampleName, vars } = await buildSampleVars(
+      supabaseAdmin,
+      data.companyId,
+      data.origin,
+      data.participantId,
+    );
+
+    const { data: templates, error } = await supabaseAdmin
+      .from("mail_templates")
+      .select("id, name, kind, subject, body, updated_at")
+      .order("created_at");
+    if (error) throw new Error(error.message);
+
+    // 표본을 바꿀 수 있게 후보 명단도 같이 준다(이메일이 있는 참여자만).
+    let candidateQuery = supabaseAdmin
+      .from("participants")
+      .select("id, name, emp_no, org_text, account_status")
+      .eq("role", "respondent")
+      .not("email", "is", null)
+      .order("emp_no")
+      .limit(50);
+    if (data.companyId) candidateQuery = candidateQuery.eq("company_id", data.companyId);
+    const { data: candidates } = await candidateQuery;
+
+    const previews: TemplatePreview[] = (templates ?? []).map((t) => {
+      const subject = renderMailText(t.subject, vars);
+      const body = renderMailText(t.body, vars);
+      return {
+        id: t.id,
+        name: t.name,
+        kind: t.kind,
+        updatedAt: t.updated_at,
+        subject,
+        html: renderMailHtml(body, vars["접속링크"]),
+        unreplaced: [
+          ...new Set([...findUnreplacedTokens(subject), ...findUnreplacedTokens(body)]),
+        ],
+      };
+    });
+
+    return {
+      sampleId,
+      sampleName,
+      sampleEmail: vars["ID"] ?? "",
+      candidates: candidates ?? [],
+      previews,
+    };
+  });
+
+export type SendTargetRow = {
+  id: string;
+  name: string;
+  emp_no: string;
+  email: string | null;
+  org_text: string | null;
+  org_unit_id: string | null;
+  company_id: string;
+  account_status: string;
+  invited_at: string | null;
+  last_seen_at: string | null;
+  archived_at: string | null;
+};
+
+/**
+ * 발송 대상 후보 전량 + 소속 트리 (기획 B5·B7).
+ *
+ * 회사·계정상태·참여자 지정까지는 `selectTargets` 와 같은 조건으로 좁히고, 소속 하위 필터는
+ * 화면이 트리에서 고른 뒤 걸러 낸다(트리를 그리기 전에는 하위 소속 목록을 알 수 없다).
+ * 이메일이 없어 제외되는 사람도 그대로 담아 보내, 화면이 "왜 제외됐는지" 를 말할 수 있게 한다.
+ */
+export const listSendTargets = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        companyId: z.string().uuid().nullable().optional(),
+        statuses: z.array(z.string()).optional(),
+        participantIds: z.array(z.string().uuid()).optional(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { fetchAll } = await import("@/lib/paginate");
+
+    const rows = await fetchAll<SendTargetRow>((from, to) => {
+      let query = supabaseAdmin
+        .from("participants")
+        .select(
+          "id, name, emp_no, email, org_text, org_unit_id, company_id, account_status, invited_at, last_seen_at, archived_at",
+        )
+        .eq("role", "respondent")
+        .order("emp_no")
+        .range(from, to);
+      if (data.participantIds?.length) query = query.in("id", data.participantIds);
+      if (data.companyId) query = query.eq("company_id", data.companyId);
+      // 화면이 고르는 값은 계정 상태 목록에서만 나온다. 없는 값이 와도 그냥 아무도 안 걸린다.
+      if (data.statuses?.length) {
+        query = query.in(
+          "account_status",
+          data.statuses as Database["public"]["Enums"]["account_status"][],
+        );
+      }
+      return query;
+    });
+
+    let unitQuery = supabaseAdmin
+      .from("org_units")
+      .select("id, company_id, parent_id, name, level, sort");
+    if (data.companyId) unitQuery = unitQuery.eq("company_id", data.companyId);
+    const { data: units, error: unitError } = await unitQuery;
+    if (unitError) throw new Error(unitError.message);
+
+    return { rows, units: units ?? [], asOf: new Date().toISOString() };
   });
 
 /** 로그인한 관리자 본인에게만 1건 발송한다(수신자 지정 불가 — 오발송 방지). */
@@ -386,7 +543,10 @@ export const listLogs = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: logs, error } = await supabaseAdmin
       .from("mail_logs")
-      .select("id, to_name, to_email, subject, status, error_message, sent_at")
+      // participant 의 마지막 접속 시각을 함께 받아 "보낸 뒤 실제로 들어왔는지" 를 화면에서 판단한다.
+      .select(
+        "id, to_name, to_email, subject, status, error_message, sent_at, participant_id, participants(last_seen_at)",
+      )
       .eq("batch_id", data.batchId)
       .order("sent_at", { ascending: false });
     if (error) throw new Error(error.message);

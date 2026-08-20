@@ -27,13 +27,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { ExamplesPanel, TaskGrid, TaskHowTo, uid } from "@/components/survey/TaskGrid";
+import { HowToBox, TaskGrid, TaskHowTo, uid } from "@/components/survey/TaskGrid";
 import { selfCheckMyResponse, type SelfCheckFinding } from "@/lib/ai.functions";
 import { InfoChangeBanner } from "@/components/survey/InfoChangeBanner";
 import { SkillGrid, SkillHowTo } from "@/components/survey/SkillGrid";
 import { RequirementsForm } from "@/components/survey/RequirementsForm";
-import { validateSkills, validateTasks } from "@/components/survey/validation";
+import { ExamplePopover } from "@/components/survey/ExamplePopover";
+import { StepChecklist } from "@/components/survey/StepChecklist";
+import { SubmissionSummary } from "@/components/survey/SubmissionSummary";
+import { buildChecklist, validateSkills, validateTasks } from "@/components/survey/validation";
 import type { RequirementsValue, SkillItem, TaskItem } from "@/components/survey/types";
+import { FieldHint } from "@/components/FieldHint";
+import { SaveStatusChip, type SaveState } from "@/components/SaveStatusChip";
+import { SURVEY_STEP_LABELS, isFocusField } from "@/lib/survey.focus";
 import {
   COVERAGE_OPTIONS,
   EMPTY_REQUIREMENTS,
@@ -60,32 +66,34 @@ import {
   type MyParticipant,
 } from "@/lib/survey.data";
 
-const STEPS = [
-  {
-    label: "기본정보",
-    intro: "관리자가 등록한 귀하의 인사정보를 확인합니다. 잘못된 내용이 있으면 알려 주세요.",
-  },
-  {
-    label: "직무 확인",
-    intro: "귀하가 맡고 있는 직무의 이름을 확인합니다. 이후 모든 답변의 기준이 됩니다.",
-  },
-  {
-    label: "정의·목적",
-    intro: "이 직무가 무엇을 하는 자리이고, 회사에 무엇으로 기여하는지를 한두 문장으로 적습니다.",
-  },
-  {
-    label: "과업 작성",
-    intro: "직무를 이루는 과업과 세부 활동을 적습니다. 조사에서 가장 중요한 단계입니다.",
-  },
-  {
-    label: "스킬·요건",
-    intro: "이 직무를 제대로 하려면 무엇을 알고 할 수 있어야 하는지를 적습니다.",
-  },
-  {
-    label: "마무리",
-    intro: "작성 내용을 되돌아보고 제출합니다. 제출 전 마지막 단계입니다.",
-  },
+/** 단계 이름은 홈 화면과 공유한다(survey.focus.ts). 여기서는 한 줄 설명만 갖는다. */
+const STEP_INTROS = [
+  "관리자가 등록한 귀하의 인사정보를 확인합니다. 잘못된 내용이 있으면 알려 주세요.",
+  "귀하가 맡고 있는 직무의 이름을 확인합니다. 이후 모든 답변의 기준이 됩니다.",
+  "이 직무가 무엇을 하는 자리이고, 회사에 무엇으로 기여하는지를 한두 문장으로 적습니다.",
+  "직무를 이루는 과업과 세부 활동을 적습니다. 조사에서 가장 중요한 단계입니다.",
+  "이 직무를 제대로 하려면 무엇을 알고 할 수 있어야 하는지를 적습니다.",
+  "작성 내용을 되돌아보고 제출합니다. 제출 전 마지막 단계입니다.",
 ];
+
+const STEPS = SURVEY_STEP_LABELS.map((label, i) => ({ label, intro: STEP_INTROS[i] ?? "" }));
+
+/**
+ * 반려·정정 딥링크(`focus=`)가 가리키는 입력칸으로 데려간다 (기획 C8).
+ * 진행 체크리스트의 「미완 항목 클릭」도 같은 길을 쓴다 — 한 곳에서만 관리한다.
+ */
+function focusAnchor(anchor: string) {
+  if (!anchor) return;
+  const el = document.getElementById(anchor);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  // 어디로 왔는지 보이지 않으면 이동한 의미가 없다 — 잠깐 테두리를 준다.
+  el.classList.add("ring-2", "ring-primary", "ring-offset-2", "rounded-lg");
+  window.setTimeout(
+    () => el.classList.remove("ring-2", "ring-primary", "ring-offset-2", "rounded-lg"),
+    2400,
+  );
+}
 
 /** 저장 실패 재시도 간격 — 3회 모두 실패하면 수동 [지금 저장] 버튼을 띄운다. */
 const RETRY_DELAYS = [1000, 3000, 9000];
@@ -93,16 +101,23 @@ const RETRY_DELAYS = [1000, 3000, 9000];
 /** 현재 단계는 URL 이 원천 — 새로고침·뒤로가기가 단계 이동으로 동작한다. */
 export const Route = createFileRoute("/_authenticated/survey")({
   ssr: false,
-  validateSearch: (search: Record<string, unknown>): { step?: number } => {
+  validateSearch: (search: Record<string, unknown>): { step?: number; focus?: string } => {
     const n = Number(search["step"]);
-    return Number.isInteger(n) && n >= 1 && n <= STEPS.length ? { step: n } : {};
+    const f = search["focus"];
+    return {
+      ...(Number.isInteger(n) && n >= 1 && n <= STEPS.length ? { step: n } : {}),
+      ...(typeof f === "string" && isFocusField(f) ? { focus: f } : {}),
+    };
   },
   head: () => ({
     meta: [
       { title: "업무조사 작성 | 서연 그룹 업무조사" },
       { name: "description", content: "담당 직무의 과업과 필요 역량을 단계별로 작성합니다." },
       { property: "og:title", content: "업무조사 작성 | 서연 그룹 업무조사" },
-      { property: "og:description", content: "담당 직무의 과업과 필요 역량을 단계별로 작성합니다." },
+      {
+        property: "og:description",
+        content: "담당 직무의 과업과 필요 역량을 단계별로 작성합니다.",
+      },
     ],
   }),
   component: SurveyPage,
@@ -359,9 +374,7 @@ function InfoRequestPanel({
                       value={picked[f.key] ?? ""}
                       aria-label={`${f.label} 올바른 값`}
                       placeholder="올바른 값"
-                      onChange={(e) =>
-                        setPicked((prev) => ({ ...prev, [f.key]: e.target.value }))
-                      }
+                      onChange={(e) => setPicked((prev) => ({ ...prev, [f.key]: e.target.value }))}
                     />
                   ) : null}
                 </div>
@@ -422,7 +435,9 @@ function DutyImportPanel({
   const apply = () => {
     onAppend(candidates.filter((_, i) => picked.has(i)));
     setOpen(false);
-    toast.success(`업무분장 ${picked.size}건을 과업으로 추가했습니다. 내용은 자유롭게 고쳐 주세요.`);
+    toast.success(
+      `업무분장 ${picked.size}건을 과업으로 추가했습니다. 내용은 자유롭게 고쳐 주세요.`,
+    );
   };
 
   return (
@@ -535,6 +550,8 @@ function SurveyPage() {
   const [req, setReq] = useState<RequirementsValue>(EMPTY_REQUIREMENTS);
   const [saveState, setSaveState] = useState<"unsaved" | "saving" | "saved">("saved");
   const [saveFails, setSaveFails] = useState(0);
+  /** 마지막으로 저장이 끝난 시각 — 저장됐다는 말만으로는 언제 저장됐는지 알 수 없다 (기획 P8). */
+  const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [gateTried, setGateTried] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [conflictOpen, setConflictOpen] = useState(false);
@@ -619,12 +636,23 @@ function SurveyPage() {
   }, [data]);
 
   // URL 정규화 — step 이 없으면 이어서 할 단계로, 상한을 넘으면 상한으로 되돌린다.
+  // search 를 통째로 갈아끼우면 딥링크로 실려 온 focus 가 도착 직후 사라진다.
   useEffect(() => {
     if (!data) return;
     if (search.step !== step) {
-      void navigate({ to: "/survey", search: { step }, replace: true });
+      void navigate({ to: "/survey", search: (prev) => ({ ...prev, step }), replace: true });
     }
   }, [data, search.step, step, navigate]);
+
+  // 딥링크로 들어온 항목으로 데려간다. 목록이 그려진 뒤여야 하므로 데이터 주입 후에 돈다.
+  const focusedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const target = search.focus;
+    if (!data || !target || focusedRef.current === target) return;
+    focusedRef.current = target;
+    const timer = setTimeout(() => focusAnchor(`field-${target}`), 150);
+    return () => clearTimeout(timer);
+  }, [data, search.focus]);
 
   async function persist(target: number) {
     if (!responseId) return;
@@ -676,6 +704,7 @@ function SurveyPage() {
       failsRef.current = 0;
       setSaveFails(0);
       setSaveState("saved");
+      setSavedAt(new Date());
     } catch (err) {
       setSaveState("unsaved");
       // 충돌은 재시도해도 계속 실패한다 — 사용자에게 최신 내용을 불러올지 묻는다.
@@ -804,6 +833,26 @@ function SurveyPage() {
 
   const activeCheck = checkStep(step);
 
+  // 진행 체크리스트 (기획 C3). 게이트와 같은 조건을 쓰되 항목마다 갈 자리를 달고 있다.
+  const checklist = useMemo(
+    () =>
+      buildChecklist({
+        jobGroup: form.jobGroup,
+        jobSeries: form.jobSeries,
+        jobName: form.jobName,
+        definition: form.definition,
+        mission: form.mission,
+        tasks,
+        skills,
+        coverage: form.coverage,
+        requirements: req,
+      }),
+    [form, tasks, skills, req],
+  );
+  const missingItems = checklist
+    .filter((i) => i.required && !i.done)
+    .map((i) => ({ id: i.id, label: i.hint ? `${i.label} — ${i.hint}` : i.label, step: i.step }));
+
   /** target 단계로 가기 전에 통과해야 할 선행 단계 중 처음 실패하는 단계 번호 */
   function firstBlockingStep(target: number): number | null {
     for (let n = 1; n < target; n += 1) {
@@ -853,6 +902,16 @@ function SurveyPage() {
     unlockedRef.current = Math.max(unlockedRef.current, next);
     await navigate({ to: "/survey", search: { step: next } });
     window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  /**
+   * 체크리스트 항목 → 그 입력칸. 다른 단계면 먼저 옮기고, 화면이 그려진 뒤 스크롤한다.
+   * 앞 단계를 건너뛰려 하면 goTo 가 막고 어디를 채워야 하는지 알려 준다(막다른 골목 없음).
+   */
+  async function jumpTo(target: number, anchor: string) {
+    if (target !== step) await goTo(target);
+    // 단계가 바뀌면 그 화면이 그려진 뒤에야 대상 요소가 생긴다. 없으면 focusAnchor 가 그냥 넘어간다.
+    setTimeout(() => focusAnchor(anchor), 120);
   }
 
   /** V15-2: 화면의 마지막 입력까지 저장한 뒤 본인 응답을 AI 로 점검한다(선택 사항). */
@@ -963,48 +1022,41 @@ function SurveyPage() {
   const { participant, examples, reject, suggestions } = data;
   const stepMeta = STEPS[step - 1] as (typeof STEPS)[number];
   const improveNotes = tasks.filter((t) => t.improveType || t.improveNote.trim());
+  const activityCount = tasks.reduce((sum, t) => sum + t.activities.length, 0);
+
+  const chipState: SaveState =
+    saveFails > 0
+      ? "failed"
+      : saveState === "saving"
+        ? "saving"
+        : saveState === "saved" && savedAt
+          ? "saved"
+          : "idle";
 
   return (
     <div className="min-h-screen bg-secondary">
       <header className="sticky top-0 z-20 border-b bg-card">
-        <div className="mx-auto max-w-5xl space-y-3 px-4 py-3 sm:px-6">
+        <div className="mx-auto max-w-5xl space-y-3 px-4 py-3 sm:px-6 lg:max-w-7xl">
           <div className="flex items-center justify-between gap-3">
             <h1 className="text-sm font-bold sm:text-base">업무조사 작성</h1>
-            <div className="flex items-center gap-2">
-              {readOnly ? (
-                <span className="text-xs text-muted-foreground">제출 완료 (읽기 전용)</span>
-              ) : (
-                <span
-                  aria-live="polite"
-                  className={`rounded-full px-2 py-1 text-xs font-medium ${
-                    saveFails > 0
-                      ? "bg-warning/15 text-warning"
-                      : "bg-secondary text-muted-foreground"
-                  }`}
-                >
-                  {saveState === "saving"
-                    ? "저장 중…"
-                    : saveFails >= RETRY_DELAYS.length
-                      ? "저장 안 됨"
-                      : saveFails > 0
-                        ? "저장 안 됨 — 재시도 중"
-                        : saveState === "saved"
-                          ? "저장됨 ✓"
-                          : "저장 대기"}
-                </span>
-              )}
-              {!readOnly && saveFails >= RETRY_DELAYS.length ? (
-                <Button size="sm" onClick={() => void manualSave()}>
-                  지금 저장
-                </Button>
-              ) : null}
-            </div>
+            {readOnly ? (
+              <span className="text-xs text-muted-foreground">제출 완료 (읽기 전용)</span>
+            ) : (
+              // 저장 상태·재시도 횟수·수동 저장이 늘 같은 자리에 있다 (기획 C6).
+              <SaveStatusChip
+                state={chipState}
+                savedAt={savedAt}
+                retryCount={saveFails}
+                onSaveNow={() => void manualSave()}
+              />
+            )}
           </div>
           <StepBar step={step} onSelect={(n) => void goTo(n)} />
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl px-4 py-6 sm:px-6">
+      {/* 넓은 화면에서는 입력이 좁아지지 않도록 폭을 늘려 오른쪽에 점검 패널을 세운다 (기획 C1·C3). */}
+      <main className="mx-auto max-w-5xl px-4 py-6 pb-24 sm:px-6 lg:grid lg:max-w-7xl lg:grid-cols-[minmax(0,1fr)_19rem] lg:gap-6 lg:pb-6">
         <div className="space-y-5">
           {status === "rejected" && reject ? (
             <RejectBanner
@@ -1023,19 +1075,34 @@ function SurveyPage() {
             <div className="mt-6">
               {step === 1 ? (
                 <div className="space-y-4">
+                  <HowToBox
+                    sectionId="step1"
+                    title="이 단계에서 할 일"
+                    steps={[
+                      "관리자가 등록한 인사정보가 맞는지 훑어봅니다.",
+                      "틀린 내용이 있으면 [정정 요청]으로 알려 주세요. 이 화면에서는 직접 고칠 수 없습니다.",
+                      "요청을 보낸 뒤에도 작성은 계속할 수 있습니다.",
+                    ]}
+                  />
                   <InfoChangeBanner />
                   <InfoRequestPanel participant={participant} showPending />
                   <dl className="grid gap-3 sm:grid-cols-2">
-                    {[
-                      ["성명", participant.name],
-                      ["사번", participant.emp_no],
-                      ["이메일", participant.email],
-                      ["회사", participant.company_name],
-                      ["소속", participant.org_text],
-                      ["직급", participant.grade],
-                      ["역할단계", participant.role_level],
-                    ].map(([label, value]) => (
-                      <div key={label} className="rounded-lg border bg-background p-3">
+                    {(
+                      [
+                        ["name", "성명", participant.name],
+                        ["emp_no", "사번", participant.emp_no],
+                        ["email", "이메일", participant.email],
+                        ["company", "회사", participant.company_name],
+                        ["org_text", "소속", participant.org_text],
+                        ["grade", "직급", participant.grade],
+                        ["role_level", "역할단계", participant.role_level],
+                      ] as const
+                    ).map(([key, label, value]) => (
+                      <div
+                        key={key}
+                        id={`field-${key}`}
+                        className="rounded-lg border bg-background p-3 scroll-mt-28"
+                      >
                         <dt className="text-xs text-muted-foreground">{label}</dt>
                         <dd className="mt-1 text-sm font-medium">{value || "미등록"}</dd>
                       </div>
@@ -1046,10 +1113,25 @@ function SurveyPage() {
 
               {step === 2 ? (
                 <div className="space-y-4">
-                  <p className="rounded-lg bg-secondary p-3 text-sm text-muted-foreground">
-                    직군 = 가장 큰 분류 (예: 사무관리) · 직렬 = 중간 분류 (예: 인사) · 직무 = 실제
-                    담당 업무 단위 (예: 인사기획)
-                  </p>
+                  <HowToBox
+                    sectionId="step2"
+                    title="이 단계에서 할 일"
+                    steps={[
+                      "직군 → 직렬 → 직무 순으로 본인이 맡은 자리의 이름을 적습니다.",
+                      "입력칸을 누르면 같은 계열사에서 이미 쓰는 이름이 후보로 뜹니다. 맞는 것이 있으면 고르세요.",
+                      "여기 적은 직군에 맞춰 이후 단계의 작성 예시가 바뀝니다.",
+                    ]}
+                    sections={[
+                      {
+                        title: "세 가지 분류",
+                        rows: [
+                          ["직군", "가장 큰 분류입니다. 예: 사무관리, 생산, 연구개발"],
+                          ["직렬", "직군 안의 중간 분류입니다. 예: 사무관리 안의 인사, 총무"],
+                          ["직무", "실제로 담당하는 업무 단위입니다. 예: 인사기획, 급여운영"],
+                        ],
+                      },
+                    ]}
+                  />
                   <div className="rounded-lg border bg-background p-3">
                     <p className="text-xs text-muted-foreground">회사</p>
                     <p className="mt-1 text-sm font-medium">
@@ -1073,13 +1155,17 @@ function SurveyPage() {
                   </datalist>
                   {(
                     [
-                      ["jobGroup", "직군", "예: 사무관리", "job-group-options"],
-                      ["jobSeries", "직렬", "예: 인사", "job-series-options"],
-                      ["jobName", "직무", "예: 인사기획", "job-name-options"],
+                      ["jobGroup", "job_group", "직군", "예: 사무관리", "job-group-options"],
+                      ["jobSeries", "job_series", "직렬", "예: 인사", "job-series-options"],
+                      ["jobName", "job_name", "직무", "예: 인사기획", "job-name-options"],
                     ] as const
-                  ).map(([key, label, placeholder, listId]) => (
-                    <div key={key} className="space-y-2">
-                      <Label htmlFor={key}>{label}</Label>
+                  ).map(([key, anchor, label, placeholder, listId]) => (
+                    <div key={key} id={`field-${anchor}`} className="space-y-2 scroll-mt-28">
+                      {/* 정의 아이콘은 label 밖에 둔다 — label 안의 버튼은 눌러도 입력칸이 잡힌다. */}
+                      <div className="flex items-center gap-1.5">
+                        <Label htmlFor={key}>{label}</Label>
+                        <FieldHint term={label} />
+                      </div>
                       <Input
                         id={key}
                         list={listId}
@@ -1100,18 +1186,42 @@ function SurveyPage() {
 
               {step === 3 ? (
                 <div className="space-y-6">
-                  <ExamplesPanel
-                    examples={examples.filter(
-                      (e) => e.field === "definition" || e.field === "mission",
-                    )}
-                    jobGroup={form.jobGroup}
-                    title="정의·목적 작성 예시"
+                  <HowToBox
+                    sectionId="step3"
+                    title="이 단계에서 할 일"
+                    steps={[
+                      "직무 정의 — 「무엇을 대상으로 → 어떤 활동을 하여 → 어떤 상태를 만드는가」를 두세 문장으로 적습니다.",
+                      "직무 목적 — 이 직무가 회사에 남기는 최종 성과를 한두 문장으로 적습니다.",
+                      "막히면 각 칸 옆 [예시 보기]에서 잘 쓴 문장과 아쉬운 문장을 비교해 보세요.",
+                    ]}
+                    sections={[
+                      {
+                        title: "자주 하는 실수",
+                        rows: [
+                          [
+                            "내 이야기로 쓰기",
+                            "「저는 ~을 합니다」가 아니라 직무를 주어로 씁니다.",
+                          ],
+                          [
+                            "부서명으로 쓰기",
+                            "「인사 업무 담당」처럼 쓰면 무엇을 하는 자리인지 남지 않습니다.",
+                          ],
+                        ],
+                      },
+                    ]}
                   />
-                  <div className="space-y-2">
-                    <Label htmlFor="definition">직무 정의</Label>
+                  <div id="field-definition" className="space-y-2 scroll-mt-28">
+                    <div className="flex flex-wrap items-center gap-x-2">
+                      <Label htmlFor="definition">직무 정의</Label>
+                      <ExamplePopover
+                        examples={examples}
+                        jobGroup={form.jobGroup}
+                        fields={["definition"]}
+                      />
+                    </div>
                     <p className="text-xs text-muted-foreground">
-                      「무엇을 대상으로 → 어떤 활동을 하여 → 어떤 상태를 만드는가」가 드러나도록 2~3줄로
-                      적어 주세요. 본인 이야기가 아니라 직무 이야기로 적습니다.
+                      「무엇을 대상으로 → 어떤 활동을 하여 → 어떤 상태를 만드는가」가 드러나도록
+                      2~3줄로 적어 주세요. 본인 이야기가 아니라 직무 이야기로 적습니다.
                     </p>
                     <Textarea
                       id="definition"
@@ -1122,8 +1232,15 @@ function SurveyPage() {
                       placeholder="예: 회사의 인적자원을 확보·육성·평가·보상하는 제도를 설계하고 운영하여 조직의 인력 경쟁력을 유지하는 직무"
                     />
                   </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="mission">직무 목적 (미션)</Label>
+                  <div id="field-mission" className="space-y-2 scroll-mt-28">
+                    <div className="flex flex-wrap items-center gap-x-2">
+                      <Label htmlFor="mission">직무 목적</Label>
+                      <ExamplePopover
+                        examples={examples}
+                        jobGroup={form.jobGroup}
+                        fields={["mission"]}
+                      />
+                    </div>
                     <p className="text-xs text-muted-foreground">
                       이 직무가 회사에 남기는 최종 성과를 1~2줄로 적어 주세요.
                     </p>
@@ -1164,15 +1281,11 @@ function SurveyPage() {
                       }
                     />
                   ) : null}
-                  <ExamplesPanel
-                    examples={examples.filter((e) => e.field === "task" || e.field === "activity")}
-                    jobGroup={form.jobGroup}
-                    title="과업 작성 예시"
-                  />
                   <TaskGrid
                     value={tasks}
                     onChange={setTasks}
                     examples={examples.filter((e) => e.field === "task" || e.field === "activity")}
+                    jobGroup={form.jobGroup}
                     disabled={readOnly}
                     confirmRemove={(task) => {
                       const linked = skills.filter((s) => s.relatedTaskIds.includes(task.id));
@@ -1180,7 +1293,7 @@ function SurveyPage() {
                       const names = linked.map((s) => s.name.trim() || "이름 미입력").join(", ");
                       if (
                         !window.confirm(
-                          `이 과업에 연결된 스킬이 ${linked.length}개 있습니다 (${names}).\n삭제하면 연결도 함께 사라집니다. 계속할까요?`,
+                          `이 과업에 연결된 필요 역량이 ${linked.length}개 있습니다 (${names}).\n삭제하면 연결도 함께 사라집니다. 계속할까요?`,
                         )
                       ) {
                         return false;
@@ -1205,7 +1318,7 @@ function SurveyPage() {
                 <Tabs defaultValue="skills">
                   <TabsList className="w-full">
                     <TabsTrigger value="skills" className="flex-1">
-                      스킬
+                      필요 역량
                     </TabsTrigger>
                     <TabsTrigger value="requirements" className="flex-1">
                       자격요건
@@ -1213,16 +1326,12 @@ function SurveyPage() {
                   </TabsList>
                   <TabsContent value="skills" className="mt-4 space-y-5">
                     <SkillHowTo skillCount={skills.length} />
-                    <ExamplesPanel
-                      examples={examples.filter((e) => e.field === "skill")}
-                      jobGroup={form.jobGroup}
-                      title="스킬 작성 예시"
-                    />
                     <SkillGrid
                       value={skills}
                       onChange={setSkills}
                       tasks={tasks.map((t) => ({ id: t.id, name: t.name }))}
                       examples={examples.filter((e) => e.field === "skill")}
+                      jobGroup={form.jobGroup}
                       disabled={readOnly}
                     />
                   </TabsContent>
@@ -1234,6 +1343,18 @@ function SurveyPage() {
 
               {step === 6 ? (
                 <div className="space-y-6">
+                  {/* 제출 전 영수증 — 무엇을 냈는지 한 장으로 보고 누르면 그 단계로 돌아간다 (기획 C7). */}
+                  <SubmissionSummary
+                    job={{ group: form.jobGroup, series: form.jobSeries, name: form.jobName }}
+                    definition={form.definition}
+                    mission={form.mission}
+                    taskCount={tasks.length}
+                    activityCount={activityCount}
+                    skillCount={skills.length}
+                    missing={missingItems}
+                    onGoToStep={(n) => void goTo(n)}
+                  />
+
                   <div className="space-y-2">
                     <p className="text-sm font-semibold">작성하신 업무 개선의견</p>
                     {improveNotes.length ? (
@@ -1256,7 +1377,7 @@ function SurveyPage() {
                     )}
                   </div>
 
-                  <div className="space-y-2">
+                  <div id="field-pain_note" className="space-y-2 scroll-mt-28">
                     <Label htmlFor="pain">업무 수행 중 애로사항 (선택)</Label>
                     <p className="text-xs text-muted-foreground">
                       제도·시스템·협업 등 업무를 어렵게 만드는 요인이 있다면 자유롭게 적어 주세요.
@@ -1270,7 +1391,7 @@ function SurveyPage() {
                     />
                   </div>
 
-                  <div className="space-y-3">
+                  <div id="field-coverage" className="space-y-3 scroll-mt-28">
                     <Label>이 조사가 귀하의 실제 직무를 어느 정도 반영합니까?</Label>
                     <RadioGroup
                       value={form.coverage ?? ""}
@@ -1291,8 +1412,10 @@ function SurveyPage() {
                     </RadioGroup>
                   </div>
 
-                  <div className="space-y-2">
-                    <Label htmlFor="missed">이 조사에서 담지 못한 직무의 측면이 있다면 (선택)</Label>
+                  <div id="field-missed_note" className="space-y-2 scroll-mt-28">
+                    <Label htmlFor="missed">
+                      이 조사에서 담지 못한 직무의 측면이 있다면 (선택)
+                    </Label>
                     <Textarea
                       id="missed"
                       rows={3}
@@ -1382,6 +1505,26 @@ function SurveyPage() {
             </p>
           ) : null}
         </div>
+
+        <StepChecklist
+          steps={STEPS.map((s, i) => ({ n: i + 1, label: s.label }))}
+          items={checklist}
+          currentStep={step}
+          onJump={(target, anchor) => void jumpTo(target, anchor)}
+          submit={
+            readOnly
+              ? null
+              : {
+                  disabled: sending,
+                  onClick: () => {
+                    // 마지막 단계가 아니면 먼저 그리로 데려간다 — 제출 조건을 눈으로 보고 누르게.
+                    if (step !== STEPS.length) void goTo(STEPS.length);
+                    else if (!form.coverage) void jumpTo(STEPS.length, "field-coverage");
+                    else setConfirmOpen(true);
+                  },
+                }
+          }
+        />
       </main>
 
       <Dialog open={conflictOpen} onOpenChange={setConflictOpen}>

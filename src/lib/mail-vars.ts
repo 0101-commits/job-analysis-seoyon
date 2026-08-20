@@ -10,6 +10,13 @@ export const MAIL_VARIABLES = [
 
 export type MailVars = Record<string, string>;
 
+/** 템플릿 종류의 화면 표기 — 템플릿·미리보기·발송·이력이 같은 말을 쓴다(용어집 TERMS.reminder). */
+export const MAIL_KIND_LABELS: Record<string, string> = {
+  invite: "초대",
+  reminder: "독려 안내",
+  custom: "일반",
+};
+
 /** 메일 본문 이미지 저장소(공개 읽기 버킷). */
 export const MAIL_ASSET_BUCKET = "mail-assets";
 
@@ -33,6 +40,16 @@ export function replaceImageTokens(text: string, render: (path: string, width: n
   return text.replace(IMAGE_TOKEN, (_match, path: string, width: string) =>
     render(path.trim(), clampImageWidth(Number(width))),
   );
+}
+
+/**
+ * 치환되지 않고 남은 `{항목}` 을 찾는다 (기획 B6).
+ * 오타나 없는 항목명은 발송된 메일에 `{담당자}` 처럼 그대로 나가므로 발송 전에 잡아야 한다.
+ * 이미지 토큰은 발송 시 그림으로 바뀌는 정상 토큰이라 먼저 지운다.
+ */
+export function findUnreplacedTokens(text: string) {
+  const stripped = replaceImageTokens(text, () => "");
+  return [...new Set(stripped.match(/\{[^{}\n]{1,30}\}/g) ?? [])];
 }
 
 export function renderMailText(text: string, vars: MailVars) {

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -8,13 +8,19 @@ import {
   CheckCircle2,
   Copy,
   Download,
+  Eye,
+  EyeOff,
   FileSearch,
   KeyRound,
   Link2,
   Loader2,
+  Mail,
+  MoreHorizontal,
   Pencil,
   Plus,
+  Rows3,
   Search,
+  TableProperties,
   Trash2,
   Upload,
   UserPlus,
@@ -34,6 +40,21 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -41,8 +62,16 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { StatusBadge } from "@/components/StatusBadge";
+import { EmptyState } from "@/components/EmptyState";
+import {
+  OrgTreeFilter,
+  orgPathLabel,
+  orgSubtreeIds,
+  useOrgLens,
+} from "@/components/admin/OrgTreeFilter";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { similarity } from "@/components/survey/validation";
+import { usePersistedState, useDensity } from "@/hooks/use-persisted-ui";
 import { ACCOUNT_STATUS_LABELS } from "@/lib/auth";
 import {
   ROSTER_COLUMNS,
@@ -67,7 +96,70 @@ import {
 import { getAllowedEmailDomains } from "@/lib/settings.functions";
 import { fetchAll } from "@/lib/paginate";
 
+/**
+ * 이 화면이 URL 로 주고받는 규약 (기획 D4).
+ *
+ * 받는다 — 대시보드·전역 검색이 보낸다
+ *   ?p=<참여자id>    그 사람의 상세 패널을 열고 목록에서 그 행을 강조한다
+ *   ?status=<상태>   그 상태만 남긴다 (계정 상태 7종)
+ *   ?org=<소속id>    그 소속과 하위 소속만 남긴다
+ *   ?q=<검색어> ?tag=<태그> ?archived=1 ?tab=list|upload
+ *
+ * 보낸다
+ *   /admin/review?response=<응답id>                      그 응답 단건으로 직행
+ *   /admin/mail?ids=<id,id,...>   선택한 인원에게 독려 (최대 200명)
+ *   /admin/mail?org=<소속id>      선택한 소속 전체에게 독려 (인원 선택이 없을 때)
+ *   두 독려 링크 모두 지금 걸린 상태 필터를 &status=<상태> 로 함께 넘긴다.
+ */
+type ParticipantsSearch = {
+  tab?: "list" | "upload";
+  p?: string;
+  status?: string;
+  org?: string;
+  q?: string;
+  tag?: string;
+  archived?: boolean;
+};
+
+/** 값을 지울 때 undefined 를 명시적으로 넘길 수 있어야 한다(exactOptionalPropertyTypes). */
+type SearchPatch = { [K in keyof ParticipantsSearch]?: ParticipantsSearch[K] | undefined };
+
+/** 빈 값·false 는 URL 에서 아예 뺀다 — 주소가 짧아야 공유가 쉽다. */
+function patchSearch(prev: ParticipantsSearch, next: SearchPatch): ParticipantsSearch {
+  const out: ParticipantsSearch = { ...prev };
+  for (const [key, value] of Object.entries(next)) {
+    if (value === undefined || value === "" || value === false) {
+      delete out[key as keyof ParticipantsSearch];
+    } else {
+      (out as Record<string, unknown>)[key] = value;
+    }
+  }
+  return out;
+}
+
 export const Route = createFileRoute("/_authenticated/admin/participants")({
+  validateSearch: (search: Record<string, unknown>): ParticipantsSearch => {
+    const text = (key: string) => {
+      const raw = search[key];
+      return typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : null;
+    };
+    const out: ParticipantsSearch = {};
+    if (search["tab"] === "upload" || search["tab"] === "list") out.tab = search["tab"];
+    const p = text("p");
+    if (p) out.p = p;
+    // 모르는 상태 값이 오면 무시한다 — 조건에 맞는 사람이 0명인 빈 화면을 만들지 않기 위해.
+    const status = text("status");
+    if (status && (ACCOUNT_STATUS_LABELS as readonly string[]).includes(status)) out.status = status;
+    const org = text("org");
+    if (org) out.org = org;
+    const q = text("q");
+    if (q) out.q = q;
+    const tag = text("tag");
+    if (tag) out.tag = tag;
+    const archived = search["archived"];
+    if (archived === true || archived === "1" || archived === "true") out.archived = true;
+    return out;
+  },
   head: () => ({
     meta: [
       { title: "참여자 관리 | 서연 그룹 업무조사" },
@@ -193,6 +285,35 @@ function reclassify(rows: RosterRow[], index: ExistingIndex): Classified[] {
   });
 }
 
+/**
+ * 실패 사유별 조치 안내 (기획 P8).
+ * 사유 문구에 값이 붙는 경우가 있어 접두어로 찾는다. 사유만 보여 주면 무엇을 고쳐야 하는지
+ * 화면에 없으므로, 사유 한 줄마다 조치 한 줄을 붙인다.
+ */
+const ERROR_FIXES: { match: string; fix: string }[] = [
+  { match: "회사 누락", fix: "회사 열을 연결하고, 빈 칸에 계열사 이름을 채우세요." },
+  { match: "등록되지 않은 계열사", fix: "기준정보 화면에 등록된 계열사 이름과 똑같이 적으세요." },
+  { match: "성명 누락", fix: "성명 열을 연결하고 빈 칸을 채우세요." },
+  { match: "사번 누락", fix: "사번 열을 연결하고 빈 칸을 채우세요." },
+  { match: "이메일 누락", fix: "계정 발급에 필요합니다. 이메일 열을 연결하고 빈 칸을 채우세요." },
+  { match: "이메일 형식 오류", fix: "@ 앞뒤를 확인하세요. 공백·한글이 섞이면 실패합니다." },
+  {
+    match: "허용되지 않은 이메일 도메인",
+    fix: "설정 화면의 허용 도메인에 추가하거나 회사 메일 주소로 바꾸세요.",
+  },
+  { match: "생년월일 형식 오류", fix: "YYMMDD 6자리로 적으세요. 예: 850312" },
+  { match: "파일 내 사번 중복", fix: "같은 사번이 두 번 있습니다. 한 행만 남기세요." },
+  { match: "파일 내 이메일 중복", fix: "같은 이메일이 두 번 있습니다. 한 행만 남기세요." },
+  {
+    match: "이미 등록된 이메일",
+    fix: "다른 사람이 쓰는 이메일입니다. 사번과 이메일 짝을 다시 확인하세요.",
+  },
+];
+
+function fixHint(error: string) {
+  return ERROR_FIXES.find((e) => error.startsWith(e.match))?.fix ?? "";
+}
+
 function RosterUploadTab() {
   const queryClient = useQueryClient();
   const [fileName, setFileName] = useState("");
@@ -297,7 +418,7 @@ function RosterUploadTab() {
     setValidated(result);
     const bad = result.filter((r) => r.errors.length > 0).length;
     if (bad === 0) toast.success(`검증 통과 — ${result.length}건 모두 반영 가능합니다.`);
-    else toast.error(`${bad}건에 오류가 있습니다.`);
+    else toast.error(`${bad}건에 오류가 있습니다. 아래 목록의 조치대로 고친 뒤 다시 올리세요.`);
   }
 
   return (
@@ -337,7 +458,15 @@ function RosterUploadTab() {
         직급·역할단계만 덮어쓰고, 계정·상태·초기 비밀번호는 그대로 둡니다.
       </p>
 
-      {rows.length > 0 && (
+      {rows.length === 0 ? (
+        <EmptyState
+          kind="nothing"
+          title="올릴 명부 파일을 고르세요"
+          description="엑셀(.xlsx) 또는 CSV 파일을 올리면 열을 자동으로 맞추고, 반영 전에 오류를 먼저 보여 줍니다. 처음이라면 템플릿을 받아 그 형식대로 채우는 편이 빠릅니다."
+          actionLabel="템플릿 내려받기"
+          onAction={() => downloadCsv("참여자_명부_템플릿.csv", rosterTemplateCsv())}
+        />
+      ) : (
         <>
           <div className="rounded-xl border bg-card p-4">
             <p className="text-sm font-medium">항목 맞추기</p>
@@ -381,13 +510,13 @@ function RosterUploadTab() {
             </div>
             {missing.length > 0 && (
               <p className="mt-3 text-xs text-destructive">
-                필수 항목 미지정: {missing.join(", ")}
+                필수 항목 미지정: {missing.join(", ")} — 이 항목을 연결해야 검증할 수 있습니다.
               </p>
             )}
           </div>
 
           {validated && (
-            <div className="space-y-2 rounded-xl border bg-card p-4">
+            <div className="space-y-3 rounded-xl border bg-card p-4">
               <p className="flex items-start gap-2 text-sm">
                 {errorRows.length === 0 ? (
                   <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-primary" />
@@ -406,19 +535,50 @@ function RosterUploadTab() {
               </p>
               {errorRows.length > 0 && (
                 <>
-                  <ul className="max-h-56 space-y-1 overflow-y-auto text-xs">
-                    {errorRows.slice(0, 50).map((r) => (
-                      <li key={r.rowNo}>
-                        <span className="font-medium">{r.rowNo}행</span> {r.parsed.name || "-"} ·{" "}
-                        {r.errors.join(", ")}
-                      </li>
-                    ))}
-                  </ul>
-                  {errorRows.length > 50 && (
+                  <div className="max-h-72 overflow-y-auto rounded-lg border">
+                    <table className="w-full text-xs">
+                      <thead className="sticky top-0 bg-secondary text-left text-muted-foreground">
+                        <tr>
+                          <th className="w-14 border-b px-3 py-2 font-medium">행</th>
+                          <th className="w-28 border-b px-3 py-2 font-medium">성명</th>
+                          <th className="border-b px-3 py-2 font-medium">왜 실패했는지</th>
+                          <th className="border-b px-3 py-2 font-medium">무엇을 고치면 되는지</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {errorRows.slice(0, 100).map((r) => (
+                          <tr key={r.rowNo} className="border-t align-top">
+                            <td className="px-3 py-2 font-medium tabular-nums">{r.rowNo}</td>
+                            <td className="px-3 py-2">{r.parsed.name || "-"}</td>
+                            <td className="px-3 py-2 text-destructive">
+                              <ul className="space-y-0.5">
+                                {r.errors.map((e) => (
+                                  <li key={e}>{e}</li>
+                                ))}
+                              </ul>
+                            </td>
+                            <td className="px-3 py-2 text-muted-foreground">
+                              <ul className="space-y-0.5">
+                                {r.errors.map((e) => (
+                                  <li key={e}>{fixHint(e) || "해당 값을 확인해 주세요."}</li>
+                                ))}
+                              </ul>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {errorRows.length > 100 && (
                     <p className="text-xs text-muted-foreground">
-                      외 {errorRows.length - 50}건 더 있습니다.
+                      외 {errorRows.length - 100}건 더 있습니다. 같은 사유가 반복되는지 먼저
+                      확인하세요.
                     </p>
                   )}
+                  <p className="text-xs text-muted-foreground">
+                    오류 행은 반영되지 않습니다. 정상 {validRows.length}건만 먼저 반영하고, 고친
+                    파일을 다시 올려도 됩니다(같은 사번은 갱신됩니다).
+                  </p>
                 </>
               )}
             </div>
@@ -473,12 +633,12 @@ type Participant = {
 const PARTICIPANT_COLUMNS =
   "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, org_unit_id, role, account_status, user_id, tags, archived_at, initial_password, must_change_password, companies(name)";
 
+type OrgUnitRow = { id: string; parent_id: string | null; name: string; sort: number };
+
 /** 조직 트리를 들여쓰기 라벨의 평탄 목록으로. 부모가 조회 범위 밖이면 루트로 취급한다. */
-function flattenOrgUnits(
-  units: { id: string; parent_id: string | null; name: string; sort: number }[],
-): { id: string; label: string }[] {
+function flattenOrgUnits(units: OrgUnitRow[]): { id: string; label: string }[] {
   const idSet = new Set(units.map((u) => u.id));
-  const children = new Map<string, typeof units>();
+  const children = new Map<string, OrgUnitRow[]>();
   for (const u of units) {
     const key = u.parent_id && idSet.has(u.parent_id) ? u.parent_id : "__root__";
     const list = children.get(key);
@@ -491,7 +651,7 @@ function flattenOrgUnits(
       (a, b) => a.sort - b.sort || a.name.localeCompare(b.name),
     );
     for (const u of list) {
-      out.push({ id: u.id, label: `${"  ".repeat(depth)}${depth > 0 ? "└ " : ""}${u.name}` });
+      out.push({ id: u.id, label: `${"  ".repeat(depth)}${depth > 0 ? "└ " : ""}${u.name}` });
       walk(u.id, depth + 1);
     }
   };
@@ -511,7 +671,7 @@ function useOrgUnitOptions(companyId: string) {
         .eq("company_id", companyId)
         .order("sort");
       if (error) throw error;
-      return data ?? [];
+      return (data ?? []) as OrgUnitRow[];
     },
   });
   return useMemo(() => flattenOrgUnits(data ?? []), [data]);
@@ -682,7 +842,7 @@ function ParticipantFormDialog({
             />
           </div>
           <div className="space-y-1.5 sm:col-span-2">
-            <Label htmlFor="p-org-unit">조직 (조직도 연결)</Label>
+            <Label htmlFor="p-org-unit">소속 (조직도 연결)</Label>
             <Select
               value={form.org_unit_id || "__none__"}
               onValueChange={(v) => set("org_unit_id", v === "__none__" ? "" : v)}
@@ -701,7 +861,7 @@ function ParticipantFormDialog({
             </Select>
             {orgOptions.length === 0 && (
               <p className="text-xs text-muted-foreground">
-                이 계열사에 등록된 조직도가 없습니다. 마스터 관리에서 조직도를 먼저 올리세요.
+                이 계열사에 등록된 조직도가 없습니다. 기준정보 화면에서 조직도를 먼저 올리세요.
               </p>
             )}
           </div>
@@ -814,15 +974,95 @@ function RemoveDialog({
   );
 }
 
-function RosterListTab() {
+/**
+ * 명단을 훑는 데 필요한 열만 기본으로 켠다 (기획 P1).
+ * 이메일·비밀번호처럼 계정을 손볼 때만 필요한 값은 상세 패널과 열 고르기에 둔다.
+ */
+const LIST_COLUMNS = [
+  { key: "emp_no", label: "사번" },
+  { key: "name", label: "성명" },
+  { key: "company", label: "계열사" },
+  { key: "org", label: "소속" },
+  { key: "job", label: "직무" },
+  { key: "role_level", label: "역할단계" },
+  { key: "status", label: "상태" },
+  { key: "grade", label: "직급" },
+  { key: "tags", label: "태그" },
+  { key: "email", label: "이메일" },
+  { key: "password", label: "비밀번호" },
+] as const;
+
+type ColumnKey = (typeof LIST_COLUMNS)[number]["key"];
+
+const DEFAULT_COLUMNS: ColumnKey[] = [
+  "emp_no",
+  "name",
+  "company",
+  "org",
+  "job",
+  "role_level",
+  "status",
+];
+
+function sameColumns(a: ColumnKey[], b: ColumnKey[]) {
+  return a.length === b.length && a.every((k) => b.includes(k));
+}
+
+type ResponseRef = { id: string; job_name: string | null; status: string };
+
+/**
+ * 선택한 인원·소속을 독려 메일 화면으로 넘긴다 (기획 B4). 발송은 메일 화면이 한다.
+ * 메일 화면의 수신 규약은 `?template=&org=&status=&ids=` 이고, 여기서는 org·status·ids 만 채운다.
+ */
+function remindSearch(args: { participantIds: string[]; orgId: string | null; status: string }) {
+  const out: { org?: string; status?: string; ids?: string } = {};
+  if (args.participantIds.length > 0) {
+    // 주소 길이 상한이 있어 200명까지만 싣는다. 그보다 많으면 소속 단위로 보내는 편이 맞다.
+    out.ids = args.participantIds.slice(0, 200).join(",");
+  } else if (args.orgId) {
+    out.org = args.orgId;
+  }
+  if (args.status !== "all") out.status = args.status;
+  return out;
+}
+
+function RosterListTab({
+  search,
+  patch,
+}: {
+  search: ParticipantsSearch;
+  patch: (next: SearchPatch) => void;
+}) {
   const { companyId } = useCompanyScope();
   const queryClient = useQueryClient();
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [tagFilter, setTagFilter] = useState("all");
-  const [orgFilter, setOrgFilter] = useState("all");
+
+  // 필터는 URL 이 원천이다 — 새로고침·뒤로가기·공유가 그대로 동작해야 한다 (기획 D4).
+  const statusFilter = search.status ?? "all";
+  const tagFilter = search.tag ?? "all";
+  const includeArchived = search.archived === true;
+
+  // 검색어만은 입력 중 IME 조합이 끊기지 않도록 지역 상태로 받고 잠깐 뒤 URL 에 싣는다.
+  const [searchText, setSearchText] = useState(search.q ?? "");
+  useEffect(() => {
+    setSearchText(search.q ?? "");
+  }, [search.q]);
+  useEffect(() => {
+    const current = search.q ?? "";
+    if (searchText === current) return;
+    const timer = setTimeout(() => patch({ q: searchText || undefined }), 300);
+    return () => clearTimeout(timer);
+    // patch 는 매 렌더 새로 만들어지므로 의존성에서 뺀다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchText, search.q]);
+
+  const { selectedOrgId, setSelectedOrgId } = useOrgLens();
   const [includeSubOrgs, setIncludeSubOrgs] = useState(true);
-  const [search, setSearch] = useState("");
-  const [includeArchived, setIncludeArchived] = useState(false);
+  const { density, setDensity, rowClass } = useDensity("participants");
+  const [visibleColumns, setVisibleColumns] = usePersistedState<ColumnKey[]>(
+    "participants-columns",
+    DEFAULT_COLUMNS,
+  );
+
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [tagInput, setTagInput] = useState("");
   const [bulkOrgId, setBulkOrgId] = useState("");
@@ -861,7 +1101,7 @@ function RosterListTab() {
     [data],
   );
 
-  /** 조직 필터·조직 열·일괄 배정이 함께 쓴다. 전사 스코프면 전 계열사 조직을 가져온다. */
+  /** 소속 트리·소속 열·일괄 배정이 함께 쓴다. 전사 스코프면 전 계열사 소속을 가져온다. */
   const { data: orgUnits } = useQuery({
     queryKey: ["org-units-filter", companyId],
     queryFn: async () => {
@@ -869,68 +1109,101 @@ function RosterListTab() {
       if (companyId !== "all") query = query.eq("company_id", companyId);
       const { data, error } = await query;
       if (error) throw error;
-      return data ?? [];
+      return (data ?? []) as OrgUnitRow[];
     },
   });
-  const orgOptions = useMemo(() => flattenOrgUnits(orgUnits ?? []), [orgUnits]);
-  const unitNameById = useMemo(
-    () => new Map((orgUnits ?? []).map((u) => [u.id, u.name])),
-    [orgUnits],
-  );
+  const units = orgUnits ?? [];
+  const orgOptions = useMemo(() => flattenOrgUnits(units), [units]);
+  const unitNameById = useMemo(() => new Map(units.map((u) => [u.id, u.name])), [units]);
 
-  /** 선택 조직 + (토글 시) 하위 조직 전체의 id 집합. 전체 조직이면 null. */
+  // 딥링크가 소속을 지정하면 렌즈를 그 소속으로 맞춘다. 이후에는 렌즈 선택이 URL 을 갱신한다.
+  useEffect(() => {
+    if (search.org && search.org !== selectedOrgId) setSelectedOrgId(search.org);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search.org]);
+
+  function selectOrg(id: string | null) {
+    setSelectedOrgId(id);
+    patch({ org: id ?? undefined });
+  }
+
+  /** 선택 소속 + (토글 시) 하위 소속 전체의 id 집합. 전체면 null. */
   const orgIdSet = useMemo(() => {
-    if (orgFilter === "all") return null;
-    const set = new Set([orgFilter]);
-    if (!includeSubOrgs) return set;
-    const childrenOf = new Map<string, string[]>();
-    for (const u of orgUnits ?? []) {
-      if (!u.parent_id) continue;
-      const list = childrenOf.get(u.parent_id);
-      if (list) list.push(u.id);
-      else childrenOf.set(u.parent_id, [u.id]);
-    }
-    const stack = [orgFilter];
-    while (stack.length > 0) {
-      for (const child of childrenOf.get(stack.pop()!) ?? []) {
-        if (!set.has(child)) {
-          set.add(child);
-          stack.push(child);
-        }
-      }
-    }
-    return set;
-  }, [orgFilter, includeSubOrgs, orgUnits]);
+    if (!selectedOrgId) return null;
+    if (!includeSubOrgs) return new Set([selectedOrgId]);
+    return new Set(orgSubtreeIds(units, selectedOrgId) ?? [selectedOrgId]);
+  }, [selectedOrgId, includeSubOrgs, units]);
 
-  /** 응답 검토 바로가기 노출 근거 — draft 를 뺀(제출 이상) 응답이 있는 참여자. */
-  const { data: responded } = useQuery({
-    queryKey: ["participants-responded"],
+  /** 응답 검토 딥링크와 직무 열의 근거. 참여자당 한 건(제출 이상을 우선)으로 줄인다. */
+  const { data: responses } = useQuery({
+    queryKey: ["participants-responses"],
     queryFn: () =>
-      fetchAll<{ participant_id: string }>((from, to) =>
-        supabase
-          .from("responses")
-          .select("participant_id")
-          .neq("status", "draft")
-          .order("id")
-          .range(from, to),
+      fetchAll<{ id: string; participant_id: string; job_name: string | null; status: string }>(
+        (from, to) =>
+          supabase
+            .from("responses")
+            .select("id, participant_id, job_name, status")
+            .order("id")
+            .range(from, to),
       ),
   });
-  const respondedSet = useMemo(
-    () => new Set((responded ?? []).map((r) => r.participant_id)),
-    [responded],
-  );
+  const responseByParticipant = useMemo(() => {
+    const map = new Map<string, ResponseRef>();
+    for (const r of responses ?? []) {
+      const prev = map.get(r.participant_id);
+      // 검토 대상은 제출 이상이다. 작성중(draft)보다 제출된 응답을 우선 잡는다.
+      if (prev && prev.status !== "draft" && r.status === "draft") continue;
+      map.set(r.participant_id, { id: r.id, job_name: r.job_name, status: r.status });
+    }
+    return map;
+  }, [responses]);
 
-  const rows = useMemo(() => {
-    const q = search.trim().toLowerCase();
+  /** 소속 필터를 뺀 나머지 조건까지 적용한 행 — 트리의 인원수는 이 모수로 센다. */
+  const baseRows = useMemo(() => {
+    const q = searchText.trim().toLowerCase();
     return (data ?? []).filter((p) => {
       if (!includeArchived && p.archived_at) return false;
       if (statusFilter !== "all" && p.account_status !== statusFilter) return false;
       if (tagFilter !== "all" && !(p.tags ?? []).includes(tagFilter)) return false;
-      if (orgIdSet && !(p.org_unit_id && orgIdSet.has(p.org_unit_id))) return false;
       if (!q) return true;
       return [p.name, p.emp_no, p.email ?? ""].some((v) => v.toLowerCase().includes(q));
     });
-  }, [data, search, statusFilter, tagFilter, orgIdSet, includeArchived]);
+  }, [data, searchText, statusFilter, tagFilter, includeArchived]);
+
+  const rows = useMemo(
+    () =>
+      orgIdSet
+        ? baseRows.filter((p) => p.org_unit_id && orgIdSet.has(p.org_unit_id))
+        : baseRows,
+    [baseRows, orgIdSet],
+  );
+
+  /**
+   * 소속별 인원수 — 자기 소속과 하위 소속을 합친 값. 트리에서 규모를 바로 본다.
+   * ponytail: 소속 수 × 트리 깊이만큼 훑는다. 수백 개까지는 체감이 없고,
+   *           수천 개가 되면 부모 방향으로 한 번에 더하는 방식으로 바꾼다.
+   */
+  const orgCounts = useMemo(() => {
+    const direct = new Map<string, number>();
+    for (const p of baseRows) {
+      if (!p.org_unit_id) continue;
+      direct.set(p.org_unit_id, (direct.get(p.org_unit_id) ?? 0) + 1);
+    }
+    const out: Record<string, number> = {};
+    for (const u of units) {
+      out[u.id] = (orgSubtreeIds(units, u.id) ?? []).reduce(
+        (sum, id) => sum + (direct.get(id) ?? 0),
+        0,
+      );
+    }
+    return out;
+  }, [baseRows, units]);
+
+  /** 상세 패널 대상. 필터에 걸려 목록에 없어도 딥링크는 열려야 한다. */
+  const detail = useMemo(
+    () => (search.p ? ((data ?? []).find((p) => p.id === search.p) ?? null) : null),
+    [data, search.p],
+  );
 
   const provision = useMutation({
     mutationFn: async (ids: string[]) =>
@@ -952,7 +1225,7 @@ function RosterListTab() {
       resetParticipantPassword({ data: { participantId }, headers: await authHeaders() }),
     onSuccess: (res) => {
       toast.success(`초기 비밀번호를 ${res.password} 로 재설정했습니다.`);
-      // 목록의 비밀번호 열이 낡은 값을 계속 보여주지 않게 한다.
+      // 상세 패널의 비밀번호가 낡은 값을 계속 보여주지 않게 한다.
       void queryClient.invalidateQueries({ queryKey: ["participants"] });
     },
     onError: (err) => toast.error(errorMessage(err)),
@@ -1024,7 +1297,7 @@ function RosterListTab() {
         headers: await authHeaders(),
       }),
     onSuccess: (res) => {
-      toast.success(`${res.changed}명에게 조직을 배정했습니다.`);
+      toast.success(`${res.changed}명의 소속을 배정했습니다.`);
       setBulkOrgId("");
       void queryClient.invalidateQueries({ queryKey: ["participants"] });
     },
@@ -1036,6 +1309,9 @@ function RosterListTab() {
   const hasTagInput = tagInput.trim().length > 0;
   const busy =
     provision.isPending || bulkReset.isPending || tagMutation.isPending || orgAssign.isPending;
+  const columnsChanged = !sameColumns(visibleColumns, DEFAULT_COLUMNS);
+  const shownColumns = LIST_COLUMNS.filter((c) => visibleColumns.includes(c.key));
+  const remindTarget = selectedIds.length > 0 || !!selectedOrgId;
 
   /** 현재 필터가 적용된 rows 그대로 CSV 로 만든다. 엑셀 호환을 위해 BOM 을 붙인다. */
   function downloadRoster() {
@@ -1044,8 +1320,8 @@ function RosterListTab() {
       "사번",
       "이름",
       "계열사",
-      "조직",
       "소속",
+      "소속 표기",
       "직급",
       "역할단계",
       "이메일",
@@ -1085,390 +1361,519 @@ function RosterListTab() {
     });
   }
 
+  function openDetail(id: string) {
+    patch({ p: id });
+  }
+
+  function cell(key: ColumnKey, p: Participant) {
+    const response = responseByParticipant.get(p.id);
+    switch (key) {
+      case "emp_no":
+        return <span className="text-muted-foreground tabular-nums">{p.emp_no}</span>;
+      case "name":
+        return (
+          // 모든 행은 그 사람 단건으로 가는 딥링크다 (기획 P6).
+          <button
+            type="button"
+            onClick={() => openDetail(p.id)}
+            className="text-left font-medium hover:underline"
+          >
+            {p.name}
+            {p.archived_at && (
+              <span className="ml-2 text-xs font-normal text-muted-foreground">보관</span>
+            )}
+          </button>
+        );
+      case "company":
+        return p.companies?.name ?? "-";
+      case "org":
+        return p.org_unit_id ? (
+          (unitNameById.get(p.org_unit_id) ?? "-")
+        ) : (
+          <span className="text-muted-foreground">
+            {p.org_text}
+            <span className="ml-1.5 rounded-full bg-secondary px-2 py-0.5 text-xs">미배정</span>
+          </span>
+        );
+      case "job":
+        return response?.job_name ? (
+          response.job_name
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        );
+      case "role_level":
+        return p.role_level ?? <span className="text-muted-foreground">-</span>;
+      case "status":
+        return <StatusBadge status={p.account_status} withHelp />;
+      case "grade":
+        return p.grade ?? <span className="text-muted-foreground">-</span>;
+      case "tags":
+        return <TagChips participant={p} />;
+      case "email":
+        return <span className="break-all text-xs">{p.email ?? "-"}</span>;
+      case "password":
+        return <PasswordCell participant={p} />;
+    }
+  }
+
   return (
-    <div className="space-y-4">
-      <div className="space-y-3 rounded-xl border bg-card p-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="이름 · 사번 · 이메일"
-                aria-label="참여자 검색"
-                className="w-[220px] pl-8"
-              />
-            </div>
-            <Select value={statusFilter} onValueChange={setStatusFilter}>
-              <SelectTrigger className="w-[140px]" aria-label="상태 필터">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">전체 상태</SelectItem>
-                {ACCOUNT_STATUS_LABELS.map((s) => (
-                  <SelectItem key={s} value={s}>
-                    {s}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select value={tagFilter} onValueChange={setTagFilter}>
-              <SelectTrigger className="w-[140px]" aria-label="태그 필터">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">전체 태그</SelectItem>
-                {allTags.map((t) => (
-                  <SelectItem key={t} value={t}>
-                    {t}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select value={orgFilter} onValueChange={setOrgFilter}>
-              <SelectTrigger className="w-[180px]" aria-label="조직 필터">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">전체 조직</SelectItem>
-                {orgOptions.map((o) => (
-                  <SelectItem key={o.id} value={o.id}>
-                    {o.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {orgFilter !== "all" && (
+    <div className="grid gap-4 lg:grid-cols-[240px_minmax(0,1fr)]">
+      {/* 관리의 기본 단위는 개인이 아니라 소속이다 (기획 B4·P5). */}
+      <OrgTreeFilter
+        units={units}
+        selectedId={selectedOrgId}
+        onSelect={selectOrg}
+        counts={orgCounts}
+        title="소속"
+        className="h-fit lg:sticky lg:top-4"
+      />
+
+      <div className="min-w-0 space-y-4">
+        <div className="space-y-3 rounded-xl border bg-card p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={searchText}
+                  onChange={(e) => setSearchText(e.target.value)}
+                  placeholder="이름 · 사번 · 이메일"
+                  aria-label="참여자 검색"
+                  className="w-[220px] pl-8"
+                />
+              </div>
+              <Select
+                value={statusFilter}
+                onValueChange={(v) => patch({ status: v === "all" ? undefined : v })}
+              >
+                <SelectTrigger className="w-[140px]" aria-label="상태 필터">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">전체 상태</SelectItem>
+                  {ACCOUNT_STATUS_LABELS.map((s) => (
+                    <SelectItem key={s} value={s}>
+                      {s}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select
+                value={tagFilter}
+                onValueChange={(v) => patch({ tag: v === "all" ? undefined : v })}
+              >
+                <SelectTrigger className="w-[140px]" aria-label="태그 필터">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">전체 태그</SelectItem>
+                  {allTags.map((t) => (
+                    <SelectItem key={t} value={t}>
+                      {t}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {selectedOrgId && (
+                <label className="flex items-center gap-2 text-sm">
+                  <Checkbox
+                    checked={includeSubOrgs}
+                    onCheckedChange={(v) => setIncludeSubOrgs(v === true)}
+                  />
+                  하위 소속 포함
+                </label>
+              )}
               <label className="flex items-center gap-2 text-sm">
                 <Checkbox
-                  checked={includeSubOrgs}
-                  onCheckedChange={(v) => setIncludeSubOrgs(v === true)}
+                  checked={includeArchived}
+                  onCheckedChange={(v) => patch({ archived: v === true ? true : undefined })}
                 />
-                하위 조직 포함
+                보관 포함
               </label>
-            )}
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={includeArchived}
-                onCheckedChange={(v) => setIncludeArchived(v === true)}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={rows.length === 0}
+                onClick={() => setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))}
+              >
+                {allSelected ? "전체 해제" : "전체 선택"}
+              </Button>
+              <Button variant="outline" size="sm" disabled={rows.length === 0} onClick={downloadRoster}>
+                <Download className="size-4" />
+                명단 내려받기
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={orgMatch.isPending}
+                onClick={() => orgMatch.mutate()}
+              >
+                {orgMatch.isPending ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Link2 className="size-4" />
+                )}
+                소속 일괄 매칭
+              </Button>
+              <Button size="sm" onClick={() => setAdding(true)}>
+                <Plus className="size-4" />
+                참여자 추가
+              </Button>
+            </div>
+          </div>
+
+          {/* 지금 무엇을 보고 있는지와, 표를 어떻게 보고 있는지 (기획 P9·D6) */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <span className="rounded-full bg-secondary px-2.5 py-1 font-medium text-foreground">
+                {orgPathLabel(units, selectedOrgId)}
+              </span>
+              <span className="tabular-nums">
+                {rows.length}명 표시 중 · 선택 {selectedIds.length}명
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!remindTarget}
+                title={
+                  remindTarget
+                    ? undefined
+                    : "독려할 인원을 선택하거나 왼쪽에서 소속을 고르세요."
+                }
+                asChild={remindTarget}
+              >
+                {remindTarget ? (
+                  <Link
+                    to="/admin/mail"
+                    search={remindSearch({
+                      participantIds: selectedIds,
+                      orgId: selectedOrgId,
+                      status: statusFilter,
+                    })}
+                  >
+                    <Mail className="size-4" />
+                    독려 메일 보내기
+                  </Link>
+                ) : (
+                  <>
+                    <Mail className="size-4" />
+                    독려 메일 보내기
+                  </>
+                )}
+              </Button>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setDensity(density === "compact" ? "comfortable" : "compact")}
+              >
+                <Rows3 className="size-4" />
+                {density === "compact" ? "넓게 보기" : "좁게 보기"}
+              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm">
+                    <TableProperties className="size-4" />열 고르기
+                    {columnsChanged && (
+                      <span className="ml-1 rounded-full bg-warning/15 px-1.5 py-0.5 text-[11px] font-semibold text-warning">
+                        기본값과 다름
+                      </span>
+                    )}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-52">
+                  <DropdownMenuLabel>표에 보일 열</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  {LIST_COLUMNS.map((c) => {
+                    const on = visibleColumns.includes(c.key);
+                    return (
+                      <DropdownMenuItem
+                        key={c.key}
+                        // 여러 열을 연달아 켜고 끄는 동작이라 메뉴를 닫지 않는다.
+                        onSelect={(e) => {
+                          e.preventDefault();
+                          setVisibleColumns((prev) =>
+                            on ? prev.filter((k) => k !== c.key) : [...prev, c.key],
+                          );
+                        }}
+                      >
+                        <Checkbox checked={on} aria-hidden className="pointer-events-none" />
+                        {c.label}
+                      </DropdownMenuItem>
+                    );
+                  })}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    disabled={!columnsChanged}
+                    onSelect={() => setVisibleColumns(DEFAULT_COLUMNS)}
+                  >
+                    기본값으로 되돌리기
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </div>
+
+          {selectedIds.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+              <Button disabled={busy} onClick={() => provision.mutate(selectedIds)}>
+                {provision.isPending ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <UserPlus className="size-4" />
+                )}
+                계정 생성
+              </Button>
+              <Button
+                variant="outline"
+                disabled={busy}
+                onClick={() => bulkReset.mutate(selectedIds)}
+              >
+                {bulkReset.isPending ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <KeyRound className="size-4" />
+                )}
+                비밀번호 초기화
+              </Button>
+              <Input
+                value={tagInput}
+                onChange={(e) => setTagInput(e.target.value)}
+                placeholder="태그 (쉼표로 여러 개)"
+                aria-label="일괄 적용할 태그"
+                className="w-[200px]"
               />
-              보관 포함
-            </label>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={rows.length === 0}
-              onClick={() => setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))}
-            >
-              {allSelected ? "전체 해제" : "전체 선택"}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={rows.length === 0}
-              onClick={downloadRoster}
-            >
-              <Download className="size-4" />
-              명단 내려받기
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={orgMatch.isPending}
-              onClick={() => orgMatch.mutate()}
-            >
-              {orgMatch.isPending ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <Link2 className="size-4" />
-              )}
-              조직 일괄 매칭
-            </Button>
-            <Button size="sm" onClick={() => setAdding(true)}>
-              <Plus className="size-4" />
-              참여자 추가
-            </Button>
-          </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={busy || !hasTagInput}
+                onClick={() => tagMutation.mutate("add")}
+              >
+                태그 부여
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy || !hasTagInput}
+                onClick={() => tagMutation.mutate("remove")}
+              >
+                태그 제거
+              </Button>
+              <Select
+                value={bulkOrgId || "__pick__"}
+                onValueChange={(v) => setBulkOrgId(v === "__pick__" ? "" : v)}
+              >
+                <SelectTrigger className="w-[200px]" aria-label="일괄 배정할 소속">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__pick__">— 소속 선택</SelectItem>
+                  {orgOptions.map((o) => (
+                    <SelectItem key={o.id} value={o.id}>
+                      {o.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={busy || !bulkOrgId}
+                onClick={() => orgAssign.mutate()}
+              >
+                {orgAssign.isPending && <Loader2 className="size-4 animate-spin" />}
+                소속 배정
+              </Button>
+            </div>
+          )}
         </div>
 
-        <p className="text-xs text-muted-foreground">
-          {rows.length}명 표시 중 · 선택 {selectedIds.length}명
-        </p>
-
-        {selectedIds.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 border-t pt-3">
-            <Button disabled={busy} onClick={() => provision.mutate(selectedIds)}>
-              {provision.isPending ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <UserPlus className="size-4" />
-              )}
-              계정 생성
-            </Button>
-            <Button variant="outline" disabled={busy} onClick={() => bulkReset.mutate(selectedIds)}>
-              {bulkReset.isPending ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <KeyRound className="size-4" />
-              )}
-              비밀번호 초기화
-            </Button>
-            <Input
-              value={tagInput}
-              onChange={(e) => setTagInput(e.target.value)}
-              placeholder="태그 (쉼표로 여러 개)"
-              aria-label="일괄 적용할 태그"
-              className="w-[200px]"
-            />
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={busy || !hasTagInput}
-              onClick={() => tagMutation.mutate("add")}
-            >
-              태그 부여
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={busy || !hasTagInput}
-              onClick={() => tagMutation.mutate("remove")}
-            >
-              태그 제거
-            </Button>
-            <Select
-              value={bulkOrgId || "__pick__"}
-              onValueChange={(v) => setBulkOrgId(v === "__pick__" ? "" : v)}
-            >
-              <SelectTrigger className="w-[200px]" aria-label="일괄 배정할 조직">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="__pick__">— 조직 선택</SelectItem>
-                {orgOptions.map((o) => (
-                  <SelectItem key={o.id} value={o.id}>
-                    {o.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={busy || !bulkOrgId}
-              onClick={() => orgAssign.mutate()}
-            >
-              {orgAssign.isPending && <Loader2 className="size-4 animate-spin" />}
-              조직 배정
-            </Button>
-          </div>
-        )}
-      </div>
-
-      {isLoading ? (
-        <p className="text-sm text-muted-foreground">불러오는 중...</p>
-      ) : rows.length === 0 ? (
-        <p className="rounded-xl border bg-card p-8 text-center text-sm text-muted-foreground">
-          조건에 맞는 참여자가 없습니다.
-        </p>
-      ) : (
-        <>
-          {/* 모바일: 카드 스택 */}
-          <ul className="space-y-3 md:hidden">
-            {rows.map((p) => (
-              <li
-                key={p.id}
-                className={`rounded-xl border bg-card p-4 shadow-sm ${p.archived_at ? "opacity-60" : ""}`}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex min-w-0 items-start gap-3">
-                    <Checkbox
-                      checked={selected.has(p.id)}
-                      onCheckedChange={() => toggle(p.id)}
-                      aria-label={`${p.name} 선택`}
-                    />
-                    <div className="min-w-0">
-                      <p className="font-semibold">
-                        {p.name}
-                        <span className="ml-2 text-xs font-normal text-muted-foreground">
-                          {p.emp_no}
-                        </span>
-                      </p>
-                      <p className="mt-1 truncate text-xs text-muted-foreground">
-                        {p.companies?.name} ·{" "}
-                        {p.org_unit_id ? unitNameById.get(p.org_unit_id) : p.org_text}
-                      </p>
-                    </div>
-                  </div>
-                  <StatusBadge status={p.account_status} />
-                </div>
-                <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                  <div>
-                    <dt className="text-muted-foreground">직급</dt>
-                    <dd className="mt-0.5 font-medium">{p.grade ?? "-"}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">권한</dt>
-                    <dd className="mt-0.5 font-medium">
-                      {p.role === "admin" ? "관리자" : "응답자"}
-                    </dd>
-                  </div>
-                  <div className="col-span-2">
-                    <dt className="text-muted-foreground">이메일</dt>
-                    <dd className="mt-0.5 truncate font-medium">{p.email ?? "-"}</dd>
-                  </div>
-                  <div className="col-span-2">
-                    <dt className="text-muted-foreground">비밀번호</dt>
-                    <dd className="mt-0.5">
-                      <PasswordCell participant={p} />
-                    </dd>
-                  </div>
-                </dl>
-                <TagChips participant={p} />
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {respondedSet.has(p.id) && (
-                    <Button size="sm" variant="outline" asChild>
-                      <Link to="/admin/review">
-                        <FileSearch className="size-4" />
-                        응답 검토
-                      </Link>
-                    </Button>
-                  )}
-                  <Button size="sm" variant="outline" onClick={() => setEditing(p)}>
-                    <Pencil className="size-4" />
-                    수정
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={!p.user_id || resetPassword.isPending}
-                    onClick={() => resetPassword.mutate(p.id)}
-                  >
-                    <KeyRound className="size-4" />
-                    비밀번호 초기화
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={() => setRemoving(p)}>
-                    <Trash2 className="size-4" />
-                    삭제 · 보관
-                  </Button>
-                </div>
-              </li>
-            ))}
-          </ul>
-
-          {/* 데스크톱: 표 */}
-          <div className="hidden overflow-x-auto rounded-xl border bg-card shadow-sm md:block">
-            <table className="w-full text-sm">
-              <thead className="bg-secondary text-left text-xs text-muted-foreground">
-                <tr>
-                  <th className="w-10 px-4 py-3" />
-                  <th className="px-4 py-3 font-medium">사번</th>
-                  <th className="px-4 py-3 font-medium">이름</th>
-                  <th className="px-4 py-3 font-medium">계열사</th>
-                  <th className="px-4 py-3 font-medium">조직</th>
-                  <th className="px-4 py-3 font-medium">직급</th>
-                  <th className="px-4 py-3 font-medium">태그</th>
-                  <th className="px-4 py-3 font-medium">비밀번호</th>
-                  <th className="px-4 py-3 font-medium">상태</th>
-                  <th className="px-4 py-3 font-medium">관리</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((p) => (
-                  <tr key={p.id} className={`border-t ${p.archived_at ? "opacity-60" : ""}`}>
-                    <td className="px-4 py-3">
+        {isLoading ? (
+          <p className="text-sm text-muted-foreground">불러오는 중...</p>
+        ) : rows.length === 0 ? (
+          <EmptyState
+            kind="nothing"
+            title="조건에 맞는 참여자가 없습니다"
+            description={
+              baseRows.length > 0
+                ? `${orgPathLabel(units, selectedOrgId)} 소속으로는 0명입니다. 다른 조건에서는 ${baseRows.length}명이 있습니다.`
+                : "지금 걸린 검색어·상태·태그 조건에 맞는 사람이 없습니다. 조건을 풀거나 명부를 올려 참여자를 등록하세요."
+            }
+            actionLabel="조건 모두 지우기"
+            onAction={() => {
+              selectOrg(null);
+              setSearchText("");
+              patch({ q: undefined, status: undefined, tag: undefined, archived: undefined });
+            }}
+          />
+        ) : (
+          <>
+            {/* 모바일: 카드 스택 */}
+            <ul className="space-y-3 md:hidden">
+              {rows.map((p) => (
+                <li
+                  key={p.id}
+                  className={`rounded-xl border bg-card p-4 shadow-sm ${p.archived_at ? "opacity-60" : ""} ${
+                    search.p === p.id ? "ring-2 ring-primary" : ""
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex min-w-0 items-start gap-3">
                       <Checkbox
                         checked={selected.has(p.id)}
                         onCheckedChange={() => toggle(p.id)}
                         aria-label={`${p.name} 선택`}
                       />
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground">{p.emp_no}</td>
-                    <td className="px-4 py-3 font-medium">
-                      {p.name}
-                      {p.archived_at && (
-                        <span className="ml-2 text-xs font-normal text-muted-foreground">보관</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">{p.companies?.name}</td>
-                    <td className="px-4 py-3">
-                      {p.org_unit_id ? (
-                        (unitNameById.get(p.org_unit_id) ?? "-")
-                      ) : (
-                        <span className="text-muted-foreground">
-                          {p.org_text}
-                          <span className="ml-1.5 rounded-full bg-secondary px-2 py-0.5 text-xs">
-                            미배정
+                      <div className="min-w-0">
+                        <button
+                          type="button"
+                          onClick={() => openDetail(p.id)}
+                          className="text-left font-semibold hover:underline"
+                        >
+                          {p.name}
+                          <span className="ml-2 text-xs font-normal tabular-nums text-muted-foreground">
+                            {p.emp_no}
                           </span>
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">{p.grade ?? "-"}</td>
-                    <td className="px-4 py-3">
-                      <TagChips participant={p} />
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-3">
-                      <PasswordCell participant={p} />
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge status={p.account_status} />
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex gap-1">
-                        {respondedSet.has(p.id) && (
-                          <Button size="sm" variant="ghost" asChild>
-                            {/* review.tsx 는 URL 로 응답 지정을 지원하지 않아 목록 이동까지만. */}
-                            <Link to="/admin/review" aria-label={`${p.name} 응답 검토로 이동`}>
-                              <FileSearch className="size-4" />
-                            </Link>
-                          </Button>
-                        )}
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          aria-label={`${p.name} 수정`}
-                          onClick={() => setEditing(p)}
-                        >
-                          <Pencil className="size-4" />
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          aria-label={`${p.name} 비밀번호 초기화`}
-                          disabled={!p.user_id || resetPassword.isPending}
-                          onClick={() => resetPassword.mutate(p.id)}
-                        >
-                          <KeyRound className="size-4" />
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          aria-label={`${p.name} 삭제 또는 보관`}
-                          onClick={() => setRemoving(p)}
-                        >
-                          <Trash2 className="size-4" />
-                        </Button>
+                        </button>
+                        <p className="mt-1 truncate text-xs text-muted-foreground">
+                          {p.companies?.name} ·{" "}
+                          {p.org_unit_id ? unitNameById.get(p.org_unit_id) : p.org_text}
+                        </p>
                       </div>
-                    </td>
+                    </div>
+                    <StatusBadge status={p.account_status} withHelp />
+                  </div>
+                  <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                    <div>
+                      <dt className="text-muted-foreground">직무</dt>
+                      <dd className="mt-0.5 truncate font-medium">
+                        {responseByParticipant.get(p.id)?.job_name ?? "-"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-muted-foreground">역할단계</dt>
+                      <dd className="mt-0.5 font-medium">{p.role_level ?? "-"}</dd>
+                    </div>
+                  </dl>
+                  <TagChips participant={p} />
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button size="sm" variant="outline" onClick={() => openDetail(p.id)}>
+                      상세 · 계정
+                    </Button>
+                    <RowMenu
+                      participant={p}
+                      response={responseByParticipant.get(p.id) ?? null}
+                      resetting={resetPassword.isPending}
+                      onDetail={() => openDetail(p.id)}
+                      onEdit={() => setEditing(p)}
+                      onReset={() => resetPassword.mutate(p.id)}
+                      onRemove={() => setRemoving(p)}
+                    />
+                  </div>
+                </li>
+              ))}
+            </ul>
+
+            {/* 데스크톱: 표. 500행을 훑어도 머리글을 잃지 않게 표 안에서 스크롤한다 (기획 D6). */}
+            <div className="hidden max-h-[calc(100vh-19rem)] overflow-auto rounded-xl border bg-card shadow-sm md:block">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 z-10 bg-secondary text-left text-xs text-muted-foreground">
+                  <tr>
+                    <th className="w-10 border-b px-4 py-3" />
+                    {shownColumns.map((c) => (
+                      <th key={c.key} className="border-b px-4 py-3 font-medium">
+                        {c.label}
+                      </th>
+                    ))}
+                    <th className="w-14 border-b px-4 py-3 font-medium">관리</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
+                </thead>
+                <tbody>
+                  {rows.map((p) => (
+                    <tr
+                      key={p.id}
+                      className={`border-t ${p.archived_at ? "opacity-60" : ""} ${
+                        search.p === p.id ? "bg-primary-soft" : ""
+                      }`}
+                    >
+                      <td className={`px-4 ${rowClass}`}>
+                        <Checkbox
+                          checked={selected.has(p.id)}
+                          onCheckedChange={() => toggle(p.id)}
+                          aria-label={`${p.name} 선택`}
+                        />
+                      </td>
+                      {shownColumns.map((c) => (
+                        <td key={c.key} className={`px-4 ${rowClass}`}>
+                          {cell(c.key, p)}
+                        </td>
+                      ))}
+                      <td className={`px-4 ${rowClass}`}>
+                        <RowMenu
+                          participant={p}
+                          response={responseByParticipant.get(p.id) ?? null}
+                          resetting={resetPassword.isPending}
+                          onDetail={() => openDetail(p.id)}
+                          onEdit={() => setEditing(p)}
+                          onReset={() => resetPassword.mutate(p.id)}
+                          onRemove={() => setRemoving(p)}
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* 딥링크로 지목된 한 사람 (기획 D4·P6) */}
+      <Sheet open={!!search.p} onOpenChange={(open) => !open && patch({ p: undefined })}>
+        <SheetContent className="w-full overflow-y-auto sm:max-w-md">
+          {detail ? (
+            <ParticipantDetail
+              participant={detail}
+              orgLabel={orgPathLabel(units, detail.org_unit_id)}
+              response={responseByParticipant.get(detail.id) ?? null}
+              resetting={resetPassword.isPending}
+              onEdit={() => setEditing(detail)}
+              onReset={() => resetPassword.mutate(detail.id)}
+              onRemove={() => setRemoving(detail)}
+            />
+          ) : (
+            <>
+              <SheetHeader>
+                <SheetTitle>참여자 상세</SheetTitle>
+                <SheetDescription>지목된 참여자를 확인합니다.</SheetDescription>
+              </SheetHeader>
+              <div className="mt-6">
+                {isLoading ? (
+                  <p className="text-sm text-muted-foreground">불러오는 중...</p>
+                ) : (
+                  <EmptyState
+                    kind="nothing"
+                    title="이 참여자를 찾지 못했습니다"
+                    description="삭제되었거나, 지금 보고 있는 계열사 범위 밖에 있습니다. 상단의 계열사 범위를 전체로 바꾼 뒤 다시 시도해 보세요."
+                    actionLabel="명단으로 돌아가기"
+                    onAction={() => patch({ p: undefined })}
+                  />
+                )}
+              </div>
+            </>
+          )}
+        </SheetContent>
+      </Sheet>
 
       {adding && (
         <ParticipantFormDialog
           open
           participant={null}
           companies={companies ?? []}
-          defaultCompanyId={
-            companyId !== "all" ? companyId : ((companies ?? [])[0]?.id ?? "")
-          }
+          defaultCompanyId={companyId !== "all" ? companyId : ((companies ?? [])[0]?.id ?? "")}
           onOpenChange={(open) => !open && setAdding(false)}
         />
       )}
@@ -1493,9 +1898,9 @@ function RosterListTab() {
         <Dialog open onOpenChange={(open) => !open && setOrgMatchReport(null)}>
           <DialogContent className="max-h-[85vh] overflow-y-auto">
             <DialogHeader>
-              <DialogTitle>조직 일괄 매칭 결과</DialogTitle>
+              <DialogTitle>소속 일괄 매칭 결과</DialogTitle>
               <DialogDescription>
-                조직 미연결 참여자의 소속 표기를 조직도 이름과 대조했습니다 (공백 제거 후 정확
+                소속 미연결 참여자의 소속 표기를 조직도 이름과 대조했습니다 (공백 제거 후 정확
                 일치).
               </DialogDescription>
             </DialogHeader>
@@ -1514,7 +1919,7 @@ function RosterListTab() {
                   ))}
                 </ul>
                 <p className="text-xs text-muted-foreground">
-                  미매칭 건은 참여자 수정 화면에서 조직을 직접 선택하거나, 조직도 이름과 소속
+                  미매칭 건은 참여자 수정 화면에서 소속을 직접 선택하거나, 조직도 이름과 소속
                   표기를 맞춘 뒤 다시 실행하세요.
                   {orgMatchReport.unmatched > orgMatchReport.unmatchedList.length &&
                     ` (목록은 ${orgMatchReport.unmatchedList.length}건까지만 표시)`}
@@ -1532,12 +1937,183 @@ function RosterListTab() {
 }
 
 /**
+ * 행의 ⋯ 메뉴 (기획 P1).
+ * 계정을 손보는 동작은 전부 여기 또는 상세 패널에 있다. 명단을 훑는 면적과 다투지 않게 한다.
+ */
+function RowMenu({
+  participant,
+  response,
+  resetting,
+  onDetail,
+  onEdit,
+  onReset,
+  onRemove,
+}: {
+  participant: Participant;
+  response: ResponseRef | null;
+  resetting: boolean;
+  onDetail: () => void;
+  onEdit: () => void;
+  onReset: () => void;
+  onRemove: () => void;
+}) {
+  const reviewable = !!response && response.status !== "draft";
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button size="sm" variant="ghost" aria-label={`${participant.name} 관리 메뉴`}>
+          <MoreHorizontal className="size-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuItem onSelect={onDetail}>
+          <FileSearch className="size-4" />
+          상세 · 계정 보기
+        </DropdownMenuItem>
+        {reviewable && response && (
+          <DropdownMenuItem asChild>
+            {/* 목록이 아니라 그 응답 단건으로 착지시킨다 (기획 P6). */}
+            <Link to="/admin/review" search={{ response: response.id }}>
+              <FileSearch className="size-4" />
+              응답 검토
+            </Link>
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem onSelect={onEdit}>
+          <Pencil className="size-4" />
+          수정
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem disabled={!participant.user_id || resetting} onSelect={onReset}>
+          <KeyRound className="size-4" />
+          비밀번호 초기화
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onRemove}>
+          <Trash2 className="size-4" />
+          삭제 · 보관
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** 상세 패널 — 계정 운영 정보와 동작을 여기 모은다 (기획 P1). */
+function ParticipantDetail({
+  participant,
+  orgLabel,
+  response,
+  resetting,
+  onEdit,
+  onReset,
+  onRemove,
+}: {
+  participant: Participant;
+  orgLabel: string;
+  response: ResponseRef | null;
+  resetting: boolean;
+  onEdit: () => void;
+  onReset: () => void;
+  onRemove: () => void;
+}) {
+  const rows: { label: string; value: React.ReactNode }[] = [
+    { label: "사번", value: <span className="tabular-nums">{participant.emp_no}</span> },
+    { label: "계열사", value: participant.companies?.name ?? "-" },
+    { label: "소속", value: participant.org_unit_id ? orgLabel : `${participant.org_text ?? "-"} (미배정)` },
+    { label: "직급", value: participant.grade ?? "-" },
+    { label: "역할단계", value: participant.role_level ?? "-" },
+    { label: "생년월일", value: participant.birth_date ?? "-" },
+    { label: "직무", value: response?.job_name ?? "-" },
+    { label: "권한", value: participant.role === "admin" ? "관리자" : "참여자" },
+    { label: "이메일", value: <span className="break-all">{participant.email ?? "-"}</span> },
+    { label: "비밀번호", value: <PasswordCell participant={participant} /> },
+  ];
+
+  return (
+    <>
+      <SheetHeader>
+        <SheetTitle className="flex items-center gap-2">
+          {participant.name}
+          <StatusBadge status={participant.account_status} withHelp />
+        </SheetTitle>
+        <SheetDescription>
+          {participant.companies?.name ?? "-"} · 사번 {participant.emp_no}
+          {participant.archived_at && " · 보관됨(로그인 차단)"}
+        </SheetDescription>
+      </SheetHeader>
+
+      <dl className="mt-5 space-y-2 text-sm">
+        {rows.map((r) => (
+          <div key={r.label} className="flex items-start gap-3 border-b pb-2 last:border-0">
+            <dt className="w-20 shrink-0 text-xs text-muted-foreground">{r.label}</dt>
+            <dd className="min-w-0 flex-1">{r.value}</dd>
+          </div>
+        ))}
+      </dl>
+
+      <TagChips participant={participant} />
+
+      <div className="mt-6 flex flex-wrap gap-2">
+        <Button size="sm" variant="outline" onClick={onEdit}>
+          <Pencil className="size-4" />
+          수정
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={!participant.user_id || resetting}
+          onClick={onReset}
+        >
+          {resetting ? <Loader2 className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+          비밀번호 초기화
+        </Button>
+        {response && response.status !== "draft" && (
+          <Button size="sm" variant="outline" asChild>
+            <Link to="/admin/review" search={{ response: response.id }}>
+              <FileSearch className="size-4" />
+              응답 검토
+            </Link>
+          </Button>
+        )}
+        <Button size="sm" variant="outline" asChild>
+          <Link to="/admin/mail" search={{ ids: participant.id }}>
+            <Mail className="size-4" />
+            독려 메일
+          </Link>
+        </Button>
+        <Button size="sm" variant="ghost" onClick={onRemove}>
+          <Trash2 className="size-4" />
+          삭제 · 보관
+        </Button>
+      </div>
+
+      {!participant.user_id && (
+        <p className="mt-4 rounded-lg border bg-secondary/40 p-3 text-xs text-muted-foreground">
+          아직 로그인 계정이 없습니다. 명단에서 이 사람을 선택한 뒤 [계정 생성]을 누르면 초기
+          비밀번호가 만들어집니다.
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
  * 계정 비밀번호 노출 셀. 관리자만 보는 화면이고, 값은 서버가 실제로 적용한 평문이다
  * (발급·초기화·본인 변경 모두 participants.initial_password 를 갱신).
  * 계정이 없으면 비밀번호도 없고, 값이 비어 있으면 옛 계정이라 [비밀번호 초기화]로 다시 만들어야 한다.
+ *
+ * 기본은 가린다 — 화면 공유·어깨 너머로 명단 전체의 비밀번호가 새는 일을 막는다.
+ * 복사는 값을 드러내지 않고도 되고, 한 번 드러낸 값은 15초 뒤 자동으로 다시 가린다.
  */
 function PasswordCell({ participant }: { participant: Participant }) {
+  const [shown, setShown] = useState(false);
   const pw = participant.initial_password;
+
+  useEffect(() => {
+    if (!shown) return;
+    const timer = setTimeout(() => setShown(false), 15000);
+    return () => clearTimeout(timer);
+  }, [shown]);
+
   if (!participant.user_id) {
     return <span className="text-xs text-muted-foreground">계정 없음</span>;
   }
@@ -1545,8 +2121,19 @@ function PasswordCell({ participant }: { participant: Participant }) {
     return <span className="text-xs text-muted-foreground">미기록 — 초기화 필요</span>;
   }
   return (
-    <span className="inline-flex items-center gap-1">
-      <code className="rounded bg-secondary px-1.5 py-0.5 font-mono text-xs">{pw}</code>
+    <span className="inline-flex items-center gap-1 whitespace-nowrap">
+      <code className="rounded bg-secondary px-1.5 py-0.5 font-mono text-xs">
+        {shown ? pw : "••••••••"}
+      </code>
+      <Button
+        size="sm"
+        variant="ghost"
+        className="size-7 p-0"
+        aria-label={`${participant.name} 비밀번호 ${shown ? "가리기" : "보기"}`}
+        onClick={() => setShown((v) => !v)}
+      >
+        {shown ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+      </Button>
       <Button
         size="sm"
         variant="ghost"
@@ -1556,7 +2143,7 @@ function PasswordCell({ participant }: { participant: Participant }) {
           void navigator.clipboard
             .writeText(pw)
             .then(() => toast.success("비밀번호를 복사했습니다."))
-            .catch(() => toast.error("복사에 실패했습니다. 값을 직접 선택해 복사해 주세요."));
+            .catch(() => toast.error("복사에 실패했습니다. 눈 모양 버튼으로 값을 확인해 주세요."));
         }}
       >
         <Copy className="size-3.5" />
@@ -1585,6 +2172,19 @@ function TagChips({ participant }: { participant: Participant }) {
 }
 
 function ParticipantsPage() {
+  const search = Route.useSearch();
+  const navigate = Route.useNavigate();
+  const tab = search.tab ?? "list";
+
+  /** URL 을 화면 상태의 원천으로 쓴다. 필터를 바꿔도 뒤로가기가 필터 이력을 삼키지 않게 replace. */
+  function patch(next: SearchPatch) {
+    void navigate({
+      to: "/admin/participants",
+      search: (prev) => patchSearch(prev, next),
+      replace: true,
+    });
+  }
+
   return (
     <div className="space-y-6">
       <div>
@@ -1594,13 +2194,16 @@ function ParticipantsPage() {
         </p>
       </div>
 
-      <Tabs defaultValue="list">
+      <Tabs
+        value={tab}
+        onValueChange={(v) => patch({ tab: v === "upload" ? "upload" : "list", p: undefined })}
+      >
         <TabsList className="grid w-full grid-cols-2 sm:w-auto">
           <TabsTrigger value="list">명단 · 계정</TabsTrigger>
           <TabsTrigger value="upload">명부 업로드</TabsTrigger>
         </TabsList>
         <TabsContent value="list" className="mt-4">
-          <RosterListTab />
+          <RosterListTab search={search} patch={patch} />
         </TabsContent>
         <TabsContent value="upload" className="mt-4">
           <RosterUploadTab />

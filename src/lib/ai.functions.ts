@@ -207,6 +207,16 @@ export const scanTypos = createServerFn({ method: "POST" })
     return { inserted: rows.length, suggestions: inserted ?? [] };
   });
 
+/**
+ * 부실 판정 기준 — 전체 스윕(detectPoorResponses)·단건 점검(checkResponseQuality)·
+ * 참여자 셀프 점검(selfCheckMyResponse)이 같은 기준으로 판단해야 한다.
+ * 세 곳에 따로 적어 두면 화면마다 다른 답이 나온다.
+ */
+const POOR_CRITERIA =
+  "너는 직무조사 응답의 품질을 판정하는 심사자다. 부실 판정 기준: " +
+  "①과업명이 명사 한 단어뿐이거나 「업무」「관리」처럼 내용이 없다 ②활동이 과업명과 사실상 같거나 서로 중복된다 " +
+  "③직무 정의·미션이 비었거나 한 줄 상투어다 ④과업이 3개 미만이다 ⑤복사·붙여넣기로 보이는 반복 문구가 있다.";
+
 export const detectPoorResponses = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => z.object({ companyId: optionalCompany }).parse(input ?? {}))
@@ -258,11 +268,7 @@ export const detectPoorResponses = createServerFn({ method: "POST" })
     const verdicts = await callLLMJson<
       { responseId: string; issues: string[]; rejectDraft: string }[]
     >({
-      system:
-        "너는 직무조사 응답의 품질을 판정하는 심사자다. 부실 판정 기준: " +
-        "①과업명이 명사 한 단어뿐이거나 「업무」「관리」처럼 내용이 없다 ②활동이 과업명과 사실상 같거나 서로 중복된다 " +
-        "③직무 정의·미션이 비었거나 한 줄 상투어다 ④과업이 3개 미만이다 ⑤복사·붙여넣기로 보이는 반복 문구가 있다. " +
-        "기준에 걸리지 않는 응답은 결과에 포함하지 않는다.",
+      system: `${POOR_CRITERIA} 기준에 걸리지 않는 응답은 결과에 포함하지 않는다.`,
       user:
         `${JSON.stringify(payload)}\n\n` +
         'JSON만 출력한다. 형식: [{"responseId":"...","issues":["근거 한 문장"],"rejectDraft":"응답자에게 보낼 반려 사유 초안(존댓말 2~3문장, 무엇을 어떻게 고쳐야 하는지 구체적으로)"}]',
@@ -324,11 +330,7 @@ export const selfCheckMyResponse = createServerFn({ method: "POST" })
     };
 
     const found = await callLLMJson<SelfCheckFinding[]>({
-      system:
-        "너는 직무조사 응답의 품질을 판정하는 심사자다. 부실 판정 기준: " +
-        "①과업명이 명사 한 단어뿐이거나 「업무」「관리」처럼 내용이 없다 ②활동이 과업명과 사실상 같거나 서로 중복된다 " +
-        "③직무 정의·미션이 비었거나 한 줄 상투어다 ④과업이 3개 미만이다 ⑤복사·붙여넣기로 보이는 반복 문구가 있다. " +
-        "기준에 걸리는 항목만 결과에 포함하고, 작성자 본인에게 직접 말하듯 존댓말로 보완 방법을 제안한다. 문제가 없으면 빈 배열을 반환한다.",
+      system: `${POOR_CRITERIA} 기준에 걸리는 항목만 결과에 포함하고, 작성자 본인에게 직접 말하듯 존댓말로 보완 방법을 제안한다. 문제가 없으면 빈 배열을 반환한다.`,
       user:
         `${JSON.stringify(payload)}\n\n` +
         'JSON만 출력한다. 형식: [{"item":"항목(예: 과업 2, 직무 정의)","reason":"부실로 본 근거 한 문장","suggestion":"어떻게 보완하면 되는지 한두 문장"}]',
@@ -339,6 +341,221 @@ export const selfCheckMyResponse = createServerFn({ method: "POST" })
       (f) => typeof f?.item === "string" && typeof f?.reason === "string",
     );
     return { findings };
+  });
+
+/**
+ * A2: 검토 화면에서 지금 보고 있는 응답 한 건만 점검한다.
+ * 전체 스윕(detectPoorResponses)은 목록을 훑는 용도라 한 건을 판단하는 자리에서는 과하다.
+ * 판정 기준·반려 초안 형식은 스윕과 동일하게 유지한다(POOR_CRITERIA).
+ */
+export const checkResponseQuality = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ responseId: uuid }).parse(input))
+  .handler(
+    async ({
+      data,
+      context,
+    }): Promise<{ issues: string[]; rejectDraft: string; suggestedStep: number }> => {
+      const { requireAdmin } = await import("@/lib/guard.server");
+      await requireAdmin(context.supabase, context.userId);
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { callLLMJson } = await import("@/lib/llm.server");
+
+      const { response, taskRows, activityRows } = await collectResponseText(
+        supabaseAdmin,
+        data.responseId,
+      );
+      const payload = {
+        jobName: response.job_name,
+        definition: response.definition,
+        mission: response.mission,
+        tasks: taskRows.map((t) => ({
+          name: t.name,
+          activities: activityRows.filter((a) => a.task_id === t.id).map((a) => a.name),
+        })),
+      };
+
+      const verdict = await callLLMJson<{
+        issues?: string[];
+        rejectDraft?: string;
+        step?: number;
+      }>({
+        system: `${POOR_CRITERIA} 기준에 걸리는 항목만 근거로 적고, 걸리는 것이 없으면 issues 를 빈 배열로 둔다.`,
+        user:
+          `${JSON.stringify(payload)}\n\n` +
+          'JSON만 출력한다. 형식: {"issues":["근거 한 문장"],"rejectDraft":"응답자에게 보낼 반려 사유 초안(존댓말 2~3문장, 무엇을 어떻게 고쳐야 하는지 구체적으로)","step":되돌릴 작성 단계 번호(3=정의·목적, 4=과업·활동, 5=스킬·요건)}',
+        maxTokens: 1024,
+      });
+
+      const issues = Array.isArray(verdict?.issues)
+        ? verdict.issues.filter((i): i is string => typeof i === "string")
+        : [];
+      const step = Number(verdict?.step);
+      return {
+        issues,
+        rejectDraft: typeof verdict?.rejectDraft === "string" ? verdict.rejectDraft : "",
+        // 단계를 못 받으면 과업·활동(4단계)로 되돌린다 — 부실 판정 대부분이 그 단계에서 생긴다.
+        suggestedStep: Number.isInteger(step) && step >= 1 && step <= 6 ? step : 4,
+      };
+    },
+  );
+
+/**
+ * A2: 관리자가 검토 화면에서 AI 제안 한 건을 수락·수정·거절한다.
+ *
+ * applySuggestion 은 '반영'만 할 수 있어 거절·수정이 없었고, 그래서 제안이 계속 남아
+ * 승인 게이트를 막았다. 응답자 결정(decideMySuggestion)과 같은 반영 경로
+ * (writeSuggestionValue)를 쓰되 소유자 검사 대신 관리자 가드를 적용한다.
+ */
+export const decideSuggestionAsAdmin = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        suggestionId: uuid,
+        decision: z.enum(["수락", "수정", "거절"]),
+        note: z.string().trim().max(2000).optional(),
+        editedValue: z.string().trim().max(4000).optional(),
+      })
+      .refine((v) => v.decision !== "수정" || !!v.editedValue, {
+        message: "수정 결정에는 수정한 내용이 필요합니다.",
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: s, error: loadError } = await supabaseAdmin
+      .from("ai_suggestions")
+      .select("id, response_id, target, suggested_value, ai_suggested_value, status")
+      .eq("id", data.suggestionId)
+      .maybeSingle();
+    if (loadError) throw new Error(loadError.message);
+    if (!s) throw new Error("제안을 찾을 수 없습니다.");
+    if (!["제안", "요청중", "수락", "수정"].includes(s.status)) {
+      throw new Error(`이미 처리된 제안입니다: ${s.status}`);
+    }
+
+    const now = new Date().toISOString();
+
+    if (data.decision === "거절") {
+      const { error } = await supabaseAdmin
+        .from("ai_suggestions")
+        .update({
+          status: "거절",
+          respondent_note: data.note ?? null,
+          decided_by: context.userId,
+          decided_at: now,
+        })
+        .eq("id", s.id);
+      if (error) throw new Error(error.message);
+
+      await writeAudit(supabaseAdmin, {
+        actor_id: context.userId,
+        action: "AI 제안 거절",
+        target_type: "ai_suggestion",
+        target_id: s.id,
+        detail: { target: s.target },
+      });
+      return { applied: false as const, target: s.target };
+    }
+
+    const value = data.decision === "수정" ? data.editedValue!.trim() : s.suggested_value;
+    await writeSuggestionValue(supabaseAdmin, { ...s, suggested_value: value });
+
+    const { error } = await supabaseAdmin
+      .from("ai_suggestions")
+      .update({
+        status: "확정",
+        suggested_value: value,
+        // 관리자가 고친 경우에도 AI 원문은 보존한다(무엇을 사람이 바꿨는지 남기기 위해).
+        ai_suggested_value:
+          data.decision === "수정"
+            ? (s.ai_suggested_value ?? s.suggested_value)
+            : s.ai_suggested_value,
+        respondent_note: data.note ?? null,
+        decided_by: context.userId,
+        decided_at: now,
+      })
+      .eq("id", s.id);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: data.decision === "수정" ? "AI 제안 수정 반영" : "AI 제안 반영",
+      target_type: "ai_suggestion",
+      target_id: s.id,
+      detail: { target: s.target },
+    });
+
+    return { applied: true as const, target: s.target };
+  });
+
+/**
+ * A2: /admin/ai 일괄 점검 화면용 — 미결 AI 제안을 응답 단위로 묶어 준다.
+ * 각 행에서 검토 화면(?response=)으로 넘어가 그 자리에서 판단하도록 만드는 것이 목적이다.
+ */
+export const listPendingSuggestions = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ companyId: optionalCompany }).parse(input ?? {}))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: rows, error } = await supabaseAdmin
+      .from("ai_suggestions")
+      .select(
+        "id, response_id, target, kind, route, status, created_at, responses(job_name, status, company_id, participants(name))",
+      )
+      .in("status", ["제안", "요청중"])
+      .order("created_at", { ascending: false })
+      .limit(500);
+    if (error) throw new Error(error.message);
+
+    type Row = NonNullable<typeof rows>[number];
+    const scoped = (rows ?? []).filter((r) => {
+      const res = r.responses as { company_id?: string | null } | null;
+      return !data.companyId || res?.company_id === data.companyId;
+    });
+
+    const groups = new Map<
+      string,
+      {
+        responseId: string;
+        name: string;
+        jobName: string;
+        responseStatus: string;
+        kinds: Record<string, number>;
+        total: number;
+        latest: string;
+      }
+    >();
+    for (const r of scoped as Row[]) {
+      const res = r.responses as {
+        job_name?: string | null;
+        status?: string | null;
+        participants?: { name?: string | null } | null;
+      } | null;
+      const key = r.response_id;
+      const g = groups.get(key) ?? {
+        responseId: key,
+        name: res?.participants?.name ?? "이름 미등록",
+        jobName: res?.job_name ?? "직무 미입력",
+        responseStatus: res?.status ?? "-",
+        kinds: {},
+        total: 0,
+        latest: r.created_at,
+      };
+      g.kinds[r.kind] = (g.kinds[r.kind] ?? 0) + 1;
+      g.total += 1;
+      if (Date.parse(r.created_at) > Date.parse(g.latest)) g.latest = r.created_at;
+      groups.set(key, g);
+    }
+
+    return { groups: [...groups.values()].sort((a, b) => b.total - a.total) };
   });
 
 export const draftMissingFields = createServerFn({ method: "POST" })

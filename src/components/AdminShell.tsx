@@ -25,6 +25,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { CommandPalette } from "@/components/admin/CommandPalette";
+import { OpsEvidenceBar } from "@/components/admin/OpsEvidenceBar";
+import { orgPathLabel, useOrgLens } from "@/components/admin/OrgTreeFilter";
 import { cn } from "@/lib/utils";
 
 type NavItem = {
@@ -32,18 +35,53 @@ type NavItem = {
   label: string;
   icon: typeof Users;
   exact?: boolean;
+  /** 검토 대기 건수를 배지로 붙인다. */
+  badge?: "review";
 };
 
-const NAV: NavItem[] = [
-  { to: "/admin", label: "대시보드", icon: LayoutDashboard, exact: true },
-  { to: "/admin/participants", label: "참여자 관리", icon: Users },
-  { to: "/admin/review", label: "응답 검토", icon: ClipboardCheck },
-  { to: "/admin/master", label: "마스터 관리", icon: Database },
-  { to: "/admin/mail", label: "메일 발송", icon: Mail },
-  { to: "/admin/ai", label: "AI 도구", icon: Sparkles },
-  { to: "/admin/settings", label: "설정", icon: Settings },
-  { to: "/admin/export", label: "내보내기", icon: Download },
+type NavGroup = {
+  /** 구획 이름. 없으면 최상단 단독 항목. */
+  label?: string;
+  items: NavItem[];
+};
+
+/**
+ * 메뉴는 조사 진행 순서다 (기획 A1).
+ *
+ * 평면 8개였을 때는 "지금 뭘 해야 하는지"가 메뉴에서 읽히지 않았다. 준비 → 수집 → 산출
+ * 순서로 묶고 이름을 업무 어휘로 바꿔서, 메뉴만 봐도 조사 한 바퀴가 보이게 한다.
+ */
+const NAV: NavGroup[] = [
+  { items: [{ to: "/admin", label: "진행 현황", icon: LayoutDashboard, exact: true }] },
+  {
+    label: "1 · 준비",
+    items: [
+      { to: "/admin/master", label: "조직·직무 기준정보", icon: Database },
+      { to: "/admin/participants", label: "참여자 명부", icon: Users },
+      { to: "/admin/settings", label: "조사 설정", icon: Settings },
+    ],
+  },
+  {
+    label: "2 · 수집",
+    items: [
+      { to: "/admin/mail", label: "안내·독려 메일", icon: Mail },
+      { to: "/admin/review", label: "응답 검토", icon: ClipboardCheck, badge: "review" },
+    ],
+  },
+  {
+    label: "3 · 산출",
+    items: [{ to: "/admin/export", label: "직무기술서·내보내기", icon: Download }],
+  },
 ];
+
+/** AI 점검은 응답 검토 화면으로 흡수되는 중이다. 그때까지 들어갈 길만 남겨 둔다. */
+const AI_TOOLS: NavItem = { to: "/admin/ai", label: "AI 일괄 점검", icon: Sparkles };
+
+/** 전역 찾기의 화면 이동 목록 — 메뉴와 어긋나지 않도록 NAV 에서 뽑는다. */
+const FLAT_SCREENS = [...NAV.flatMap((g) => g.items), AI_TOOLS].map((i) => ({
+  to: i.to,
+  label: i.label,
+}));
 
 export function AdminShell({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
@@ -51,6 +89,7 @@ export function AdminShell({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { companyId, setCompanyId } = useCompanyScope();
+  const { selectedOrgId, setSelectedOrgId } = useOrgLens();
 
   const { data: companies } = useQuery({
     queryKey: ["companies"],
@@ -64,6 +103,33 @@ export function AdminShell({ children }: { children: ReactNode }) {
     },
   });
 
+  // 헤더에 "지금 무엇을 보는 중인지" 표시하려면 선택한 소속의 경로 이름이 필요하다.
+  const { data: orgUnits } = useQuery({
+    queryKey: ["org-units-filter", companyId],
+    queryFn: async () => {
+      let query = supabase.from("org_units").select("id, parent_id, name, sort").order("sort");
+      if (companyId !== "all") query = query.eq("company_id", companyId);
+      const { data, error } = await query;
+      if (error) throw error;
+      return data ?? [];
+    },
+    enabled: Boolean(selectedOrgId),
+  });
+
+  const { data: reviewWaiting } = useQuery({
+    queryKey: ["review-waiting-count", companyId],
+    queryFn: async () => {
+      let query = supabase
+        .from("responses")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "submitted");
+      if (companyId !== "all") query = query.eq("company_id", companyId);
+      const { count, error } = await query;
+      if (error) throw error;
+      return count ?? 0;
+    },
+  });
+
   async function handleSignOut() {
     await queryClient.cancelQueries();
     queryClient.clear();
@@ -71,27 +137,71 @@ export function AdminShell({ children }: { children: ReactNode }) {
     navigate({ to: "/auth", replace: true });
   }
 
-  const nav = (
-    <nav className="space-y-1">
-      {NAV.map((item) => {
-        const active = item.exact ? pathname === item.to : pathname.startsWith(item.to);
-        return (
-          <Link
-            key={item.to}
-            to={item.to as never}
-            onClick={() => setOpen(false)}
-            className={cn(
-              "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
-              active
-                ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                : "text-sidebar-foreground hover:bg-secondary",
-            )}
+  /**
+   * 계열사를 바꾸면 소속 렌즈는 반드시 풀어야 한다. 다른 계열사의 조직을 그대로 물고 있으면
+   * 목록이 이유 없이 텅 비어 보인다 — 침묵 실패(기획 P8).
+   */
+  function handleCompanyChange(next: string) {
+    if (next !== companyId) setSelectedOrgId(null);
+    setCompanyId(next);
+  }
+
+  const lensLabel = selectedOrgId ? orgPathLabel(orgUnits ?? [], selectedOrgId) : null;
+
+  function NavLink({ item }: { item: NavItem }) {
+    const active = item.exact ? pathname === item.to : pathname.startsWith(item.to);
+    const badge = item.badge === "review" ? reviewWaiting : undefined;
+    return (
+      <Link
+        to={item.to as never}
+        onClick={() => setOpen(false)}
+        className={cn(
+          "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
+          active
+            ? "bg-sidebar-accent text-sidebar-accent-foreground"
+            : "text-sidebar-foreground hover:bg-secondary",
+        )}
+      >
+        <item.icon className="size-4 shrink-0" />
+        <span className="min-w-0 flex-1 truncate">{item.label}</span>
+        {badge ? (
+          <span
+            className="shrink-0 rounded-full bg-warning/20 px-1.5 py-0.5 text-xs font-semibold tabular-nums text-warning"
+            title={`검토 대기 ${badge}건`}
           >
-            <item.icon className="size-4" />
-            {item.label}
-          </Link>
-        );
-      })}
+            {badge}
+          </span>
+        ) : null}
+      </Link>
+    );
+  }
+
+  const nav = (
+    <nav className="space-y-4">
+      {NAV.map((group, gi) => (
+        <div key={group.label ?? `top-${gi}`} className="space-y-1">
+          {group.label ? (
+            <p className="px-3 pb-0.5 text-xs font-semibold text-muted-foreground">{group.label}</p>
+          ) : null}
+          {group.items.map((item) => (
+            <NavLink key={item.to} item={item} />
+          ))}
+        </div>
+      ))}
+
+      <div className="border-t pt-3">
+        <Link
+          to={AI_TOOLS.to as never}
+          onClick={() => setOpen(false)}
+          className={cn(
+            "flex items-center gap-2 rounded-lg px-3 py-2 text-xs transition-colors hover:bg-secondary",
+            pathname.startsWith(AI_TOOLS.to) ? "text-accent-foreground" : "text-muted-foreground",
+          )}
+        >
+          <AI_TOOLS.icon className="size-3.5 shrink-0" />
+          {AI_TOOLS.label}
+        </Link>
+      </div>
     </nav>
   );
 
@@ -113,8 +223,9 @@ export function AdminShell({ children }: { children: ReactNode }) {
             <p className="truncate text-sm font-bold sm:text-base">서연 그룹 업무조사</p>
           </div>
           <div className="flex items-center gap-2">
+            <CommandPalette screens={FLAT_SCREENS} />
             <Building2 className="hidden size-4 text-muted-foreground sm:block" />
-            <Select value={companyId} onValueChange={setCompanyId}>
+            <Select value={companyId} onValueChange={handleCompanyChange}>
               <SelectTrigger className="w-[130px] sm:w-[170px]" aria-label="계열사 전환">
                 <SelectValue placeholder="계열사 전환" />
               </SelectTrigger>
@@ -127,27 +238,42 @@ export function AdminShell({ children }: { children: ReactNode }) {
                 ))}
               </SelectContent>
             </Select>
+            {lensLabel ? (
+              <button
+                type="button"
+                onClick={() => setSelectedOrgId(null)}
+                title="이 소속만 보는 상태입니다. 눌러서 전체로 돌아갑니다."
+                className="hidden max-w-[220px] items-center gap-1 rounded-full border bg-primary-soft px-2.5 py-1 text-xs font-medium text-accent-foreground hover:opacity-80 sm:inline-flex"
+              >
+                <span className="truncate">{lensLabel}</span>
+                <X className="size-3 shrink-0" aria-hidden />
+              </button>
+            ) : null}
             <Button variant="ghost" size="icon" aria-label="로그아웃" onClick={handleSignOut}>
               <LogOut className="size-4" />
             </Button>
           </div>
         </div>
+        <OpsEvidenceBar />
       </header>
 
+      {/* 아래 97px·93px 은 헤더(제목줄 61px + 운영 증거 바 36px) 높이다. 헤더 구성이 바뀌면 함께 고친다. */}
       <div className="mx-auto flex w-full max-w-[1400px]">
-        <aside className="sticky top-[61px] hidden h-[calc(100vh-61px)] w-60 shrink-0 border-r bg-sidebar p-4 lg:block">
+        <aside className="sticky top-[97px] hidden h-[calc(100vh-97px)] w-60 shrink-0 overflow-y-auto border-r bg-sidebar p-4 lg:block">
           {nav}
         </aside>
 
         {open && (
-          <div className="fixed inset-0 top-[57px] z-20 lg:hidden">
+          <div className="fixed inset-0 top-[93px] z-20 lg:hidden">
             <button
               type="button"
               aria-label="메뉴 닫기"
               className="absolute inset-0 bg-foreground/30"
               onClick={() => setOpen(false)}
             />
-            <div className="relative h-full w-64 max-w-[80vw] border-r bg-sidebar p-4">{nav}</div>
+            <div className="relative h-full w-64 max-w-[80vw] overflow-y-auto border-r bg-sidebar p-4">
+              {nav}
+            </div>
           </div>
         )}
 

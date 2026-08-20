@@ -5,7 +5,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { Database, Json } from "@/integrations/supabase/types";
 import { CUSTOM } from "@/components/survey/RequirementsForm";
-import type { ExampleLibRow } from "@/components/survey/TaskGrid";
+import type { ExampleLibRow } from "@/components/survey/ExamplePopover";
 import type {
   Authority,
   Education,
@@ -14,6 +14,7 @@ import type {
   Ksao,
   LanguageItem,
   LicenseItem,
+  NotApplicable,
   RequirementsValue,
   SkillItem,
   TaskItem,
@@ -42,7 +43,22 @@ export const EMPTY_REQUIREMENTS: RequirementsValue = {
   languages: [],
   trainings: "",
   proficiency: "",
+  licensesNa: null,
+  languagesNa: null,
 };
+
+/**
+ * 「해당 없음」 표식은 기존 jsonb 배열의 원소로 저장한다 (기획 C5).
+ * 표식이 들어 있으면 그 목록은 비어 있는 것으로 읽는다 — 새 컬럼 없이 판단 여부만 구분한다.
+ */
+function splitNotApplicable<T>(raw: unknown): { mark: NotApplicable | null; items: T[] } {
+  const arr = Array.isArray(raw) ? raw : [];
+  const mark = arr.find(
+    (x) => typeof x === "object" && x !== null && (x as { na?: unknown }).na === true,
+  ) as { reason?: unknown } | undefined;
+  if (!mark) return { mark: null, items: arr as T[] };
+  return { mark: { na: true, reason: String(mark.reason ?? "") }, items: [] };
+}
 
 export const COVERAGE_OPTIONS = [
   { value: "0-25", label: "0~25% — 실제 직무의 일부만 담겼다" },
@@ -139,15 +155,19 @@ export async function loadFull(responseId: string): Promise<FullResponse> {
   }));
 
   const r = reqRes.data;
+  const lic = splitNotApplicable<LicenseItem>(r?.licenses);
+  const lang = splitNotApplicable<LanguageItem>(r?.languages);
   const requirements: RequirementsValue = r
     ? {
         education: r.education as Education | null,
         majorsRequired: r.majors_required ?? "",
         majorsPreferred: r.majors_preferred ?? "",
-        licenses: (r.licenses as unknown as LicenseItem[]) ?? [],
-        languages: (r.languages as unknown as LanguageItem[]) ?? [],
+        licenses: lic.items,
+        languages: lang.items,
         trainings: r.trainings ?? "",
         proficiency: r.proficiency ?? "",
+        licensesNa: lic.mark,
+        languagesNa: lang.mark,
       }
     : EMPTY_REQUIREMENTS;
 
@@ -250,6 +270,9 @@ export async function saveRequirements(responseId: string, value: RequirementsVa
   // "직접 입력"은 Select 표식일 뿐 실제 값이 아니다 — 옆 칸을 안 채웠으면 빈 값으로 저장한다.
   const dropMarker = (raw: string) => (raw.trim() === CUSTOM ? "" : raw.trim());
   const languages = value.languages.map((l) => ({ ...l, level: dropMarker(l.level) }));
+  // 「해당 없음」이면 목록 대신 표식 하나만 저장한다 (기획 C5).
+  const licenseJson = value.licensesNa ? [value.licensesNa] : value.licenses;
+  const languageJson = value.languagesNa ? [value.languagesNa] : languages;
 
   const { error } = await supabase.from("response_requirements").upsert(
     {
@@ -257,8 +280,8 @@ export async function saveRequirements(responseId: string, value: RequirementsVa
       education: value.education,
       majors_required: value.majorsRequired || null,
       majors_preferred: value.majorsPreferred || null,
-      licenses: value.licenses as unknown as Json,
-      languages: languages as unknown as Json,
+      licenses: licenseJson as unknown as Json,
+      languages: languageJson as unknown as Json,
       trainings: value.trainings || null,
       proficiency: dropMarker(value.proficiency) || null,
     },

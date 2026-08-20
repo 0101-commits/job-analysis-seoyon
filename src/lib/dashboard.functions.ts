@@ -5,6 +5,7 @@ import { createServerFn } from "@tanstack/react-start";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { DEFAULT_ROLE_LEVELS } from "@/lib/settings.functions";
+import { fetchAll } from "./paginate";
 
 /**
  * participants.org_unit_id / survey_settings.stale_days / example_library.job_group_key 는
@@ -349,5 +350,108 @@ export const getLaunchReadiness = createServerFn({ method: "GET" })
     return {
       ready: items.every((i) => i.ok),
       items: items.map((i) => ({ ...i, hint: i.ok ? null : i.hint })),
+    };
+  });
+
+/* ───────────────────── 알림 카드의 근거 원천 (기획 B2·B8) ───────────────────── */
+
+/**
+ * SignalCard 는 신호·근거·행동 셋을 다 채워야 렌더된다. 근거에 들어갈 「기준 시점」과
+ * 「모수」를 화면이 스스로 만들 수 없으므로, 판단에 필요한 원천 행을 여기서 모아 준다.
+ * 조직·회사 스코프 계산은 참여자 행을 이미 들고 있는 화면이 담당한다(getOrgOverview 와 같은 분업).
+ */
+export type SignalResponse = {
+  id: string;
+  participant_id: string;
+  status: string;
+  submitted_at: string | null;
+  reviewed_at: string | null;
+};
+
+export type DashboardSignals = {
+  /** 이 집계의 기준 시점(ISO). 카드마다 「기준 …」으로 표시한다. */
+  asOf: string;
+  responses: SignalResponse[];
+  /**
+   * 미확정 AI 초안이 남아 승인이 막힌 제출 응답 id.
+   * 판정 조건은 approveResponse 의 게이트 1(response_skills/requirements.ai_draft)과 같다.
+   */
+  aiBlockedResponseIds: string[];
+  /** 발송 실패 로그 — 최근 것부터. */
+  failedMails: { id: string; participant_id: string | null; sent_at: string }[];
+  /** 제출 → 검토 처리(승인·반려) 평균 소요일. 처리 이력이 없으면 null. */
+  reviewTurnaroundDays: number | null;
+};
+
+export const getDashboardSignals = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<DashboardSignals> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const admin = untyped(supabaseAdmin);
+
+    const [responses, draftSkills, draftRequirements, failedMails] = await Promise.all([
+      fetchAll<SignalResponse>((from, to) =>
+        admin
+          .from("responses")
+          .select("id, participant_id, status, submitted_at, reviewed_at")
+          .order("id")
+          .range(from, to),
+      ),
+      fetchAll<{ response_id: string }>((from, to) =>
+        admin
+          .from("response_skills")
+          .select("response_id")
+          .eq("ai_draft", true)
+          .order("response_id")
+          .range(from, to),
+      ),
+      fetchAll<{ response_id: string }>((from, to) =>
+        admin
+          .from("response_requirements")
+          .select("response_id")
+          .eq("ai_draft", true)
+          .order("response_id")
+          .range(from, to),
+      ),
+      fetchAll<{ id: string; participant_id: string | null; sent_at: string }>((from, to) =>
+        admin
+          .from("mail_logs")
+          .select("id, participant_id, sent_at")
+          .eq("status", "실패")
+          .order("sent_at", { ascending: false })
+          .order("id")
+          .range(from, to),
+      ),
+    ]);
+
+    // 승인 게이트는 제출 상태에서만 의미가 있다. 초안·반려 건의 AI 초안은 아직 막는 것이 없다.
+    const submittedIds = new Set(
+      responses.filter((r) => r.status === "submitted").map((r) => r.id),
+    );
+    const aiBlocked = new Set<string>();
+    for (const row of [...draftSkills, ...draftRequirements]) {
+      if (submittedIds.has(row.response_id)) aiBlocked.add(row.response_id);
+    }
+
+    // 평균 검토 소요일 — 「이 건이 오래 걸렸다」를 말하려면 비교 기준이 있어야 한다.
+    let elapsedSum = 0;
+    let elapsedCount = 0;
+    for (const r of responses) {
+      if (!r.submitted_at || !r.reviewed_at) continue;
+      const days = (Date.parse(r.reviewed_at) - Date.parse(r.submitted_at)) / 86_400_000;
+      if (days < 0) continue;
+      elapsedSum += days;
+      elapsedCount += 1;
+    }
+
+    return {
+      asOf: new Date().toISOString(),
+      responses,
+      aiBlockedResponseIds: [...aiBlocked],
+      failedMails,
+      reviewTurnaroundDays:
+        elapsedCount > 0 ? Math.round((elapsedSum / elapsedCount) * 10) / 10 : null,
     };
   });

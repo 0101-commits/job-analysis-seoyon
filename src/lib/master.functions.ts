@@ -630,7 +630,7 @@ export const uploadJobCatalog = createServerFn({ method: "POST" })
         .from("job_catalog_versions")
         .insert({
           label: autoVersionLabel(data.source === "ai_draft" ? "AI 가안 반영 전" : "업로드 교체 전"),
-          note: scoped ? "계열사 범위 교체 전 전체 스냅샷" : null,
+          note: scoped ? "계열사 범위 교체 전 전체 시점 저장본" : null,
           rows: fullSnapshot,
           created_by: context.userId,
         });
@@ -997,11 +997,19 @@ function topCounts(values: (string | null)[], limit: number) {
     .join(", ");
 }
 
+/**
+ * 「AI 응답 … 실패」 계열 오류(응답이 잘려 읽어들이지 못한 경우)인지 판정한다.
+ * 문구(라벨)는 화면 용어 정리로 바뀔 수 있어 특정 낱말이 아니라 형태로 본다 —
+ * llm.server 의 throw 문구가 바뀌어도 아래 재시도 분기가 함께 깨지지 않게 하기 위함이다.
+ * 「AI 프록시 호출 실패」(네트워크·설정 오류)는 재시도해도 소용이 없어 일부러 제외한다.
+ */
+const READ_FAIL = /^AI 응답 .*실패/;
+
 /** AI 오류 원문은 콘솔에만 남기고, 사용자에게는 조치 가능한 문구로 바꾼다. */
 function friendlyAiError(err: unknown, tag = "draftJobCatalog"): Error {
   console.error(`[${tag}]`, err);
   const message = err instanceof Error ? err.message : String(err);
-  if (message.includes("파싱 실패")) {
+  if (READ_FAIL.test(message)) {
     return new Error("AI 응답이 중간에 끊겼습니다 — 실패한 직군만 다시 생성해 주세요");
   }
   if (message.includes("429") || message.includes("네트워크")) {
@@ -1116,7 +1124,7 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
       'JSON 형식: [{"job_series":"직렬명","job_name":"직무명","definition":"정의 한 문장"}]';
 
     // max_tokens 2048 안에 전체 직무를 다 담을 수 없어 직군 단위로 나눠 병렬 호출한다.
-    // 파싱 실패(응답 잘림)면 그 직군을 직렬 단위로 쪼개 1회 자동 재시도한다.
+    // 읽어들이기 실패(응답 잘림)면 그 직군을 직렬 단위로 쪼개 1회 자동 재시도한다.
     const settled = await Promise.allSettled(
       groups.map(async (group) => {
         let items: DetailItem[];
@@ -1129,7 +1137,7 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
           items = Array.isArray(parsed) ? parsed : [];
         } catch (err) {
           const message = err instanceof Error ? err.message : "";
-          if (!message.includes("파싱 실패")) throw err;
+          if (!READ_FAIL.test(message)) throw err;
           const parts = await Promise.all(
             group.job_series.map((series) =>
               callLLMJson<DetailItem[]>({
@@ -1440,7 +1448,7 @@ export const draftDutyCharts = createServerFn({ method: "POST" })
           if (details.length === 0) rows.push({ main, detail: "" });
           for (const detail of details) rows.push({ main, detail });
         }
-        if (rows.length === 0) throw new Error("AI 응답 파싱 실패: 업무 항목이 비어 있습니다.");
+        if (rows.length === 0) throw new Error("AI 응답 읽어들이기 실패: 업무 항목이 비어 있습니다.");
         return {
           orgId: org.id,
           orgName: org.name,
@@ -1640,6 +1648,39 @@ function personLabel(p: { name?: string | null; emp_no?: string | null } | null)
   return `${p?.name ?? "?"}(${p?.emp_no ?? "-"})`;
 }
 
+type OrgSubtree = { unit: { id: string; name: string; company_id: string }; ids: string[] };
+
+/** 대상 조직 + 하위 조직 전체의 id. 대상이 없으면 null. */
+async function orgSubtree(loose: SupabaseClient, id: string): Promise<OrgSubtree | null> {
+  const { data: unit } = await loose
+    .from("org_units")
+    .select("id, name, company_id")
+    .eq("id", id)
+    .maybeSingle();
+  const target = unit as OrgSubtree["unit"] | null;
+  if (!target) return null;
+
+  const { data: all } = await loose
+    .from("org_units")
+    .select("id, parent_id")
+    .eq("company_id", target.company_id);
+  const byParent = new Map<string, string[]>();
+  for (const row of (all ?? []) as { id: string; parent_id: string | null }[]) {
+    if (!row.parent_id) continue;
+    const list = byParent.get(row.parent_id);
+    if (list) list.push(row.id);
+    else byParent.set(row.parent_id, [row.id]);
+  }
+  const ids: string[] = [];
+  const queue = [target.id];
+  while (queue.length > 0) {
+    const cursor = queue.pop()!;
+    ids.push(cursor);
+    queue.push(...(byParent.get(cursor) ?? []));
+  }
+  return { unit: target, ids };
+}
+
 export const previewImpact = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
@@ -1659,37 +1700,14 @@ export const previewImpact = createServerFn({ method: "POST" })
     const none: ImpactPreview = { count: 0, summary: "", samples: [] };
 
     if (data.kind === "org_rename" || data.kind === "org_move" || data.kind === "org_delete") {
-      const { data: unit } = await supabaseAdmin
-        .from("org_units")
-        .select("id, name, company_id")
-        .eq("id", data.id)
-        .maybeSingle();
-      if (!unit) return none;
-
       // 하위 조직까지 포함해 배정 참여자를 센다.
-      const { data: all } = await supabaseAdmin
-        .from("org_units")
-        .select("id, parent_id")
-        .eq("company_id", unit.company_id);
-      const byParent = new Map<string, string[]>();
-      for (const row of all ?? []) {
-        if (!row.parent_id) continue;
-        const list = byParent.get(row.parent_id);
-        if (list) list.push(row.id);
-        else byParent.set(row.parent_id, [row.id]);
-      }
-      const ids: string[] = [];
-      const queue = [unit.id];
-      while (queue.length > 0) {
-        const cursor = queue.pop()!;
-        ids.push(cursor);
-        queue.push(...(byParent.get(cursor) ?? []));
-      }
+      const tree = await orgSubtree(loose, data.id);
+      if (!tree) return none;
 
       const { data: members, count } = await loose
         .from("participants")
         .select("name, emp_no", { count: "exact" })
-        .in("org_unit_id", ids)
+        .in("org_unit_id", tree.ids)
         .limit(SAMPLE_LIMIT);
       const n = count ?? 0;
       if (n === 0) return none;
@@ -1781,6 +1799,226 @@ export const previewImpact = createServerFn({ method: "POST" })
       summary: `역할단계 「${data.id}」 를 쓰는 참여자 ${n}명이 영향을 받습니다.`,
       samples: ((hits ?? []) as { name: string | null; emp_no: string | null }[]).map(personLabel),
     };
+  });
+
+/* ─────────────── 변경 영향 인스펙터 (B5) ─────────────── */
+
+/**
+ * previewImpact 는 「몇 명 · 표본」만 주는 확인 다이얼로그용이다. 편집 화면 옆에 상시 띄우는
+ * 인스펙터에는 그것으로 부족하다 — 같은 변경이라도 이미 제출한 사람과 아직 시작하지 않은 사람은
+ * 감당해야 할 일의 크기가 다르다. 그래서 진행 상태별로 나눠 집계한다 (기획 P11).
+ */
+export type ImpactStage = "submitted" | "drafting" | "notStarted";
+
+export type ImpactStageGroup = {
+  stage: ImpactStage;
+  label: string;
+  count: number;
+  /** 화면에 펼쳐 보여줄 명단. 이보다 많으면 「외 n명」으로 안내한다. */
+  people: string[];
+};
+
+export type ImpactAudience = {
+  /** 변경 대상 이름(조직명·직무명·버전 라벨). 대상을 못 찾으면 빈 문자열. */
+  target: string;
+  total: number;
+  stages: ImpactStageGroup[];
+  /** 저장 후 배너 고지에 쓸 참여자 id. */
+  ids: string[];
+  /** 집계 기준 시점 — SignalCard 의 asOf 에 그대로 쓴다. */
+  asOf: string;
+  /** 상한에 걸려 집계·명단이 잘렸는지. */
+  truncated: boolean;
+};
+
+/** 한 번에 집계·고지하는 인원 상한. */
+const AUDIENCE_LIMIT = 2000;
+/** 상태별로 화면에 이름을 몇 개까지 내려보낼지. */
+const PEOPLE_SHOWN = 40;
+
+/** participants.account_status → 진행 단계. 반려는 다시 손봐야 하므로 작성 중으로 본다. */
+const STAGE_OF: Record<string, ImpactStage> = {
+  제출: "submitted",
+  승인: "submitted",
+  작성중: "drafting",
+  반려: "drafting",
+  미발송: "notStarted",
+  초대발송: "notStarted",
+  미접속: "notStarted",
+};
+
+const STAGE_LABEL: Record<ImpactStage, string> = {
+  submitted: "이미 제출한 인원",
+  drafting: "지금 작성 중인 인원",
+  notStarted: "아직 시작하지 않은 인원",
+};
+
+type AudienceRow = {
+  id: string;
+  name: string | null;
+  emp_no: string | null;
+  account_status: string | null;
+};
+
+const PEOPLE_COLUMNS = "id, name, emp_no, account_status";
+
+/** 같은 사람이 여러 응답으로 겹칠 수 있어 id 로 접는다. 모르는 계정상태는 미시작으로 센다. */
+function buildAudience(target: string, rows: AudienceRow[]): ImpactAudience {
+  const seen = new Map<string, AudienceRow>();
+  for (const row of rows) {
+    if (row?.id && !seen.has(row.id)) seen.set(row.id, row);
+  }
+  const stages: ImpactStageGroup[] = (["submitted", "drafting", "notStarted"] as const).map(
+    (stage) => ({ stage, label: STAGE_LABEL[stage], count: 0, people: [] }),
+  );
+  for (const row of seen.values()) {
+    const stage = STAGE_OF[(row.account_status ?? "").trim()] ?? "notStarted";
+    const group = stages.find((g) => g.stage === stage)!;
+    group.count += 1;
+    if (group.people.length < PEOPLE_SHOWN) group.people.push(personLabel(row));
+  }
+  return {
+    target,
+    total: seen.size,
+    stages,
+    ids: [...seen.keys()],
+    asOf: new Date().toISOString(),
+    truncated: rows.length >= AUDIENCE_LIMIT,
+  };
+}
+
+/** 해당 직무명으로 작성된 응답의 작성자들. */
+async function responseAudience(loose: SupabaseClient, jobNames: string[]): Promise<AudienceRow[]> {
+  const { data } = await loose
+    .from("responses")
+    .select(`participants(${PEOPLE_COLUMNS})`)
+    .in("job_name", jobNames)
+    .limit(AUDIENCE_LIMIT);
+  return ((data ?? []) as unknown as { participants: AudienceRow | null }[])
+    .map((row) => row.participants)
+    .filter((p): p is AudienceRow => p !== null);
+}
+
+export const inspectImpact = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        kind: z.enum(IMPACT_KINDS),
+        id: z.string().trim().min(1).max(200),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }): Promise<ImpactAudience> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const loose = untyped(supabaseAdmin);
+
+    if (data.kind === "org_rename" || data.kind === "org_move" || data.kind === "org_delete") {
+      const tree = await orgSubtree(loose, data.id);
+      if (!tree) return buildAudience("", []);
+      // 고지 대상이 될 사람만 센다 — 보관 처리된 계정·관리자는 이 변경으로 할 일이 없다.
+      const { data: rows } = await loose
+        .from("participants")
+        .select(PEOPLE_COLUMNS)
+        .eq("role", "respondent")
+        .is("archived_at", null)
+        .in("org_unit_id", tree.ids)
+        .limit(AUDIENCE_LIMIT);
+      return buildAudience(tree.unit.name, (rows ?? []) as AudienceRow[]);
+    }
+
+    if (data.kind === "catalog_row_update" || data.kind === "catalog_row_delete") {
+      const { data: row } = await supabaseAdmin
+        .from("job_catalog")
+        .select("job_name")
+        .eq("id", data.id)
+        .maybeSingle();
+      if (!row) return buildAudience("", []);
+      return buildAudience(row.job_name, await responseAudience(loose, [row.job_name]));
+    }
+
+    if (data.kind === "catalog_restore") {
+      const { data: version } = await loose
+        .from("job_catalog_versions")
+        .select("label, rows")
+        .eq("id", data.id)
+        .maybeSingle();
+      if (!version) return buildAudience("", []);
+      const label = String((version as { label?: string }).label ?? "");
+      const verRows = (Array.isArray((version as { rows?: unknown }).rows)
+        ? (version as { rows: unknown[] }).rows
+        : []) as CatalogRowLike[];
+      const verNames = new Set(verRows.map((r) => String(r.job_name ?? "")).filter(Boolean));
+      const { data: current } = await supabaseAdmin.from("job_catalog").select("job_name");
+      const removed = [
+        ...new Set((current ?? []).map((c) => c.job_name).filter((name) => !verNames.has(name))),
+      ];
+      if (removed.length === 0) return buildAudience(label, []);
+      return buildAudience(label, await responseAudience(loose, removed));
+    }
+
+    // role_level_delete — 설정 화면이 쓰는 종류. 여기서도 같은 규격으로 답한다.
+    const { data: rows } = await loose
+      .from("participants")
+      .select(PEOPLE_COLUMNS)
+      .eq("role_level", data.id)
+      .is("archived_at", null)
+      .limit(AUDIENCE_LIMIT);
+    return buildAudience(data.id, (rows ?? []) as AudienceRow[]);
+  });
+
+/** 배너가 라벨을 아는 필드만 고지에 쓴다 (survey.data 의 INFO_FIELDS · InfoChangeBanner). */
+const NOTICE_FIELDS = ["org_text", "job_name", "role_level"] as const;
+
+/**
+ * 마스터 변경 고지 예약 (B5).
+ *
+ * 새 테이블을 만들지 않는다. 참여자 배너(InfoChangeBanner)는 audit_logs 의 「참여자 수정」 기록을
+ * getMyInfoChanges 로 읽어 대상자가 다음 접속 때 한 번 보게 되어 있으므로, 영향 인원마다 그 기록을
+ * 남기면 그것이 곧 예약된 고지다. detail.source 로 마스터 변경에서 온 것임을 남겨 감사 기록에서
+ * 개별 참여자 수정과 구분한다.
+ */
+export const notifyImpacted = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        participantIds: z.array(z.string().uuid()).min(1).max(AUDIENCE_LIMIT),
+        field: z.enum(NOTICE_FIELDS),
+        /** 배너에 남길 한 줄 — 무엇이 바뀌었는지. */
+        note: z.string().trim().min(1).max(200),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }): Promise<{ notified: number }> => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const ids = [...new Set(data.participantIds)];
+    const { error } = await untyped(supabaseAdmin)
+      .from("audit_logs")
+      .insert(
+        ids.map((id) => ({
+          actor_id: context.userId,
+          action: "참여자 수정",
+          target_type: "participants",
+          target_id: id,
+          detail: { changed: { [data.field]: data.note }, source: "마스터 변경 고지" },
+        })),
+      );
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "마스터 변경 고지",
+      target_type: "participants",
+      detail: { count: ids.length, field: data.field, note: data.note },
+    });
+
+    return { notified: ids.length };
   });
 
 /* ───────────────────────────── 현황 ───────────────────────────── */

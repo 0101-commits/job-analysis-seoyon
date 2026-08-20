@@ -1,13 +1,21 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, useNavigate, Link } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CalendarClock, CheckCircle2, FileText, LogOut } from "lucide-react";
+import { CalendarClock, Check, LogOut } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/StatusBadge";
-import { getLatestReject } from "@/lib/survey.data";
+import { SignalCard, type SignalAction } from "@/components/SignalCard";
+import { getLatestReject, loadFull } from "@/lib/survey.data";
 import { decideMySuggestion } from "@/lib/ai.functions";
+import {
+  SURVEY_STEP_LABELS,
+  findFocusFields,
+  focusLabel,
+  focusSearch,
+} from "@/lib/survey.focus";
 import { InfoChangeBanner } from "@/components/survey/InfoChangeBanner";
+import { SubmissionSummary, type SubmissionSummaryProps } from "@/components/survey/SubmissionSummary";
 import {
   AiSuggestionCards,
   type AiSuggestionItem,
@@ -32,6 +40,13 @@ function daysUntil(deadline: string) {
   return Math.round((new Date(`${deadline}T00:00:00`).getTime() - today.getTime()) / 86_400_000);
 }
 
+/**
+ * 참여자 홈 (기획 H1).
+ *
+ * 이 화면의 주인공은 "지금 내가 할 일" 하나다. 상태·마감·진행률을 나란히 늘어놓으면
+ * 무엇부터 눌러야 하는지가 사라진다 — 주행동 하나를 맨 위에 크게 두고, 나머지는
+ * 그 판단의 근거로만 아래에 붙인다. 화면에 보이는 것은 전부 그 대상으로 가는 링크다 (P6).
+ */
 function RespondentHome() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -60,7 +75,9 @@ function RespondentHome() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("responses")
-        .select("id, status, current_step, onboarding_done")
+        .select(
+          "id, status, current_step, onboarding_done, submitted_at, job_group, job_series, job_name, definition, mission",
+        )
         .limit(1)
         .maybeSingle();
       if (error) throw error;
@@ -75,13 +92,22 @@ function RespondentHome() {
     enabled: response?.status === "rejected" && !!response?.id,
   });
 
+  const finished = response?.status === "submitted" || response?.status === "approved";
+
+  // 제출을 마친 뒤에는 "무엇을 냈는지" 가 홈의 본문이 된다.
+  const { data: full } = useQuery({
+    queryKey: ["my-submission-detail", response?.id],
+    queryFn: () => loadFull(response!.id),
+    enabled: finished && !!response?.id,
+  });
+
   // RLS 상 본인 응답의 '요청중' 제안만 조회된다.
   const { data: suggestions } = useQuery({
     queryKey: ["my-ai-suggestions"],
     queryFn: async () => {
       const { data, error } = await supabase
         .from("ai_suggestions")
-        .select("id, target, original_value, suggested_value, kind, status")
+        .select("id, target, original_value, suggested_value, kind, status, created_at")
         .eq("status", "요청중")
         .order("created_at");
       if (error) throw error;
@@ -121,46 +147,107 @@ function RespondentHome() {
   const deadline = data?.companies?.survey_settings?.deadline ?? null;
   const dday = deadline ? daysUntil(deadline) : null;
 
-  const surveyTarget = response?.onboarding_done ? "/survey" : "/onboarding";
+  const currentStep = Math.min(Math.max(response?.current_step ?? 1, 1), SURVEY_STEP_LABELS.length);
   const rejectStep = reject?.step ?? null;
-  const { surveyLabel, surveyMessage, surveyAction } = (() => {
-    switch (response?.status) {
+
+  /** 단계·항목까지 실어 작성 화면을 연다. 규약은 @/lib/survey.focus 참조. */
+  const goTo = (field: string | null, fallbackStep: number) => {
+    void navigate({ to: "/survey", search: focusSearch(field, fallbackStep) });
+  };
+
+  // 지금 눌러야 할 것 하나. 상태마다 문구도 버튼도 달라진다.
+  const next = (() => {
+    if (!response || !response.onboarding_done) {
+      return {
+        title: "업무조사를 시작해 주세요",
+        description:
+          "담당 직무의 과업과 필요 역량을 6단계로 작성합니다. 처음이라면 안내 5장을 먼저 보시면 훨씬 수월합니다.",
+        label: "안내 보고 시작하기",
+        onClick: () => void navigate({ to: "/onboarding" }),
+      };
+    }
+    switch (response.status) {
       case "submitted":
         return {
-          surveyLabel: "제출 완료 (검토 중)",
-          surveyMessage: "제출해 주셔서 감사합니다. 관리자 검토 결과를 기다리고 있습니다.",
-          surveyAction: null,
+          title: "제출을 마쳤습니다",
+          description:
+            "관리자가 확인하고 있습니다. 보완이 필요하면 이 화면과 메일로 알려 드립니다. 아래에서 제출한 내용을 다시 볼 수 있습니다.",
+          label: null,
+          onClick: null,
         };
       case "approved":
         return {
-          surveyLabel: "승인 완료",
-          surveyMessage: "작성하신 업무조사가 승인되었습니다. 더 이상 수정할 수 없습니다.",
-          surveyAction: null,
+          title: "작성이 끝났습니다",
+          description:
+            "검토가 끝나 확정되었습니다. 더 이상 수정할 수 없으며, 아래에서 제출한 내용을 볼 수 있습니다.",
+          label: null,
+          onClick: null,
         };
       case "rejected":
         return {
-          surveyLabel:
-            rejectStep && surveyTarget === "/survey"
-              ? `${rejectStep}단계부터 보완하기`
-              : "반려됨 — 수정하러 가기",
-          surveyMessage: "제출한 응답이 반려되었습니다. 아래 사유를 확인하고 보완해 주세요.",
-          surveyAction: surveyTarget,
-        };
-      case "draft":
-        return {
-          surveyLabel: "이어서 작성하기",
-          surveyMessage: "작성 중인 조사가 있습니다. 이어서 마무리해 주세요.",
-          surveyAction: surveyTarget,
+          title: "보완이 필요합니다",
+          description: "아래 반려 사유를 확인하고 해당 항목을 고친 뒤 다시 제출해 주세요.",
+          label: null,
+          onClick: null,
         };
       default:
         return {
-          surveyLabel: "조사 시작하기",
-          surveyMessage:
-            "담당 직무의 과업과 필요 역량을 6단계로 작성합니다. 예상 소요 시간은 약 20분입니다.",
-          surveyAction: "/onboarding",
+          title: "이어서 작성해 주세요",
+          description: `${currentStep}단계 「${SURVEY_STEP_LABELS[currentStep - 1]}」까지 왔습니다. 쓰던 내용은 자동으로 저장되어 있습니다.`,
+          label: "이어서 작성하기",
+          onClick: () => goTo(null, currentStep),
         };
     }
   })();
+
+  // 반려 사유에 적힌 항목 이름을 딥링크로 바꾼다 — 어느 칸을 고쳐야 하는지까지 데려간다.
+  const rejectFields = findFocusFields(reject?.body ?? "").slice(0, 2);
+  const rejectActions: SignalAction[] = [
+    ...rejectFields.map((f) => ({
+      label: `${focusLabel(f)} 고치러 가기`,
+      onClick: () => goTo(f, rejectStep ?? currentStep),
+    })),
+    {
+      label: rejectStep ? `${rejectStep}단계부터 보완하기` : "작성 화면 열기",
+      onClick: () => goTo(null, rejectStep ?? currentStep),
+      variant: rejectFields.length > 0 ? ("outline" as const) : ("default" as const),
+    },
+    {
+      label: "내 정보 정정 요청",
+      onClick: () => goTo("org_text", 1),
+      variant: "ghost" as const,
+    },
+  ];
+
+  const summary: SubmissionSummaryProps | null =
+    finished && response && full
+      ? {
+          job: {
+            group: response.job_group ?? "",
+            series: response.job_series ?? "",
+            name: response.job_name ?? "",
+          },
+          definition: response.definition ?? "",
+          mission: response.mission ?? "",
+          taskCount: full.tasks.length,
+          activityCount: full.tasks.reduce((n, t) => n + t.activities.length, 0),
+          skillCount: full.skills.length,
+          missing: [
+            { id: "job_name", label: "직무 이름", step: 2, empty: !response.job_name?.trim() },
+            { id: "definition", label: "직무 정의", step: 3, empty: !response.definition?.trim() },
+            { id: "mission", label: "직무 목적", step: 3, empty: !response.mission?.trim() },
+            { id: "tasks", label: "과업", step: 4, empty: full.tasks.length === 0 },
+            { id: "skills", label: "필요 역량", step: 5, empty: full.skills.length === 0 },
+          ]
+            .filter((m) => m.empty)
+            .map(({ id, label, step }) => ({ id, label, step })),
+          title: "제출한 내용",
+          // 승인된 응답은 읽기 전용이라 단계 링크를 주지 않는다 — 눌러도 고칠 수 없는 링크는 두지 않는다.
+          ...(response.status === "submitted"
+            ? { onGoToStep: (step: number) => goTo(null, step) }
+            : {}),
+        }
+      : null;
 
   async function handleSignOut() {
     await queryClient.cancelQueries();
@@ -186,97 +273,122 @@ function RespondentHome() {
 
       <main className="mx-auto max-w-4xl space-y-6 px-4 py-8 sm:px-6 sm:py-10">
         <InfoChangeBanner />
-        <section className="rounded-xl border bg-card p-5 shadow-sm sm:p-7">
-          <p className="text-sm text-muted-foreground">
-            {isLoading ? "불러오는 중..." : (data?.companies?.name ?? "계열사 미지정")}
-          </p>
-          <h2 className="mt-1 text-xl font-bold sm:text-2xl">
-            {data?.name ? `${data.name} 님, 안녕하세요` : "내 조사 홈"}
-          </h2>
-          <p className="mt-2 text-sm text-muted-foreground">
-            {data?.org_text ?? "소속 정보 미등록"}
-            {data?.grade ? ` · ${data.grade}` : ""}
-            {data?.emp_no ? ` · 사번 ${data.emp_no}` : ""}
-          </p>
 
-          <div className="mt-6 grid gap-4 sm:grid-cols-2">
-            <div className="rounded-lg border bg-background p-4">
-              <p className="text-xs font-medium text-muted-foreground">진행 상태</p>
-              <div className="mt-2">
-                <StatusBadge status={data?.account_status ?? "미발송"} />
-              </div>
-            </div>
-            <div className="rounded-lg border bg-background p-4">
-              <p className="text-xs font-medium text-muted-foreground">제출 마감</p>
-              <p className="mt-2 flex flex-wrap items-center gap-2 text-lg font-semibold">
-                <CalendarClock className="size-5 text-primary" />
-                {dday === null ? (
-                  <>
-                    D-–
-                    <span className="text-sm font-normal text-muted-foreground">(기한 미설정)</span>
-                  </>
-                ) : (
-                  <>
-                    <span
-                      className={
-                        dday < 0 ? "text-muted-foreground" : dday <= 3 ? "text-destructive" : ""
-                      }
-                    >
-                      {dday < 0 ? "마감됨" : dday === 0 ? "D-Day" : `마감까지 D-${dday}`}
-                    </span>
-                    <span className="text-sm font-normal text-muted-foreground">({deadline})</span>
-                  </>
-                )}
-              </p>
-            </div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-lg font-bold sm:text-xl">
+              {data?.name ? `${data.name} 님` : "내 조사 홈"}
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              {isLoading ? "불러오는 중..." : (data?.companies?.name ?? "계열사 미지정")}
+              {data?.org_text ? ` · ${data.org_text}` : ""}
+              {data?.grade ? ` · ${data.grade}` : ""}
+              {data?.emp_no ? ` · 사번 ${data.emp_no}` : ""}
+            </p>
           </div>
-        </section>
+          <StatusBadge
+            status={data?.account_status ?? "미발송"}
+            perspective="respondent"
+            withHelp
+          />
+        </div>
 
-        <section className="rounded-xl border border-dashed bg-card p-5 text-center sm:p-10">
-          {response?.status === "submitted" || response?.status === "approved" ? (
-            <CheckCircle2 className="mx-auto size-8 text-success" />
+        {/* 지금 할 일 하나 — 반려는 사유·근거가 함께 있어야 하므로 SignalCard 규격으로 낸다. */}
+        {response?.status === "rejected" ? (
+          <SignalCard
+            tone="attention"
+            signal={
+              rejectFields.length > 0
+                ? `${rejectFields.map(focusLabel).join(" · ")} 항목을 보완해 주세요.`
+                : rejectStep
+                  ? `${rejectStep}단계 「${SURVEY_STEP_LABELS[rejectStep - 1]}」를 보완해 주세요.`
+                  : "제출한 응답에 보완이 필요합니다."
+            }
+            evidence={[
+              `관리자가 남긴 반려 사유 — ${reject?.body?.trim() || "사유가 적혀 있지 않습니다. 관리자에게 확인해 주세요."}`,
+              "보완해서 다시 제출하면 검토가 이어집니다.",
+            ]}
+            {...(reject?.created_at
+              ? { asOf: new Date(reject.created_at).toLocaleString("ko-KR") }
+              : {})}
+            actions={rejectActions}
+          />
+        ) : (
+          <section className="rounded-xl border bg-card p-5 shadow-sm sm:p-7">
+            <h3 className="text-lg font-bold sm:text-xl">{next.title}</h3>
+            <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{next.description}</p>
+            {next.label && next.onClick ? (
+              <Button className="mt-5 h-11 px-6 text-base" onClick={next.onClick}>
+                {next.label}
+              </Button>
+            ) : null}
+          </section>
+        )}
+
+        {/* 진행 단계 — 어디까지 왔고 어디를 눌러야 그리로 가는지 (P6). */}
+        <section className="rounded-xl border bg-card p-4 sm:p-5">
+          <p className="text-sm font-semibold">
+            작성 진행 · {finished ? SURVEY_STEP_LABELS.length : currentStep - 1}/
+            {SURVEY_STEP_LABELS.length} 단계 완료
+          </p>
+          <ol className="mt-3 grid gap-2 sm:grid-cols-2">
+            {SURVEY_STEP_LABELS.map((label, i) => {
+              const n = i + 1;
+              const done = finished || n < currentStep;
+              const here = !finished && n === currentStep;
+              const openable = finished || n <= currentStep;
+              return (
+                <li key={label}>
+                  <button
+                    type="button"
+                    disabled={!openable}
+                    onClick={() => goTo(null, n)}
+                    className={`flex w-full items-center gap-3 rounded-lg border p-3 text-left text-sm transition-colors ${
+                      here ? "border-primary bg-primary-soft/40 font-semibold" : "bg-background"
+                    } ${openable ? "hover:border-primary hover:bg-secondary" : "cursor-not-allowed opacity-50"}`}
+                  >
+                    <span
+                      className={`flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-bold ${
+                        done
+                          ? "bg-success text-white"
+                          : here
+                            ? "bg-primary text-primary-foreground"
+                            : "bg-muted text-muted-foreground"
+                      }`}
+                    >
+                      {done ? <Check className="size-3.5" /> : n}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate">{label}</span>
+                    <span className="shrink-0 text-xs text-muted-foreground">
+                      {done ? "완료" : here ? "작성 중" : "대기"}
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ol>
+
+          {deadline && dday !== null ? (
+            <p className="mt-4 flex flex-wrap items-center gap-2 border-t pt-4 text-sm">
+              <CalendarClock className="size-4 text-primary" />
+              <span className="text-muted-foreground">제출 마감</span>
+              <span
+                className={`font-semibold ${
+                  dday < 0 ? "text-muted-foreground" : dday <= 3 ? "text-destructive" : ""
+                }`}
+              >
+                {dday < 0 ? "마감됨" : dday === 0 ? "오늘까지" : `${dday}일 남음`}
+              </span>
+              <span className="text-muted-foreground">({deadline})</span>
+            </p>
           ) : (
-            <FileText className="mx-auto size-8 text-muted-foreground" />
-          )}
-          <h3 className="mt-3 text-base font-semibold">업무조사 작성</h3>
-          <p className="mt-2 text-sm text-muted-foreground">{surveyMessage}</p>
-          {response && response.status !== "draft" && response.status !== "rejected" ? null : (
-            <p className="mt-3 text-xs text-muted-foreground">
-              진행률 {Math.round(((response?.current_step ?? 1) / 6) * 100)}% (
-              {response?.current_step ?? 1}/6 단계)
+            <p className="mt-4 border-t pt-4 text-sm text-muted-foreground">
+              제출 마감일은 아직 정해지지 않았습니다.
             </p>
           )}
-          {response?.status === "rejected" && reject ? (
-            <div className="mt-5 rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-left">
-              <div className="flex items-center justify-between gap-2">
-                <p className="flex items-center gap-2 text-sm font-semibold text-destructive">
-                  <AlertTriangle className="size-4" />
-                  반려 사유
-                  {rejectStep ? ` · ${rejectStep}단계` : ""}
-                </p>
-                <span className="text-xs text-muted-foreground">
-                  {new Date(reject.created_at).toLocaleString("ko-KR")}
-                </span>
-              </div>
-              <p className="mt-2 whitespace-pre-wrap text-sm text-foreground">{reject.body}</p>
-            </div>
-          ) : null}
-
-          <Button
-            className="mt-5"
-            disabled={surveyAction === null}
-            onClick={() => {
-              if (!surveyAction) return;
-              if (surveyAction === "/survey" && rejectStep) {
-                void navigate({ to: "/survey", search: { step: rejectStep } });
-                return;
-              }
-              void navigate({ to: surveyAction });
-            }}
-          >
-            {surveyLabel}
-          </Button>
         </section>
+
+        {summary ? <SubmissionSummary {...summary} /> : null}
 
         {pendingSuggestions.length > 0 && (
           <section className="space-y-4">
@@ -291,6 +403,17 @@ function RespondentHome() {
             <AiSuggestionCards suggestions={pendingSuggestions} onDecide={handleDecide} />
           </section>
         )}
+
+        {/* 안내는 한 번 보고 끝이 아니다 — 언제든 다시 열 수 있어야 한다 (P10). */}
+        <p className="text-sm text-muted-foreground">
+          작성 방법이 헷갈리면{" "}
+          <Link
+            to="/onboarding"
+            className="font-medium text-primary underline underline-offset-2"
+          >
+            조사 안내 5장 다시 보기
+          </Link>
+        </p>
       </main>
     </div>
   );

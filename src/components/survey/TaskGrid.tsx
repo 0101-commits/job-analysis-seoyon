@@ -1,5 +1,5 @@
 // ④단계 Task·Activity 작성 그리드. 순수 컴포넌트 — 저장/이동은 코어(위저드)가 담당한다.
-// 예시 패널·안내 박스는 여기서 export 만 하고, 어떤 예시를 보여줄지는 위저드가 정한다(참여자 직군을 알기 때문).
+// 입력은 화면 전폭을 쓰고 작성 예시는 항목 옆 [예시 보기] 버튼 뒤에 둔다 (기획 C1).
 import { useMemo, useState } from "react";
 import type { ComponentProps } from "react";
 import { ChevronDown, ChevronUp, Info, Plus, Trash2, TriangleAlert } from "lucide-react";
@@ -18,16 +18,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { LabelWithHint } from "@/components/FieldHint";
+import { useCollapsedSections } from "@/hooks/use-persisted-ui";
 import { cn } from "@/lib/utils";
 
-import type {
-  ActivityItem,
-  Authority,
-  ExampleRow,
-  ImproveType,
-  TaskGridProps,
-  TaskItem,
-} from "./types";
+import { ExamplePopover } from "./ExamplePopover";
+import type { ActivityItem, Authority, ImproveType, TaskGridProps, TaskItem } from "./types";
 import { findSimilarPairs } from "./validation";
 
 /**
@@ -112,141 +108,32 @@ export function AutoTextarea({ className, onChange, ...props }: ComponentProps<"
   );
 }
 
-/** example_library 행. 어떤 예시를 고를지에 쓰는 두 컬럼이 types.ts 계약에는 없어 여기서 확장한다. */
-export interface ExampleLibRow extends ExampleRow {
-  is_common?: boolean | null;
-  job_group_key?: string | null;
-}
-
-const FIELD_LABEL: Record<ExampleRow["field"], string> = {
-  definition: "직무 정의",
-  mission: "직무 목적",
-  task: "과업",
-  activity: "세부 활동",
-  skill: "스킬",
-};
-
-const FIELD_ORDER: ExampleRow["field"][] = ["definition", "mission", "task", "activity", "skill"];
-
 /**
- * 예시는 딱 2세트 — ① 공통 기준 예시, ② 참여자 직군 예시.
- * 항목(field)별로 한 행씩만 뽑아 한 화면에 담기게 한다.
+ * 단계 최상단의 통합 안내 (기획 C2). 작성 순서 + 판단 항목 정의 + 진행 카운터를 한곳에 모은다.
+ *
+ * 첫 방문에는 펼쳐 두고, 한 번 접으면 그 상태를 기억한다 — 두 번째 방문부터 안내가
+ * 입력칸을 밀어내지 않게 하려는 것이므로 접힘 상태는 단계별로 따로 기억한다.
  */
-export function pickExamples(
-  examples: ExampleRow[],
-  jobGroup: string,
-): { heading: string; rows: ExampleRow[] }[] {
-  const key = jobGroup.trim();
-  const rows = examples as ExampleLibRow[];
-  const pick = (match: (e: ExampleLibRow) => boolean) =>
-    FIELD_ORDER.flatMap((f) => {
-      const row = rows.find((e) => e.field === f && match(e));
-      return row ? [row] : [];
-    });
-
-  const common = pick((e) => e.is_common === true);
-  const mine = key ? pick((e) => e.is_common !== true && e.job_group_key === key) : [];
-
-  const columns: { heading: string; rows: ExampleRow[] }[] = [];
-  if (common.length) columns.push({ heading: "공통 기준 예시", rows: common });
-  if (mine.length) columns.push({ heading: `${key} 직군 예시`, rows: mine });
-  return columns;
-}
-
-const EXAMPLES_COLLAPSED_KEY = "survey-examples-collapsed";
-
-function ExampleBody({ row }: { row: ExampleRow }) {
-  return (
-    <div className="rounded-lg border bg-background p-3">
-      <p className="text-[11px] font-semibold text-muted-foreground">{FIELD_LABEL[row.field]}</p>
-      <p className="mt-2 text-sm leading-relaxed">{row.good_example}</p>
-      {row.note ? (
-        <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-          <span className="font-semibold text-foreground">왜 좋은가 </span>
-          {row.note}
-        </p>
-      ) : null}
-      {row.bad_example ? (
-        <div className="mt-3 flex flex-wrap items-center gap-2 border-t pt-2">
-          <Badge variant="outline" className="shrink-0 text-[10px] font-semibold">
-            아쉬운 예
-          </Badge>
-          <span className="text-xs text-muted-foreground">{row.bad_example}</span>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-/**
- * 단계 콘텐츠 상단의 접이식 예시 카드. 좌=공통 기준, 우=내 직군.
- * 접힘 상태는 localStorage 로 기억해 단계를 옮겨도 유지된다.
- */
-export function ExamplesPanel({
-  examples,
-  jobGroup,
-  title = "작성 예시",
-}: {
-  examples: ExampleRow[];
-  jobGroup: string;
-  title?: string;
-}) {
-  const [open, setOpen] = useState(
-    () => globalThis.localStorage?.getItem(EXAMPLES_COLLAPSED_KEY) !== "1",
-  );
-  const columns = useMemo(() => pickExamples(examples, jobGroup), [examples, jobGroup]);
-  if (columns.length === 0) return null;
-
-  const toggle = (next: boolean) => {
-    setOpen(next);
-    globalThis.localStorage?.setItem(EXAMPLES_COLLAPSED_KEY, next ? "0" : "1");
-  };
-
-  return (
-    <Collapsible open={open} onOpenChange={toggle} className="rounded-xl border bg-card shadow-sm">
-      <CollapsibleTrigger asChild>
-        <button
-          type="button"
-          className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left"
-        >
-          <span className="text-sm font-semibold">{title}</span>
-          <ChevronDown
-            className={cn("size-4 shrink-0 transition-transform", open && "rotate-180")}
-          />
-        </button>
-      </CollapsibleTrigger>
-      <CollapsibleContent>
-        <div className={cn("grid gap-4 border-t p-4", columns.length > 1 && "sm:grid-cols-2")}>
-          {columns.map((col) => (
-            <div key={col.heading} className="space-y-2">
-              <p className="text-xs font-semibold text-primary">{col.heading}</p>
-              {col.rows.map((row) => (
-                <ExampleBody key={`${row.field}-${row.good_example}`} row={row} />
-              ))}
-            </div>
-          ))}
-        </div>
-      </CollapsibleContent>
-    </Collapsible>
-  );
-}
-
-/** 「이렇게 작성하세요」 접이식 안내. 작성 순서 + 평가 항목 정의 + 진행 카운터를 한곳에 모은다. */
 export function HowToBox({
+  sectionId,
+  title = "이렇게 작성하세요",
   steps,
-  sections,
+  sections = [],
   note,
 }: {
+  sectionId: string;
+  title?: string;
   steps: string[];
-  sections: { title: string; rows: [string, string][] }[];
+  sections?: { title: string; rows: [string, string][] }[];
   /** 접혀 있어도 보이는 진행 카운터 한 줄 (예: "과업 5~10개 권장 — 현재 4개") */
   note?: string | undefined;
 }) {
-  const [open, setOpen] = useState(true);
+  const { isCollapsed, toggle } = useCollapsedSections("survey-guide");
+  const open = !isCollapsed(sectionId);
   return (
     <Collapsible
       open={open}
-      onOpenChange={setOpen}
+      onOpenChange={() => toggle(sectionId)}
       className="rounded-xl border bg-primary-soft/20 shadow-sm"
     >
       <CollapsibleTrigger asChild>
@@ -255,10 +142,8 @@ export function HowToBox({
           className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left"
         >
           <span className="min-w-0 text-sm font-semibold">
-            이렇게 작성하세요
-            {note ? (
-              <span className="ml-2 font-normal text-muted-foreground">{note}</span>
-            ) : null}
+            {title}
+            {note ? <span className="ml-2 font-normal text-muted-foreground">{note}</span> : null}
           </span>
           <ChevronDown
             className={cn("size-4 shrink-0 transition-transform", open && "rotate-180")}
@@ -300,6 +185,7 @@ export function HowToBox({
 export function TaskHowTo({ taskCount }: { taskCount?: number | undefined }) {
   return (
     <HowToBox
+      sectionId="step4"
       note={taskCount === undefined ? undefined : `과업 5~10개 권장 — 현재 ${taskCount}개`}
       steps={[
         "계획 → 실행 → 모니터링·피드백의 시간 흐름으로 하는 일을 나열해 보세요.",
@@ -340,7 +226,14 @@ export function TaskHowTo({ taskCount }: { taskCount?: number | undefined }) {
   );
 }
 
-export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: TaskGridProps) {
+export function TaskGrid({
+  value,
+  onChange,
+  examples,
+  jobGroup = "",
+  disabled = false,
+  confirmRemove,
+}: TaskGridProps) {
   // 과업 id → 그 과업이 속한 첫 유사 쌍. 배지에 실제 과업명 두 개를 그대로 보여 준다.
   const dupPairs = useMemo(() => {
     const map = new Map<string, { nameA: string; nameB: string }>();
@@ -394,14 +287,21 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
 
   return (
     <div className="space-y-4">
-      <p className="text-sm text-muted-foreground">
-        담당하는 과업을 5~10개로 나누어 적어 주세요. 각 과업은 &lsquo;무엇을 해서 무엇을
-        만든다&rsquo; 형태의 한 문장으로 씁니다.
-      </p>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+          담당하는 과업을 5~10개로 나누어 적어 주세요. 각 과업은 &lsquo;무엇을 해서 무엇을
+          만든다&rsquo; 형태의 한 문장으로 씁니다.
+        </p>
+        <ExamplePopover examples={examples} jobGroup={jobGroup} fields={["task"]} />
+      </div>
 
-      <ul className="space-y-4">
+      <ul id="field-tasks" className="scroll-mt-28 space-y-4">
         {value.map((task, index) => (
-          <li key={task.id} className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-5">
+          <li
+            key={task.id}
+            id={`task-${task.id}`}
+            className="space-y-4 rounded-xl border bg-card p-4 shadow-sm scroll-mt-28 sm:p-5"
+          >
             <div className="flex items-start gap-2">
               <span className="mt-2 text-sm font-semibold text-muted-foreground">{index + 1}</span>
               <div className="min-w-0 flex-1 space-y-2">
@@ -463,12 +363,8 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
 
             <div className="grid gap-4 sm:grid-cols-3">
               <div className="space-y-2">
-                <Label className="flex items-center gap-1">
-                  중요도
-                  <Hint
-                    text={[1, 2, 3, 4, 5].map((n) => `${n} = ${IMPORTANCE_HINTS[n]}`).join(" / ")}
-                  />
-                </Label>
+                {/* 점수별 뜻은 각 버튼의 title·상단 안내에 있으므로 라벨에는 항목 정의만 붙인다. */}
+                <LabelWithHint term="중요도">중요도</LabelWithHint>
                 <div className="flex gap-1">
                   {[1, 2, 3, 4, 5].map((n) => (
                     <Button
@@ -489,10 +385,7 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
               </div>
 
               <div className="space-y-2">
-                <Label className="flex items-center gap-1">
-                  책임수준
-                  <Hint text={AUTHORITY_OPTIONS.map((o) => `${o.label} = ${o.hint}`).join(" / ")} />
-                </Label>
+                <LabelWithHint term="책임수준">책임수준</LabelWithHint>
                 <div className="inline-flex flex-wrap rounded-md border p-0.5">
                   {AUTHORITY_OPTIONS.map((opt) => (
                     <button
@@ -520,10 +413,7 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
               </div>
 
               <div className="space-y-2">
-                <Label className="flex items-center gap-1">
-                  이관 가능
-                  <Hint text="예 = 다른 사람이 맡아도 이 직무가 그대로 성립하는 과업 / 아니오 = 이 직무에서 떼어내면 직무 자체가 성립하지 않는 과업" />
-                </Label>
+                <LabelWithHint term="이관가능">이관 가능</LabelWithHint>
                 <div className="inline-flex rounded-md border p-0.5">
                   {[
                     { v: true, l: "예" },
@@ -551,6 +441,8 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
 
             <ActivityList
               task={task}
+              examples={examples}
+              jobGroup={jobGroup}
               disabled={disabled}
               onChange={(next) => setActivities(task, next)}
             />
@@ -570,10 +462,14 @@ export function TaskGrid({ value, onChange, disabled = false, confirmRemove }: T
 
 function ActivityList({
   task,
+  examples,
+  jobGroup,
   disabled,
   onChange,
 }: {
   task: TaskItem;
+  examples: TaskGridProps["examples"];
+  jobGroup: string;
   disabled: boolean;
   onChange: (next: ActivityItem[]) => void;
 }) {
@@ -591,10 +487,12 @@ function ActivityList({
 
   return (
     <div className="space-y-2 rounded-lg bg-muted/40 p-3">
-      <Label className="flex items-center gap-1 text-xs">
-        세부 활동(Activity)
-        <Hint text="이 과업을 실제로 수행하는 단계를 2~8개로 적습니다. 과업보다 짧은 주기로 반복되는 실행 단위입니다." />
-      </Label>
+      <div className="flex flex-wrap items-center gap-x-2">
+        <LabelWithHint term="세부 활동" className="text-xs">
+          세부 활동
+        </LabelWithHint>
+        <ExamplePopover examples={examples} jobGroup={jobGroup} fields={["activity"]} />
+      </div>
       <ul className="space-y-2">
         {task.activities.map((act, i) => (
           <li key={act.id} className="flex items-center gap-1">
