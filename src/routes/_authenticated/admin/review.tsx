@@ -349,8 +349,9 @@ function ReviewPage() {
         </TabsList>
 
         <TabsContent value="queue" className="mt-4">
-          <div className="grid gap-4 lg:grid-cols-[minmax(0,340px)_minmax(0,1fr)]">
-            <div className={cn("space-y-3", selectedId && "hidden lg:block")}>
+          {/* 좌우 분할이 아니라 전환형 — 응답을 고르면 응답자 화면과 같은 한 단 흐름으로 상세만 본다. */}
+          <div className="space-y-4">
+            <div className={cn("space-y-3", selectedId && "hidden")}>
               <div className="space-y-2 rounded-xl border bg-card p-3 shadow-sm">
                 <Select value={status} onValueChange={setStatus}>
                   <SelectTrigger aria-label="상태 필터">
@@ -388,7 +389,7 @@ function ReviewPage() {
                   조건에 맞는 응답이 없습니다.
                 </p>
               ) : (
-                <ul className="space-y-2">
+                <ul className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                   {rows.map((r) => (
                     <li key={r.id}>
                       <button
@@ -439,8 +440,9 @@ function ReviewPage() {
               )}
             </div>
 
-            <div className={cn(!selectedId && "hidden lg:block")}>
-              {selectedId ? (
+            {selectedId && (
+              // 응답자가 보던 폭과 비슷하게 가운데 한 단으로. 목록은 [목록] 버튼으로 돌아간다.
+              <div className="mx-auto w-full max-w-3xl">
                 <ReviewDetail
                   responseId={selectedId}
                   onClose={() => setSelectedId(null)}
@@ -448,14 +450,8 @@ function ReviewPage() {
                   nextId={selectedIndex >= 0 ? (rows[selectedIndex + 1]?.id ?? null) : null}
                   onNavigate={setSelectedId}
                 />
-              ) : (
-                <div className="rounded-xl border border-dashed bg-card p-8 text-center sm:p-12">
-                  <p className="text-sm text-muted-foreground">
-                    왼쪽 목록에서 검토할 응답을 선택하세요.
-                  </p>
-                </div>
-              )}
-            </div>
+              </div>
+            )}
           </div>
         </TabsContent>
 
@@ -696,7 +692,8 @@ function ReviewDetail({
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-1">
-          <Button variant="ghost" size="sm" className="lg:hidden" onClick={onClose}>
+          {/* 전환형 레이아웃이라 폭에 관계없이 목록 복귀 버튼이 필요하다. */}
+          <Button variant="outline" size="sm" onClick={onClose}>
             <ChevronLeft className="size-4" /> 목록
           </Button>
           <Button

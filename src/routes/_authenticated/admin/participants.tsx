@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   Archive,
   CheckCircle2,
+  Copy,
   Download,
   FileSearch,
   KeyRound,
@@ -463,11 +464,14 @@ type Participant = {
   user_id: string | null;
   tags: string[] | null;
   archived_at: string | null;
+  /** 계정에 현재 적용된 비밀번호(평문). 발급·초기화·본인 변경 시 갱신된다. */
+  initial_password: string | null;
+  must_change_password: boolean;
   companies: { name: string } | null;
 };
 
 const PARTICIPANT_COLUMNS =
-  "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, org_unit_id, role, account_status, user_id, tags, archived_at, companies(name)";
+  "id, company_id, emp_no, name, email, birth_date, org_text, grade, role_level, org_unit_id, role, account_status, user_id, tags, archived_at, initial_password, must_change_password, companies(name)";
 
 /** 조직 트리를 들여쓰기 라벨의 평탄 목록으로. 부모가 조회 범위 밖이면 루트로 취급한다. */
 function flattenOrgUnits(
@@ -1031,7 +1035,20 @@ function RosterListTab() {
 
   /** 현재 필터가 적용된 rows 그대로 CSV 로 만든다. 엑셀 호환을 위해 BOM 을 붙인다. */
   function downloadRoster() {
-    const header = ["사번", "이름", "계열사", "조직", "소속", "직급", "역할단계", "이메일", "태그", "상태"];
+    // 비밀번호도 평문으로 나간다 — 계정 안내용. 파일 자체가 대외비다.
+    const header = [
+      "사번",
+      "이름",
+      "계열사",
+      "조직",
+      "소속",
+      "직급",
+      "역할단계",
+      "이메일",
+      "비밀번호",
+      "태그",
+      "상태",
+    ];
     const lines = rows.map((p) =>
       [
         p.emp_no,
@@ -1042,6 +1059,7 @@ function RosterListTab() {
         p.grade ?? "",
         p.role_level ?? "",
         p.email ?? "",
+        p.initial_password ?? "",
         (p.tags ?? []).join(" "),
         p.account_status,
       ]
@@ -1298,6 +1316,12 @@ function RosterListTab() {
                     <dt className="text-muted-foreground">이메일</dt>
                     <dd className="mt-0.5 truncate font-medium">{p.email ?? "-"}</dd>
                   </div>
+                  <div className="col-span-2">
+                    <dt className="text-muted-foreground">비밀번호</dt>
+                    <dd className="mt-0.5">
+                      <PasswordCell participant={p} />
+                    </dd>
+                  </div>
                 </dl>
                 <TagChips participant={p} />
                 <div className="mt-3 flex flex-wrap gap-2">
@@ -1343,6 +1367,7 @@ function RosterListTab() {
                   <th className="px-4 py-3 font-medium">조직</th>
                   <th className="px-4 py-3 font-medium">직급</th>
                   <th className="px-4 py-3 font-medium">태그</th>
+                  <th className="px-4 py-3 font-medium">비밀번호</th>
                   <th className="px-4 py-3 font-medium">상태</th>
                   <th className="px-4 py-3 font-medium">관리</th>
                 </tr>
@@ -1380,6 +1405,9 @@ function RosterListTab() {
                     <td className="px-4 py-3">{p.grade ?? "-"}</td>
                     <td className="px-4 py-3">
                       <TagChips participant={p} />
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3">
+                      <PasswordCell participant={p} />
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge status={p.account_status} />
@@ -1496,6 +1524,45 @@ function RosterListTab() {
         </Dialog>
       )}
     </div>
+  );
+}
+
+/**
+ * 계정 비밀번호 노출 셀. 관리자만 보는 화면이고, 값은 서버가 실제로 적용한 평문이다
+ * (발급·초기화·본인 변경 모두 participants.initial_password 를 갱신).
+ * 계정이 없으면 비밀번호도 없고, 값이 비어 있으면 옛 계정이라 [비밀번호 초기화]로 다시 만들어야 한다.
+ */
+function PasswordCell({ participant }: { participant: Participant }) {
+  const pw = participant.initial_password;
+  if (!participant.user_id) {
+    return <span className="text-xs text-muted-foreground">계정 없음</span>;
+  }
+  if (!pw) {
+    return <span className="text-xs text-muted-foreground">미기록 — 초기화 필요</span>;
+  }
+  return (
+    <span className="inline-flex items-center gap-1">
+      <code className="rounded bg-secondary px-1.5 py-0.5 font-mono text-xs">{pw}</code>
+      <Button
+        size="sm"
+        variant="ghost"
+        className="size-7 p-0"
+        aria-label={`${participant.name} 비밀번호 복사`}
+        onClick={() => {
+          void navigator.clipboard
+            .writeText(pw)
+            .then(() => toast.success("비밀번호를 복사했습니다."))
+            .catch(() => toast.error("복사에 실패했습니다. 값을 직접 선택해 복사해 주세요."));
+        }}
+      >
+        <Copy className="size-3.5" />
+      </Button>
+      {participant.must_change_password && (
+        <span className="rounded-full bg-warning/15 px-2 py-0.5 text-[11px] font-semibold text-warning">
+          최초 변경 전
+        </span>
+      )}
+    </span>
   );
 }
 

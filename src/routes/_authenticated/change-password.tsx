@@ -1,9 +1,8 @@
 import { useState } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
-import { supabase } from "@/integrations/supabase/client";
 import { fetchMyRole } from "@/lib/auth";
-import { completePasswordChange } from "@/lib/auth.functions";
+import { changeMyPassword } from "@/lib/auth.functions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -42,9 +41,8 @@ function ChangePasswordPage() {
 
     setLoading(true);
     try {
-      const { error } = await supabase.auth.updateUser({ password });
-      if (error) throw error;
-      await completePasswordChange();
+      // 서버가 적용까지 수행한다 — 적용값과 명부 기록이 갈라지지 않게.
+      await changeMyPassword({ data: { password } });
       const role = await fetchMyRole();
       toast.success("비밀번호가 변경되었습니다.");
       navigate({ to: role === "admin" ? "/admin" : "/home", replace: true });

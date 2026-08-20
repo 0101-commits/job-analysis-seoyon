@@ -106,20 +106,46 @@ export const signInWithLock = createServerFn({ method: "POST" })
   });
 
 /**
- * 비밀번호 변경 완료 처리(본인 행만).
- * 계약: 성공 시 { ok: true }. DB 오류나 명부에 연결된 행이 없으면 throw하므로
- * 호출부는 반드시 try/catch로 사용자에게 실패를 알려야 한다(조용한 성공 처리 금지).
+ * 본인 비밀번호 변경(변경 + 명부 기록을 한 번에).
+ *
+ * 변경을 클라이언트(supabase.auth.updateUser)가 아니라 서버가 service_role 로 수행하는 이유:
+ * 관리자 화면이 계정별 '현재' 비밀번호를 그대로 보여줘야 하므로(운영 요구) 서버가 실제로 적용한
+ * 값만 participants.initial_password 에 평문으로 남겨야 한다. 클라이언트가 값을 따로 알려주는
+ * 구조면 적용값과 기록값이 갈라질 수 있다.
+ *
+ * ⚠ 평문 보관은 대외비 운영 전제의 의도된 선택이다. DB 유출 시 전 계정 비밀번호가 노출된다.
+ * 계약: 성공 시 { ok: true }. 비밀번호 적용 실패는 throw. 명부에 연결된 행이 없는 계정
+ * (명부 없이 만든 관리자)은 비밀번호만 바뀌고 rostered: false 로 알린다.
  */
-export const completePasswordChange = createServerFn({ method: "POST" })
+export const changeMyPassword = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .handler(async ({ context }) => {
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        // change-password 화면과 같은 규칙 — 영문+숫자 포함 8자 이상.
+        password: z
+          .string()
+          .min(8)
+          .max(200)
+          .regex(/^(?=.*[A-Za-z])(?=.*\d).{8,}$/, "영문과 숫자를 포함해 8자 이상이어야 합니다."),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data, error } = await supabaseAdmin
+    const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(context.userId, {
+      password: data.password,
+    });
+    if (authError) throw new Error("비밀번호를 변경하지 못했습니다.");
+
+    const { data: rows, error } = await supabaseAdmin
       .from("participants")
-      .update({ must_change_password: false, initial_password: null })
+      .update({ must_change_password: false, initial_password: data.password })
       .eq("user_id", context.userId)
       .select("id");
-    if (error) throw new Error("비밀번호 변경 상태를 저장하지 못했습니다.");
-    if (!data?.length) throw new Error("명부에 연결된 계정을 찾지 못했습니다. 관리자에게 문의하세요.");
-    return { ok: true };
+    // 비밀번호는 이미 바뀐 상태다. 기록 실패를 성공으로 감추지 않되, 사용자에게는
+    // '다시 시도'가 아니라 관리자 문의로 안내되도록 문구를 구분한다.
+    if (error) throw new Error("비밀번호는 변경됐지만 명부 기록에 실패했습니다. 관리자에게 알려 주세요.");
+
+    return { ok: true, rostered: (rows?.length ?? 0) > 0 };
   });
