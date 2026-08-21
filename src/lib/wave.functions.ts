@@ -485,11 +485,16 @@ export const waveDeleteImpact = createServerFn({ method: "GET" })
 /**
  * 차수 삭제. v6부터 보관 여부와 무관하게 바로 지울 수 있다 — 실수 방지는 UI 의
  * 영향 규모(waveDeleteImpact) 확인 다이얼로그가 맡는다. FK 는 SET NULL 이라
- * 참여자·응답·발송 데이터는 남지만 차수 귀속이 풀린다.
+ * 기본은 참여자·응답·발송 데이터가 남고 차수 귀속만 풀린다.
+ * `deleteResponses` 를 켜면 이 차수에 연결된 응답까지 함께 지운다(선택형 —
+ * 테스트 데이터 정리용). 응답이 지워진 참여자는 제출 이력이 사라지므로
+ * 진행 상태를 '미접속'(접속했으나 작성 전)으로 되돌린다.
  */
 export const deleteWave = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => z.object({ id: uuid }).parse(input))
+  .inputValidator((input: unknown) =>
+    z.object({ id: uuid, deleteResponses: z.boolean().optional() }).parse(input),
+  )
   .handler(async ({ data, context }) => {
     const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
@@ -503,6 +508,34 @@ export const deleteWave = createServerFn({ method: "POST" })
     if (findErr) throw new Error(findErr.message);
     if (!existing) throw new Error("차수를 찾을 수 없습니다.");
 
+    let deletedResponses = 0;
+    if (data.deleteResponses) {
+      // 지울 응답의 참여자를 먼저 확보 — 삭제 후 진행 상태를 되돌리기 위해서다.
+      const { data: victims, error: victimErr } = await supabaseAdmin
+        .from("responses")
+        .select("id, participant_id")
+        .eq("wave_id", data.id);
+      if (victimErr) throw new Error(victimErr.message);
+
+      if (victims && victims.length > 0) {
+        const { error: delErr } = await supabaseAdmin
+          .from("responses")
+          .delete()
+          .eq("wave_id", data.id);
+        if (delErr) throw new Error(delErr.message);
+        deletedResponses = victims.length;
+
+        // 응답 동기화 트리거는 INSERT/UPDATE 에만 걸려 있어 삭제 후 상태를 직접 되돌린다.
+        const participantIds = victims.map((v) => v.participant_id);
+        const { error: resetErr } = await supabaseAdmin
+          .from("participants")
+          .update({ account_status: "미접속" })
+          .in("id", participantIds)
+          .in("account_status", ["작성중", "제출", "반려", "승인"]);
+        if (resetErr) throw new Error(resetErr.message);
+      }
+    }
+
     const { error } = await supabaseAdmin.from("survey_waves").delete().eq("id", data.id);
     if (error) throw new Error(error.message);
 
@@ -511,9 +544,14 @@ export const deleteWave = createServerFn({ method: "POST" })
       action: "조사 차수 삭제",
       target_type: "survey_waves",
       target_id: data.id,
-      detail: { name: existing.name, seq: existing.seq, companyId: existing.company_id },
+      detail: {
+        name: existing.name,
+        seq: existing.seq,
+        companyId: existing.company_id,
+        deletedResponses,
+      },
     });
-    return { ok: true };
+    return { ok: true, deletedResponses };
   });
 
 /* ─────────────────── 다른 담당 함수가 참고할 헬퍼 ─────────────────── */

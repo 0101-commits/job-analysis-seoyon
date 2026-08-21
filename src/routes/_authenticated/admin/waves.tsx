@@ -166,6 +166,12 @@ function WavesPage() {
   /** 전사 모드에서 새 차수를 만들 때 고르는 계열사 (렌즈가 특정 계열사면 그 값이 고정). */
   const [draftCompanyId, setDraftCompanyId] = useState("");
   const [showArchived, setShowArchived] = useState(false);
+  // 삭제 확인 다이얼로그 — 영향 수치와 「응답도 함께 삭제」 선택을 함께 보여 준다.
+  const [deleteAsk, setDeleteAsk] = useState<{
+    wave: Wave;
+    impact: { participants: number; responses: number; mailBatches: number };
+    withResponses: boolean;
+  } | null>(null);
 
   const scoped = companyId !== "all";
 
@@ -295,9 +301,15 @@ function WavesPage() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: async (id: string) => deleteWave({ data: { id }, headers: await authHeaders() }),
-    onSuccess: () => {
-      toast.success("차수를 삭제했습니다.");
+    mutationFn: async (input: { id: string; deleteResponses: boolean }) =>
+      deleteWave({ data: input, headers: await authHeaders() }),
+    onSuccess: (result) => {
+      toast.success(
+        result.deletedResponses > 0
+          ? `차수와 응답 ${result.deletedResponses}건을 삭제했습니다.`
+          : "차수를 삭제했습니다.",
+      );
+      setDeleteAsk(null);
       openDetail(null);
       invalidate();
     },
@@ -314,17 +326,11 @@ function WavesPage() {
     }
   }
 
-  /** 삭제 확인 — 영향 규모(배정·응답·발송)를 먼저 세어 보여 준다 (v6: 보관 없이도 삭제). */
+  /** 삭제 확인 — 영향 규모(배정·응답·발송)를 먼저 세어 다이얼로그로 보여 준다 (v6). */
   async function confirmDelete(w: Wave) {
     try {
       const impact = await waveDeleteImpact({ data: { id: w.id }, headers: await authHeaders() });
-      if (
-        window.confirm(
-          `「${w.name}」 차수를 삭제할까요?\n배정 참여자 ${impact.participants}명 · 응답 ${impact.responses}건 · 발송 기록 ${impact.mailBatches}건의 차수 연결이 해제됩니다. 데이터 자체는 남지만 이 차수 기록은 사라집니다. 숨기기만 하려면 보관을 쓰세요.`,
-        )
-      ) {
-        deleteMutation.mutate(w.id);
-      }
+      setDeleteAsk({ wave: w, impact, withResponses: false });
     } catch (err) {
       toast.error(errorMessage(err));
     }
@@ -670,6 +676,60 @@ function WavesPage() {
             </Button>
             <Button onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}>
               {saveMutation.isPending ? "저장 중..." : "저장"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 삭제 확인 — 기본은 연결 해제만, 체크하면 이 차수의 응답까지 함께 삭제 */}
+      <Dialog open={deleteAsk !== null} onOpenChange={(open) => !open && setDeleteAsk(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>「{deleteAsk?.wave.name}」 차수 삭제</DialogTitle>
+            <DialogDescription>
+              배정 참여자 {deleteAsk?.impact.participants ?? 0}명 · 응답{" "}
+              {deleteAsk?.impact.responses ?? 0}건 · 발송 기록 {deleteAsk?.impact.mailBatches ?? 0}
+              건의 차수 연결이 해제됩니다. 이 차수가 어느 발송·제출의 기준이었는지 기록은
+              사라집니다. 숨기기만 하려면 보관을 쓰세요.
+            </DialogDescription>
+          </DialogHeader>
+          {deleteAsk && deleteAsk.impact.responses > 0 && (
+            <label className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={deleteAsk.withResponses}
+                onChange={(e) =>
+                  setDeleteAsk({ ...deleteAsk, withResponses: e.currentTarget.checked })
+                }
+              />
+              <span>
+                이 차수의 응답 {deleteAsk.impact.responses}건도 함께 삭제
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  참여자가 작성한 답변이 완전히 사라지고 해당 참여자는 「작성 전」 상태로
+                  돌아갑니다. 테스트 데이터 정리에만 쓰세요 — 되돌릴 수 없습니다.
+                </span>
+              </span>
+            </label>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteAsk(null)}>
+              취소
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={deleteMutation.isPending}
+              onClick={() =>
+                deleteAsk &&
+                deleteMutation.mutate({
+                  id: deleteAsk.wave.id,
+                  deleteResponses: deleteAsk.withResponses,
+                })
+              }
+            >
+              {deleteAsk?.withResponses
+                ? `응답 ${deleteAsk.impact.responses}건과 함께 삭제`
+                : "차수만 삭제"}
             </Button>
           </DialogFooter>
         </DialogContent>
