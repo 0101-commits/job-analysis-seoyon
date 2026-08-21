@@ -71,6 +71,7 @@ import {
   useOrgLens,
 } from "@/components/admin/OrgTreeFilter";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { similarity } from "@/components/survey/validation";
 import { usePersistedState, useDensity } from "@/hooks/use-persisted-ui";
 import { ACCOUNT_STATUS_LABELS } from "@/lib/auth";
@@ -108,7 +109,7 @@ import { fetchAll } from "@/lib/paginate";
  * 받는다 — 대시보드·전역 검색이 보낸다
  *   ?p=<참여자id>    그 사람의 상세 패널을 열고 목록에서 그 행을 강조한다
  *   ?status=<상태>   그 상태만 남긴다 (계정 상태 7종)
- *   ?org=<소속id>    그 소속과 하위 소속만 남긴다
+ *   ?co=<계열사id> ?org=<소속id>   계열사·소속 렌즈 (기획 v2 P2) — 모든 관리 화면이 공유한다
  *   ?q=<검색어> ?tag=<태그> ?archived=1 ?tab=list|upload
  *   ?assignWave=<차수id> 차수 관리 화면이 보낸다 — 그 차수로 배정하는 흐름을 연다
  *
@@ -118,11 +119,10 @@ import { fetchAll } from "@/lib/paginate";
  *   /admin/mail?org=<소속id>      선택한 소속 전체에게 독려 (인원 선택이 없을 때)
  *   두 독려 링크 모두 지금 걸린 상태 필터를 &status=<상태> 로 함께 넘긴다.
  */
-type ParticipantsSearch = {
+type ParticipantsSearch = LensSearch & {
   tab?: "list" | "upload";
   p?: string;
   status?: string;
-  org?: string;
   q?: string;
   tag?: string;
   archived?: boolean;
@@ -151,7 +151,7 @@ export const Route = createFileRoute("/_authenticated/admin/participants")({
       const raw = search[key];
       return typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : null;
     };
-    const out: ParticipantsSearch = {};
+    const out: ParticipantsSearch = { ...pickLens(search) };
     if (search["tab"] === "upload" || search["tab"] === "list") out.tab = search["tab"];
     const p = text("p");
     if (p) out.p = p;
@@ -1433,11 +1433,8 @@ function RosterListTab({
     [waves],
   );
 
-  // 딥링크가 소속을 지정하면 렌즈를 그 소속으로 맞춘다. 이후에는 렌즈 선택이 URL 을 갱신한다.
-  useEffect(() => {
-    if (search.org && search.org !== selectedOrgId) setSelectedOrgId(search.org);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search.org]);
+  // 소속 렌즈는 이제 이 화면의 ?org= 자체가 원천이라(useOrgLens), 딥링크 값을 옮겨 싣는
+  // 별도 동기화가 필요 없다 — search.org 와 selectedOrgId 는 항상 같은 URL 키를 가리킨다.
 
   // 차수 관리 화면이 보낸 차수를 일괄 배정 칸에 미리 채운다. 사람만 고르면 바로 배정할 수 있다.
   useEffect(() => {
@@ -1797,7 +1794,7 @@ function RosterListTab({
         onSelect={selectOrg}
         counts={orgCounts}
         title="소속"
-        className="h-fit lg:sticky lg:top-4"
+        className="h-fit lg:sticky lg:top-[var(--sticky-top)]"
       />
 
       <div className="min-w-0 space-y-4">

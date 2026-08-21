@@ -73,6 +73,7 @@ import {
 } from "@/components/admin/ImpactInspector";
 import { getOrgOverview, type OrgOverview } from "@/lib/dashboard.functions";
 import { parseRosterFile } from "@/lib/roster";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { similarity } from "@/components/survey/validation";
 import {
   JOB_FIELDS,
@@ -117,22 +118,29 @@ import {
 const MASTER_TABS = ["org", "job", "duty", "compare", "recheck", "status"] as const;
 type MasterTab = (typeof MASTER_TABS)[number];
 
-type MasterSearch = { tab?: MasterTab; job?: string; org?: string };
+/**
+ * `focusOrg`·`job` 은 조직도·직무분류 탭에서 특정 항목 하나를 강조·스크롤하는 딥링크 값이고,
+ * `org`(계열사·소속 렌즈의 소속)와는 뜻이 다르다. 같은 이름을 쓰면 두 딥링크가 서로 값을
+ * 덮어쓰므로 이름을 갈라 둔다.
+ */
+type MasterSearch = LensSearch & { tab?: MasterTab; job?: string; focusOrg?: string };
 
 function pickString(value: unknown) {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
 }
 
 export const Route = createFileRoute("/_authenticated/admin/master")({
-  /** `?tab=<탭>` `?job=<직무 id>` `?org=<소속 id>` — 모르는 값은 조용히 버린다. */
+  /** `?tab=<탭>` `?job=<직무 id>` `?focusOrg=<소속 id>` — 모르는 값은 조용히 버린다. */
   validateSearch: (search: Record<string, unknown>): MasterSearch => {
     const tab = pickString(search["tab"]);
     const job = pickString(search["job"]);
-    const org = pickString(search["org"]);
+    const focusOrg = pickString(search["focusOrg"]);
     return {
       ...(tab && (MASTER_TABS as readonly string[]).includes(tab) ? { tab: tab as MasterTab } : {}),
       ...(job ? { job } : {}),
-      ...(org ? { org } : {}),
+      ...(focusOrg ? { focusOrg } : {}),
+      // 계열사·소속 렌즈는 전 화면 공통이라 한 곳(lens-search)에서만 판다.
+      ...pickLens(search),
     };
   },
   head: () => ({
@@ -234,7 +242,7 @@ function EditorWithInspector({
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
       <div className="min-w-0 space-y-6">{children}</div>
-      <div className="lg:sticky lg:top-20 lg:self-start">{inspector}</div>
+      <div className="lg:sticky lg:top-[var(--sticky-top)] lg:self-start">{inspector}</div>
     </div>
   );
 }
@@ -3056,7 +3064,7 @@ function MasterPage() {
           <TabsTrigger value="status">현황</TabsTrigger>
         </TabsList>
         <TabsContent value="org" className="mt-4">
-          <OrgTab highlightOrgId={search.org ?? null} />
+          <OrgTab highlightOrgId={search.focusOrg ?? null} />
         </TabsContent>
         <TabsContent value="job" className="mt-4">
           <JobTab highlightJobId={search.job ?? null} />

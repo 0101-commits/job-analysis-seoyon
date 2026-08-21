@@ -24,6 +24,7 @@ import {
 } from "@/components/admin/AutomationPanels";
 import { FieldHint } from "@/components/FieldHint";
 import { EmptyState } from "@/components/EmptyState";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { PASSWORD_TOKENS, validatePasswordRule } from "@/lib/password-rule";
 import {
   DEFAULT_OPS,
@@ -46,6 +47,8 @@ import {
 } from "@/lib/settings.functions";
 
 export const Route = createFileRoute("/_authenticated/admin/settings")({
+  /** `?co=` `?org=` — 계열사·소속 렌즈 (기획 v2 P2). 다른 화면과 값을 주고받을 때 필요하다. */
+  validateSearch: (search: Record<string, unknown>): LensSearch => pickLens(search),
   head: () => ({
     meta: [
       { title: "조사 설정 | 서연 그룹 업무조사" },

@@ -16,6 +16,7 @@ import {
   useOrgLens,
 } from "@/components/admin/OrgTreeFilter";
 import { WaveFilter, useWaveLens, type WaveOption } from "@/components/admin/WaveFilter";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import {
   checkIntegrity,
   getDashboardSignals,
@@ -29,6 +30,8 @@ import {
 import { listWaves, type Wave } from "@/lib/wave.functions";
 
 export const Route = createFileRoute("/_authenticated/admin/")({
+  /** `?co=` `?org=` — 계열사·소속 렌즈 (기획 v2 P2). 다른 화면과 값을 주고받을 때 필요하다. */
+  validateSearch: (search: Record<string, unknown>): LensSearch => pickLens(search),
   head: () => ({
     meta: [
       { title: "진행 현황 | 서연 그룹 업무조사" },
@@ -481,7 +484,7 @@ function DashboardPage() {
       <SectionNav sections={sections} />
 
       <div className="grid gap-4 lg:grid-cols-[232px_minmax(0,1fr)]">
-        <aside className="space-y-2 lg:sticky lg:top-4 lg:self-start">
+        <aside className="space-y-2 lg:sticky lg:top-[var(--sticky-top)] lg:self-start">
           <OrgTreeFilter
             units={reference?.units ?? []}
             selectedId={orgId}
@@ -563,7 +566,7 @@ function DashboardPage() {
               </CollapsibleSection>
 
               {/* B2 — 알림은 전부 신호·근거·행동 3단 규격 */}
-              <section id="signals" className="scroll-mt-20 space-y-3">
+              <section id="signals" className="scroll-mt-[var(--sticky-top)] space-y-3">
                 <div>
                   <h2 className="text-base font-semibold">확인할 일</h2>
                   <p className="text-xs text-muted-foreground">

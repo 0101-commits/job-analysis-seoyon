@@ -1,7 +1,9 @@
 import { useMemo } from "react";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { ChevronRight, Building2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePersistedState } from "@/hooks/use-persisted-ui";
+import { applyLensPatch, pickLens } from "@/lib/lens-search";
 
 /**
  * 소속 트리 선택 (기획 B4).
@@ -21,10 +23,23 @@ export type OrgUnitNode = {
   sort?: number | null;
 };
 
-/** 선택한 소속은 화면 간에 공유한다 — 관리자 세션 내내 유지되는 하나의 렌즈. */
+/**
+ * 선택한 소속은 화면 간에 공유하는 하나의 렌즈다 — URL 의 `?org=` 가 유일한 원천이다
+ * (기획 v2 P2). 새로고침·뒤로가기·링크 공유가 모두 같은 소속을 연다.
+ */
 export function useOrgLens() {
-  const [selected, setSelected] = usePersistedState<string | null>("org-lens", null);
-  return { selectedOrgId: selected, setSelectedOrgId: setSelected };
+  const search = useRouterState({ select: (s) => s.location.search });
+  const navigate = useNavigate();
+  const selectedOrgId = pickLens(search as Record<string, unknown>).org ?? null;
+
+  function setSelectedOrgId(id: string | null) {
+    void navigate({
+      to: ".",
+      search: (prev: Record<string, unknown>) => applyLensPatch(prev, { org: id }),
+    });
+  }
+
+  return { selectedOrgId, setSelectedOrgId };
 }
 
 type TreeNode = OrgUnitNode & { children: TreeNode[] };

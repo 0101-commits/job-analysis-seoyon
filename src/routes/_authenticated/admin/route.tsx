@@ -1,6 +1,5 @@
 import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
 import { AdminShell } from "@/components/AdminShell";
-import { CompanyProvider } from "@/components/CompanyContext";
 import { fetchMyRole } from "@/lib/auth";
 
 export const Route = createFileRoute("/_authenticated/admin")({
@@ -14,10 +13,8 @@ export const Route = createFileRoute("/_authenticated/admin")({
 
 function AdminLayout() {
   return (
-    <CompanyProvider>
-      <AdminShell>
-        <Outlet />
-      </AdminShell>
-    </CompanyProvider>
+    <AdminShell>
+      <Outlet />
+    </AdminShell>
   );
 }

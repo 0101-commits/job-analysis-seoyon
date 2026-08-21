@@ -46,6 +46,7 @@ import {
   orgSubtreeIds,
   useOrgLens,
 } from "@/components/admin/OrgTreeFilter";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { usePersistedState } from "@/hooks/use-persisted-ui";
 import { COPY } from "@/lib/glossary";
 import { ACCOUNT_STATUS_LABELS } from "@/lib/auth";
@@ -84,17 +85,16 @@ import {
  * 다른 화면(참여자 관리·대시보드)이 대상을 실어 이 화면으로 보낼 수 있게 네 값을 받는다.
  *   ?tab=templates|preview|send|history  탭 지정. 없으면 대상 지정이 있으면 발송 탭으로 간다
  *   ?template=<템플릿 id 또는 종류>       종류는 invite | reminder | custom
- *   ?org=<소속 id>                        소속 트리 선택을 그대로 이어받는다
+ *   ?co=<계열사 id> ?org=<소속 id>        계열사·소속 렌즈 (기획 v2 P2) — 모든 관리 화면이 공유한다
  *   ?status=<계정 상태>                    쉼표로 여러 개. 예: status=초대발송,미접속
  *   ?ids=<참여자 id>                       쉼표로 여러 개. 이 사람들로만 대상을 좁힌다
  */
 const TAB_VALUES = ["templates", "preview", "send", "history"] as const;
 export type MailTab = (typeof TAB_VALUES)[number];
 
-export type MailSearch = {
+export type MailSearch = LensSearch & {
   tab?: MailTab;
   template?: string;
-  org?: string;
   status?: string;
   ids?: string;
 };
@@ -105,7 +105,7 @@ function searchText(value: unknown) {
 
 export const Route = createFileRoute("/_authenticated/admin/mail")({
   validateSearch: (search: Record<string, unknown>): MailSearch => {
-    const out: MailSearch = {};
+    const out: MailSearch = { ...pickLens(search) };
     const tab = searchText(search["tab"]);
     if (tab && (TAB_VALUES as readonly string[]).includes(tab)) {
       out.tab = tab as MailTab;
@@ -656,10 +656,8 @@ function SendTab({
     if (hit) setTemplateId(hit.id);
   }, [search.template, templates]);
 
-  // ?org= 로 넘어온 소속을 공용 렌즈에 반영한다 — 다른 화면에서 보던 조직을 그대로 이어받는다.
-  useEffect(() => {
-    if (search.org && search.org !== selectedOrgId) setSelectedOrgId(search.org);
-  }, [search.org, selectedOrgId, setSelectedOrgId]);
+  // 소속 렌즈는 이제 이 화면의 ?org= 자체가 원천이라(useOrgLens), 다른 화면에서 넘어온 값을
+  // 옮겨 싣는 별도 반영이 필요 없다.
 
   const {
     data: targets,

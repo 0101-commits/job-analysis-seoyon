@@ -29,6 +29,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { EmptyState } from "@/components/EmptyState";
 import { JobDescriptionEditor } from "@/components/admin/JobDescriptionEditor";
 import { cn } from "@/lib/utils";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { DEFAULT_OPS, getOpsValues } from "@/lib/settings.functions";
 import {
   draftJobDescriptions,
@@ -46,6 +47,8 @@ import {
 } from "@/lib/export.functions";
 
 export const Route = createFileRoute("/_authenticated/admin/export")({
+  /** `?co=` `?org=` — 계열사·소속 렌즈 (기획 v2 P2). 다른 화면과 값을 주고받을 때 필요하다. */
+  validateSearch: (search: Record<string, unknown>): LensSearch => pickLens(search),
   head: () => ({
     meta: [
       { title: "직무기술서·내보내기 | 서연 그룹 업무조사" },

@@ -16,6 +16,7 @@ import {
 import { EmptyState } from "@/components/EmptyState";
 import { SectionNav } from "@/components/SectionNav";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import {
   aiProxyStatus,
   applyMerge,
@@ -35,6 +36,8 @@ import { draftDutyCharts, draftJobCatalog } from "@/lib/master.functions";
  * 목록의 각 행은 그 응답의 검토 화면(`/admin/review?response=<id>`)으로 곧장 들어간다(P6).
  */
 export const Route = createFileRoute("/_authenticated/admin/ai")({
+  /** `?co=` `?org=` — 계열사·소속 렌즈 (기획 v2 P2). 다른 화면과 값을 주고받을 때 필요하다. */
+  validateSearch: (search: Record<string, unknown>): LensSearch => pickLens(search),
   head: () => ({
     meta: [
       { title: "AI 일괄 점검 | 서연 그룹 업무조사" },
@@ -144,7 +147,7 @@ function AiPage() {
         ]}
       />
 
-      <section id="sweep-ledger" className="scroll-mt-20 space-y-3">
+      <section id="sweep-ledger" className="scroll-mt-[var(--sticky-top)] space-y-3">
         <h2 className="text-base font-semibold">AI 사용 현황</h2>
         <p className="text-sm text-muted-foreground">
           AI 가 무엇을 얼마나 바꿨고 어디서 실패했는지 봅니다.
@@ -152,7 +155,7 @@ function AiPage() {
         <AiLedgerPanel />
       </section>
 
-      <section id="sweep-pending" className="scroll-mt-20 space-y-3">
+      <section id="sweep-pending" className="scroll-mt-[var(--sticky-top)] space-y-3">
         <h2 className="text-base font-semibold">미결 AI 제안</h2>
         <p className="text-sm text-muted-foreground">
           아직 수락·거절되지 않은 제안이 남은 응답입니다. 제안이 남아 있으면 승인 게이트가 막힐 수
@@ -195,12 +198,12 @@ function AiPage() {
         )}
       </section>
 
-      <section id="sweep-poor" className="scroll-mt-20 space-y-3">
+      <section id="sweep-poor" className="scroll-mt-[var(--sticky-top)] space-y-3">
         <h2 className="text-base font-semibold">부실 응답 스윕</h2>
         <PoorSweep scope={scope} onProxyError={setProxyError} />
       </section>
 
-      <section id="sweep-merge" className="scroll-mt-20 space-y-3">
+      <section id="sweep-merge" className="scroll-mt-[var(--sticky-top)] space-y-3">
         <h2 className="text-base font-semibold">표기 통일</h2>
         <MergeSweep scope={scope} onProxyError={setProxyError} />
       </section>
@@ -360,8 +363,8 @@ function AiLedgerPanel() {
                       disabled={retryCatalog.isPending}
                       onClick={() => retryCatalog.mutate(f.retry!.value)}
                     >
-                      {retryCatalog.isPending && <Loader2 className="size-4 animate-spin" />}
-                      이 직군만 다시 생성
+                      {retryCatalog.isPending && <Loader2 className="size-4 animate-spin" />}이
+                      직군만 다시 생성
                     </Button>
                   )}
                   {f.retry?.kind === "dutyChart" && (
@@ -371,12 +374,14 @@ function AiLedgerPanel() {
                       disabled={retryDuty.isPending}
                       onClick={() => retryDuty.mutate(f.retry!.value)}
                     >
-                      {retryDuty.isPending && <Loader2 className="size-4 animate-spin" />}
-                      이 조직만 다시 생성
+                      {retryDuty.isPending && <Loader2 className="size-4 animate-spin" />}이 조직만
+                      다시 생성
                     </Button>
                   )}
                 </div>
-                <p className="mt-2 text-destructive">{f.errorMessage ?? "사유가 남아 있지 않습니다."}</p>
+                <p className="mt-2 text-destructive">
+                  {f.errorMessage ?? "사유가 남아 있지 않습니다."}
+                </p>
               </li>
             ))}
           </ul>

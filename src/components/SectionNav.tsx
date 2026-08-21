@@ -30,6 +30,12 @@ export function SectionNav({
       .filter((el): el is HTMLElement => Boolean(el));
     if (targets.length === 0) return;
 
+    // 헤더 높이가 바뀌어도 구획 감지 기준선이 헤더 뒤로 숨지 않도록 --header-h 에서 유도한다.
+    const headerH = parseInt(
+      getComputedStyle(document.documentElement).getPropertyValue("--header-h"),
+      10,
+    );
+    const topMargin = (Number.isFinite(headerH) ? headerH : 97) + 8;
     const observer = new IntersectionObserver(
       (entries) => {
         const visible = entries
@@ -37,7 +43,7 @@ export function SectionNav({
           .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
         if (visible) setActive(visible.target.id);
       },
-      { rootMargin: "-72px 0px -60% 0px" },
+      { rootMargin: `-${topMargin}px 0px -60% 0px` },
     );
     targets.forEach((el) => observer.observe(el));
     return () => observer.disconnect();
@@ -90,14 +96,11 @@ export function CollapsibleSection({
   children: React.ReactNode;
   defaultCollapsed?: boolean;
 }) {
-  const { isCollapsed, toggle } = useCollapsedSections(
-    storageKey,
-    defaultCollapsed ? [id] : [],
-  );
+  const { isCollapsed, toggle } = useCollapsedSections(storageKey, defaultCollapsed ? [id] : []);
   const collapsed = isCollapsed(id);
 
   return (
-    <section id={id} className="scroll-mt-20 space-y-3">
+    <section id={id} className="scroll-mt-[var(--sticky-top)] space-y-3">
       <div className="flex items-center gap-2">
         <button
           type="button"
