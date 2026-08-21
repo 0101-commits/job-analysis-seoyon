@@ -27,8 +27,8 @@ import {
 } from "@/components/ui/select";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { CommandPalette } from "@/components/admin/CommandPalette";
-import { OpsEvidenceBar } from "@/components/admin/OpsEvidenceBar";
 import { orgPathLabel, useOrgLens } from "@/components/admin/OrgTreeFilter";
+import { listActiveCompanies } from "@/lib/companies";
 import { applyLensPatch } from "@/lib/lens-search";
 import { cn } from "@/lib/utils";
 
@@ -67,7 +67,7 @@ const NAV: NavGroup[] = [
   {
     label: "2 · 수집",
     items: [
-      { to: "/admin/mail", label: "안내·독려 메일", icon: Mail },
+      { to: "/admin/mail", label: "메일 템플릿", icon: Mail },
       { to: "/admin/review", label: "응답 검토", icon: ClipboardCheck, badge: "review" },
     ],
   },
@@ -95,16 +95,10 @@ export function AdminShell({ children }: { children: ReactNode }) {
   const { companyId } = useCompanyScope();
   const { selectedOrgId, setSelectedOrgId } = useOrgLens();
 
+  // 스위처에는 운영 중 계열사만 — 중지된 계열사는 화면에서 빠진다 (기획 11).
   const { data: companies } = useQuery({
-    queryKey: ["companies"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("companies")
-        .select("id, name")
-        .order("created_at");
-      if (error) throw error;
-      return data;
-    },
+    queryKey: ["companies", "active"],
+    queryFn: listActiveCompanies,
   });
 
   // 헤더에 "지금 무엇을 보는 중인지" 표시하려면 선택한 소속의 경로 이름이 필요하다.
@@ -283,7 +277,6 @@ export function AdminShell({ children }: { children: ReactNode }) {
             </Button>
           </div>
         </div>
-        <OpsEvidenceBar />
       </header>
 
       {/* 헤더 높이는 위 ResizeObserver 가 --header-h 로 실측해 넣는다. */}

@@ -316,8 +316,8 @@ export function JobDescriptionEditor({ jd, authHeaders, onChanged }: Props) {
 
       {locked && (
         <p className="rounded-lg border border-success/30 bg-success/5 p-2.5 text-xs text-success">
-          확정된 내용입니다. 내보내기·반출 묶음에는 확정된 직무기술서만 실립니다. 고쳐야 하면 [확정
-          해제]를 눌러 주세요.
+          확정된 내용입니다. 내보내기 화면의 표준 직무기술서 엑셀에는 확정된 직무기술서만 실립니다.
+          고쳐야 하면 [확정 해제]를 눌러 주세요.
         </p>
       )}
 

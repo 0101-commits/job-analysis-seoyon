@@ -1,4 +1,5 @@
 import { withJosa } from "@/lib/glossary";
+import type { SheetSpec } from "@/lib/xlsx";
 import * as XLSX from "xlsx";
 
 export const ROSTER_COLUMNS = [
@@ -31,25 +32,82 @@ export type RosterRow = {
   };
 };
 
-export function rosterTemplateCsv() {
-  const header = ROSTER_COLUMNS.join(",");
-  const sample = [
-    "서연",
-    "홍길동",
-    "20150908",
-    "gildong.hong@seoyon.example",
-    "900312",
-    "경영기획본부 / 기획팀",
-    "차장",
-    "책임",
-  ].join(",");
-  return "﻿" + header + "\n" + sample + "\n";
+/**
+ * 명부 템플릿(엑셀 2시트) — 시트1 「입력」에 헤더+예시 1행, 시트2 「작성 안내」에 열별 안내.
+ */
+export function rosterTemplateSheets(): SheetSpec[] {
+  return [
+    {
+      name: "입력",
+      rows: [
+        [...ROSTER_COLUMNS],
+        [
+          "서연",
+          "홍길동",
+          "20150908",
+          "gildong.hong@seoyon.example",
+          "900312",
+          "경영기획본부 / 기획팀",
+          "차장",
+          "책임",
+        ],
+      ],
+      colWidths: [10, 10, 12, 30, 16, 26, 8, 10],
+    },
+    {
+      name: "작성 안내",
+      rows: [
+        ["항목", "필수 여부", "형식", "예시", "자주 하는 실수"],
+        [
+          "회사",
+          "필수",
+          "시스템에 등록된 계열사 이름 그대로",
+          "서연",
+          "약칭이나 다른 표기로 적으면 「등록되지 않은 계열사」 오류가 납니다",
+        ],
+        ["성명", "필수", "실명", "홍길동", "이름 뒤에 직급을 붙여 적지 않습니다"],
+        [
+          "사번",
+          "필수",
+          "사내 사번 그대로",
+          "20150908",
+          "같은 계열사 안에서 중복되거나 이미 등록된 사번이면 올릴 수 없습니다",
+        ],
+        [
+          "이메일",
+          "필수",
+          "실제 수신 가능한 회사 메일",
+          "gildong.hong@seoyon.example",
+          "오타·퇴사자 메일 주의. 허용 도메인이 설정돼 있으면 그 도메인만 통과합니다",
+        ],
+        [
+          "생년월일(YYMMDD)",
+          "선택",
+          "YYMMDD 6자리 (YYYYMMDD 8자리도 가능)",
+          "900101",
+          "숫자가 6자리도 8자리도 아니면 형식 오류가 납니다",
+        ],
+        [
+          "소속",
+          "선택",
+          "본부/팀을 「/」로 구분해 한 칸에",
+          "경영기획본부 / 기획팀",
+          "조직도와 다른 이름으로 적으면 조직 연결이 자동으로 되지 않을 수 있습니다",
+        ],
+        ["직급", "선택", "회사에서 쓰는 직급 명칭", "차장", "비워 두어도 됩니다"],
+        ["역할단계", "선택", "회사에서 쓰는 역할단계 명칭", "책임", "비워 두어도 됩니다"],
+      ],
+      colWidths: [18, 10, 34, 30, 48],
+    },
+  ];
 }
 
 export async function parseRosterFile(file: File): Promise<RosterRaw[]> {
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, { type: "array", raw: false, codepage: 65001 });
-  const sheetName = wb.SheetNames[0];
+  // 2시트 템플릿(입력 + 작성 안내)을 그대로 올려도 안내 시트를 데이터로 오인하지 않도록
+  // 「입력」 시트가 있으면 그것을, 없으면 첫 시트를 읽는다.
+  const sheetName = wb.SheetNames.includes("입력") ? "입력" : wb.SheetNames[0];
   if (!sheetName) return [];
   const sheet = wb.Sheets[sheetName];
   if (!sheet) return [];

@@ -147,9 +147,11 @@ export async function collectRuleTargets(
     };
   }
 
-  // 마감임박: 마감이 오늘부터 rule.days 일 뒤인 계열사 + 차수를 함께 본다.
+  // 마감임박: 마감이 다가온 계열사 + 차수를 함께 본다.
   // 계열사 마감은 그 계열사 전원, 차수 마감은 그 차수에 속한 사람(participants.wave_id)만.
-  // 차수 자체의 reminder_days 는 여기서 쓰지 않는다 — 며칠 전에 보낼지는 이 규칙의 값이 정한다.
+  // 며칠 전에 보낼지 (v4): 차수에 독려 안내 일자(reminder_days)가 설정돼 있으면 그 값이
+  // 우선이고, 없는 차수는 이 규칙의 값(rule.days)을 따른다. 차수 일정이 있는 사람에게는
+  // 계열사 기본값으로 겹쳐 보내지 않는다.
   const { listWaveDeadlinesForReminders } = await import("./wave.functions");
   const [{ data: settings }, waves] = await Promise.all([
     admin.from("survey_settings").select("company_id, deadline"),
@@ -168,18 +170,23 @@ export async function collectRuleTargets(
   const dueWaveIds = waves
     .filter((w) => {
       if (rule.company_id && w.companyId !== rule.company_id) return false;
-      return daysLeft(w.deadline, today) === rule.days;
+      const days = w.reminderDays.length > 0 ? w.reminderDays : [rule.days];
+      return days.includes(daysLeft(w.deadline, today));
     })
     .map((w) => w.waveId);
 
   if (dueCompanies.length === 0 && dueWaveIds.length === 0) {
     return {
       participantIds: [],
-      note: `오늘은 어느 계열사·차수도 제출 마감 ${rule.days}일 전이 아닙니다.`,
+      note: `오늘은 어느 계열사·차수도 독려를 보낼 시점(계열사는 마감 ${rule.days}일 전, 차수는 각자 설정한 일자)이 아닙니다.`,
     };
   }
+  const waveById = new Map(waves.map((w) => [w.waveId, w]));
   const targets = people.filter((p) => {
     if (DONE_STATUSES.includes(p.account_status)) return false;
+    // 차수에 독려 일정이 따로 있으면 그 일정만 따른다 — 계열사 기본값과 겹쳐 보내지 않는다.
+    const wave = p.wave_id ? waveById.get(p.wave_id) : undefined;
+    if (wave && wave.reminderDays.length > 0) return dueWaveIds.includes(wave.waveId);
     if (dueCompanies.includes(p.company_id)) return true;
     return p.wave_id !== null && dueWaveIds.includes(p.wave_id);
   });

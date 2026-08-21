@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 /**
  * 사용자가 만든 화면 상태를 기억한다 (기획 A4·D6).
  *
- * 접은 섹션·목록 밀도처럼 "다시 왔을 때 그대로여야 하는" 값만 저장한다.
+ * 접은 섹션·표에 보일 열처럼 "다시 왔을 때 그대로여야 하는" 값만 저장한다.
  * 서버에 둘 성격이 아니고, 브라우저가 지워져도 기본값으로 돌아가면 되는 값들이다.
  */
 
@@ -98,13 +98,4 @@ export function useCollapsedSections(key: string, defaultCollapsed: string[] = [
   );
 
   return { isCollapsed, toggle };
-}
-
-export type Density = "comfortable" | "compact";
-
-/** 목록 밀도. 500행을 훑을 때와 한 건을 읽을 때 필요한 행 높이가 다르다. */
-export function useDensity(key: string) {
-  const [density, setDensity] = usePersistedState<Density>(`density:${key}`, "comfortable");
-  const rowClass = density === "compact" ? "py-1.5 text-[13px]" : "py-3 text-sm";
-  return { density, setDensity, rowClass };
 }

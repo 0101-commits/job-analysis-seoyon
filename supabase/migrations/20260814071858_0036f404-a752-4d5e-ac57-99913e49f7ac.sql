@@ -76,21 +76,6 @@ BEGIN NEW.updated_at = now(); RETURN NEW; END; $$;
 CREATE TRIGGER participants_updated_at BEFORE UPDATE ON public.participants
   FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
-INSERT INTO public.companies (name, code) VALUES ('서연','SY'),('서연이화','SYEH'),('서연탑메탈','SYTM');
-
-INSERT INTO public.participants (company_id, emp_no, name, email, birth_date, org_text, grade, role_level, role, account_status)
-SELECT c.id, v.emp_no, v.name, v.email, v.birth_date::date, v.org_text, v.grade, v.role_level, v.role::public.app_role, v.account_status::public.account_status
-FROM (VALUES
- ('SY','20180112','김지훈','jihoon.kim@seoyon.example','1985-03-12','경영기획본부 / 기획팀','부장','팀장','respondent','승인'),
- ('SY','20190233','박서연','seoyeon.park@seoyon.example','1990-07-05','경영기획본부 / 재무팀','과장','팀원','respondent','제출'),
- ('SY','20200451','이도현','dohyun.lee@seoyon.example','1992-11-21','생산본부 / 품질관리팀','대리','팀원','respondent','작성중'),
- ('SY','20210077','최민아','mina.choi@seoyon.example','1994-01-30','경영지원본부 / 인사팀','사원','팀원','respondent','초대발송'),
- ('SY','20150908','정우성','wooseong.jung@seoyon.example','1982-05-17','연구개발본부 / 선행연구팀','차장','팀장','respondent','미접속'),
- ('SYEH','30170345','한소희','sohee.han@seoyoneh.example','1988-09-09','영업본부 / 국내영업팀','부장','팀장','respondent','승인'),
- ('SYEH','30180912','오세훈','sehoon.oh@seoyoneh.example','1991-02-14','생산본부 / 사출생산팀','과장','팀원','respondent','반려'),
- ('SYEH','30200188','윤하늘','haneul.yoon@seoyoneh.example','1993-06-23','생산본부 / 설비팀','대리','팀원','respondent','작성중'),
- ('SYEH','30210562','서지안','jian.seo@seoyoneh.example','1995-12-02','경영지원본부 / 총무팀','사원','팀원','respondent','미발송'),
- ('SYEH','30160431','강태오','taeoh.kang@seoyoneh.example','1986-08-08','연구개발본부 / 설계팀','차장','팀장','respondent','제출'),
- ('SY','90000001','HCG 컨설턴트','consultant@hcg.example','1980-04-04','HCG 컨설팅','컨설턴트','관리자','admin','승인')
-) AS v(code, emp_no, name, email, birth_date, org_text, grade, role_level, role, account_status)
-JOIN public.companies c ON c.code = v.code;
+INSERT INTO public.companies (name, code) VALUES ('서연','SY'),('서연이화','SYEH');
+-- v4 정비(2026-08-21): 상태 데모용 시드 참여자 11명 INSERT 를 제거했다.
+-- 운영 DB 에 들어간 기존 시드는 supabase/maintenance/20260821_seed_cleanup.sql 로 정리한다.

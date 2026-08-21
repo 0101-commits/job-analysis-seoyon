@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "실행할 작업 (all / scheduled-mail / reminders / backup / report / cleanup)"
+        description: "실행할 작업 (all / scheduled-mail / reminders / backup / cleanup)"
         required: false
         default: "all"
 

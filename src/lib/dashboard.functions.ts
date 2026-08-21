@@ -59,7 +59,8 @@ export const getOrgOverview = createServerFn({ method: "GET" })
     const admin = untyped(supabaseAdmin);
 
     const [{ data: companies }, { data: units }, { data: settings }] = await Promise.all([
-      admin.from("companies").select("id, name").order("created_at"),
+      // v4: 운영 중(active) 계열사만 — 중지된 계열사는 화면에서 빠진다 (companies.ts 참조).
+      admin.from("companies").select("id, name").eq("status", "active").order("created_at"),
       admin.from("org_units").select("id, company_id, parent_id, name, level, sort"),
       admin.from("survey_settings").select("company_id, deadline, stale_days"),
     ]);

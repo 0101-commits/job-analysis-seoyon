@@ -18,7 +18,6 @@ import {
   MoreHorizontal,
   Pencil,
   Plus,
-  Rows3,
   Search,
   TableProperties,
   Trash2,
@@ -73,12 +72,12 @@ import {
 import { useCompanyScope } from "@/components/CompanyContext";
 import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { similarity } from "@/components/survey/validation";
-import { usePersistedState, useDensity } from "@/hooks/use-persisted-ui";
+import { usePersistedState } from "@/hooks/use-persisted-ui";
 import { ACCOUNT_STATUS_LABELS } from "@/lib/auth";
 import {
   ROSTER_COLUMNS,
   parseRosterFile,
-  rosterTemplateCsv,
+  rosterTemplateSheets,
   validateRoster,
   type RosterDiffKind,
   type RosterDiffResult,
@@ -88,10 +87,10 @@ import {
 } from "@/lib/roster";
 import { RosterDiffPanel, type LeaverAction } from "@/components/admin/RosterDiffPanel";
 import {
+  addParticipant,
   applyRoster,
   archiveParticipant,
   assignParticipantOrg,
-  createParticipant,
   deleteParticipant,
   diffRoster,
   matchParticipantOrgUnits,
@@ -100,7 +99,9 @@ import {
   setParticipantTags,
   updateParticipant,
 } from "@/lib/admin.functions";
-import { getAllowedEmailDomains } from "@/lib/settings.functions";
+import { getAllowedEmailDomains, getSettings } from "@/lib/settings.functions";
+import { listActiveCompanies } from "@/lib/companies";
+import { downloadXlsx } from "@/lib/xlsx";
 import { fetchAll } from "@/lib/paginate";
 
 /**
@@ -108,7 +109,9 @@ import { fetchAll } from "@/lib/paginate";
  *
  * 받는다 — 대시보드·전역 검색이 보낸다
  *   ?p=<참여자id>    그 사람의 상세 패널을 열고 목록에서 그 행을 강조한다
- *   ?status=<상태>   그 상태만 남긴다 (계정 상태 7종)
+ *   ?status=<상태[,상태]>   그 상태만 남긴다 (계정 상태 7종, 콤마로 여러 개 —
+ *                    대시보드 진행축 딥링크가 「미확인=초대발송,미접속」처럼 묶어 보낸다)
+ *   ?recheck=1       변경 재확인이 필요한 응답이 있는 참여자만 (기획 F10)
  *   ?co=<계열사id> ?org=<소속id>   계열사·소속 렌즈 (기획 v2 P2) — 모든 관리 화면이 공유한다
  *   ?q=<검색어> ?tag=<태그> ?archived=1 ?tab=list|upload
  *   ?assignWave=<차수id> 차수 관리 화면이 보낸다 — 그 차수로 배정하는 흐름을 연다
@@ -126,6 +129,7 @@ type ParticipantsSearch = LensSearch & {
   q?: string;
   tag?: string;
   archived?: boolean;
+  recheck?: boolean;
   assignWave?: string;
 };
 
@@ -156,9 +160,15 @@ export const Route = createFileRoute("/_authenticated/admin/participants")({
     const p = text("p");
     if (p) out.p = p;
     // 모르는 상태 값이 오면 무시한다 — 조건에 맞는 사람이 0명인 빈 화면을 만들지 않기 위해.
+    // 콤마로 여러 상태를 받는다(진행축 딥링크). 아는 상태만 남기고, 하나도 없으면 필터를 걸지 않는다.
     const status = text("status");
-    if (status && (ACCOUNT_STATUS_LABELS as readonly string[]).includes(status))
-      out.status = status;
+    if (status) {
+      const known = status
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => (ACCOUNT_STATUS_LABELS as readonly string[]).includes(s));
+      if (known.length > 0) out.status = known.join(",");
+    }
     const org = text("org");
     if (org) out.org = org;
     const q = text("q");
@@ -167,6 +177,8 @@ export const Route = createFileRoute("/_authenticated/admin/participants")({
     if (tag) out.tag = tag;
     const archived = search["archived"];
     if (archived === true || archived === "1" || archived === "true") out.archived = true;
+    const recheck = search["recheck"];
+    if (recheck === true || recheck === "1" || recheck === "true") out.recheck = true;
     const assignWave = text("assignWave");
     if (assignWave) out.assignWave = assignWave;
     return out;
@@ -211,17 +223,11 @@ function downloadCsv(name: string, body: string) {
 
 type Company = { id: string; name: string };
 
+/** 운영 중(active) 계열사만 — 계열사 조회의 단일 창구(companies.ts)를 거친다 (v4). */
 function useCompanies() {
   return useQuery({
-    queryKey: ["companies"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("companies")
-        .select("id, name")
-        .order("created_at");
-      if (error) throw error;
-      return (data ?? []) as Company[];
-    },
+    queryKey: ["companies-active"],
+    queryFn: async (): Promise<Company[]> => listActiveCompanies(),
   });
 }
 
@@ -569,7 +575,7 @@ function RosterUploadTab() {
         <Button
           variant="outline"
           size="sm"
-          onClick={() => downloadCsv("참여자_명부_템플릿.csv", rosterTemplateCsv())}
+          onClick={() => downloadXlsx("참여자_명부_템플릿.xlsx", rosterTemplateSheets())}
         >
           <Download className="size-4" />
           템플릿 내려받기
@@ -609,7 +615,7 @@ function RosterUploadTab() {
           title="올릴 명부 파일을 고르세요"
           description="엑셀(.xlsx) 또는 CSV 파일을 올리면 열을 자동으로 맞추고, 반영 전에 오류를 먼저 보여 줍니다. 처음이라면 템플릿을 받아 그 형식대로 채우는 편이 빠릅니다."
           actionLabel="템플릿 내려받기"
-          onAction={() => downloadCsv("참여자_명부_템플릿.csv", rosterTemplateCsv())}
+          onAction={() => downloadXlsx("참여자_명부_템플릿.xlsx", rosterTemplateSheets())}
         />
       ) : (
         <>
@@ -980,68 +986,50 @@ function useOrgUnitOptions(companyId: string) {
   return useMemo(() => flattenOrgUnits(data ?? []), [data]);
 }
 
-/** 추가·수정 공용 폼. 참여자가 null 이면 추가(계열사·사번 입력), 있으면 수정(둘은 고정). */
+/** 수정 폼. 계열사·사번은 고정이다 — 추가는 AddParticipantDialog 가 담당한다. */
 function ParticipantFormDialog({
   open,
   participant,
-  companies,
-  defaultCompanyId,
   onOpenChange,
 }: {
   open: boolean;
-  participant: Participant | null;
-  companies: Company[];
-  defaultCompanyId: string;
+  participant: Participant;
   onOpenChange: (open: boolean) => void;
 }) {
   const queryClient = useQueryClient();
   const [form, setForm] = useState(() => ({
-    companyId: participant?.company_id ?? defaultCompanyId,
-    emp_no: participant?.emp_no ?? "",
-    name: participant?.name ?? "",
-    email: participant?.email ?? "",
-    birth_date: participant?.birth_date ?? "",
-    org_text: participant?.org_text ?? "",
-    grade: participant?.grade ?? "",
-    role_level: participant?.role_level ?? "",
-    org_unit_id: participant?.org_unit_id ?? "",
+    name: participant.name,
+    email: participant.email ?? "",
+    birth_date: participant.birth_date ?? "",
+    org_text: participant.org_text ?? "",
+    grade: participant.grade ?? "",
+    role_level: participant.role_level ?? "",
+    org_unit_id: participant.org_unit_id ?? "",
   }));
 
-  const orgOptions = useOrgUnitOptions(form.companyId);
+  const orgOptions = useOrgUnitOptions(participant.company_id);
 
   function set<K extends keyof typeof form>(key: K, value: string) {
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
   const save = useMutation({
-    mutationFn: async () => {
-      const headers = await authHeaders();
-      const fields = {
-        name: form.name.trim(),
-        email: form.email.trim(),
-        birth_date: form.birth_date || null,
-        org_text: form.org_text.trim(),
-        grade: form.grade.trim(),
-        role_level: form.role_level.trim(),
-        orgUnitId: form.org_unit_id || null,
-      };
-      if (participant) {
-        return updateParticipant({
-          data: { participantId: participant.id, ...fields },
-          headers,
-        });
-      }
-      return createParticipant({
-        data: { companyId: form.companyId, emp_no: form.emp_no.trim(), ...fields },
-        headers,
-      });
-    },
+    mutationFn: async () =>
+      updateParticipant({
+        data: {
+          participantId: participant.id,
+          name: form.name.trim(),
+          email: form.email.trim(),
+          birth_date: form.birth_date || null,
+          org_text: form.org_text.trim(),
+          grade: form.grade.trim(),
+          role_level: form.role_level.trim(),
+          orgUnitId: form.org_unit_id || null,
+        },
+        headers: await authHeaders(),
+      }),
     onSuccess: () => {
-      toast.success(
-        participant
-          ? `${form.name.trim()} 정보를 수정했습니다.`
-          : `${form.name.trim()}${josa(form.name.trim(), "을/를")} 명부에 등록했습니다. 목록에서 선택해 계정을 생성하세요.`,
-      );
+      toast.success(`${form.name.trim()} 정보를 수정했습니다.`);
       onOpenChange(false);
       void queryClient.invalidateQueries({ queryKey: ["participants"] });
       void queryClient.invalidateQueries({ queryKey: ["participants-keys"] });
@@ -1049,57 +1037,19 @@ function ParticipantFormDialog({
     onError: (err) => toast.error(errorMessage(err)),
   });
 
-  const canSave =
-    form.name.trim().length > 0 &&
-    (participant !== null || (form.emp_no.trim().length > 0 && form.companyId.length > 0));
+  const canSave = form.name.trim().length > 0;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>{participant ? "참여자 수정" : "참여자 추가"}</DialogTitle>
+          <DialogTitle>참여자 수정</DialogTitle>
           <DialogDescription>
-            {participant
-              ? `${participant.companies?.name ?? "-"} · 사번 ${participant.emp_no}. 계열사와 사번은 바꿀 수 없습니다.`
-              : "한 명을 직접 등록합니다. 계정은 등록 후 명단에서 선택해 발급하세요."}
+            {`${participant.companies?.name ?? "-"} · 사번 ${participant.emp_no}. 계열사와 사번은 바꿀 수 없습니다.`}
           </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-3 sm:grid-cols-2">
-          {!participant && (
-            <>
-              <div className="space-y-1.5">
-                <Label htmlFor="p-company">계열사 *</Label>
-                <Select
-                  value={form.companyId}
-                  onValueChange={(v) =>
-                    // 계열사가 바뀌면 이전 계열사의 조직 선택은 무효다.
-                    setForm((prev) => ({ ...prev, companyId: v, org_unit_id: "" }))
-                  }
-                >
-                  <SelectTrigger id="p-company">
-                    <SelectValue placeholder="선택" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {companies.map((c) => (
-                      <SelectItem key={c.id} value={c.id}>
-                        {c.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="p-empno">사번 *</Label>
-                <Input
-                  id="p-empno"
-                  value={form.emp_no}
-                  onChange={(e) => set("emp_no", e.target.value)}
-                  placeholder="20150908"
-                />
-              </div>
-            </>
-          )}
           <div className="space-y-1.5">
             <Label htmlFor="p-name">이름 *</Label>
             <Input id="p-name" value={form.name} onChange={(e) => set("name", e.target.value)} />
@@ -1170,7 +1120,7 @@ function ParticipantFormDialog({
           </div>
         </div>
 
-        {participant?.user_id && form.email.trim() !== (participant.email ?? "") && (
+        {participant.user_id && form.email.trim() !== (participant.email ?? "") && (
           <p className="text-xs text-muted-foreground">
             이메일을 바꾸면 로그인 계정 아이디도 함께 변경됩니다.
           </p>
@@ -1182,7 +1132,212 @@ function ParticipantFormDialog({
           </Button>
           <Button disabled={!canSave || save.isPending} onClick={() => save.mutate()}>
             {save.isPending && <Loader2 className="size-4 animate-spin" />}
-            {participant ? "저장" : "등록"}
+            저장
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** YYMMDD·YYYYMMDD → YYYY-MM-DD. 명부 업로드(roster.ts normalizeBirth)와 같은 규칙(YY>30 → 1900년대). */
+function normalizeBirth6(value: string): string | null {
+  const digits = value.replace(/[^0-9]/g, "");
+  if (!digits) return null;
+  if (digits.length === 8) {
+    return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+  }
+  if (digits.length === 6) {
+    const yy = Number(digits.slice(0, 2));
+    const century = yy > 30 ? 1900 : 2000;
+    return `${century + yy}-${digits.slice(2, 4)}-${digits.slice(4, 6)}`;
+  }
+  return null;
+}
+
+/**
+ * 참여자 즉시 추가 (기획 15). 명부 등록과 계정 발급을 한 번에 한다 —
+ * 명부 업로드를 다시 돌리지 않고 조사 중간에 합류한 한 명을 바로 태울 수 있다.
+ */
+function AddParticipantDialog({
+  companies,
+  defaultCompanyId,
+  onOpenChange,
+}: {
+  companies: Company[];
+  defaultCompanyId: string;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [form, setForm] = useState(() => ({
+    companyId: defaultCompanyId,
+    emp_no: "",
+    name: "",
+    email: "",
+    birth: "",
+    org_text: "",
+    grade: "",
+    role_level: "",
+  }));
+
+  // 역할단계 선택지는 설정 화면(system_settings.role_levels)이 단일 원천이다.
+  const { data: settings } = useQuery({
+    queryKey: ["admin-settings"],
+    queryFn: async () => getSettings({ headers: await authHeaders() }),
+  });
+  const roleLevels: string[] = settings?.roleLevels ?? [];
+
+  function set<K extends keyof typeof form>(key: K, value: string) {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  const birthInvalid = form.birth.trim() !== "" && normalizeBirth6(form.birth) === null;
+
+  const save = useMutation({
+    mutationFn: async () =>
+      addParticipant({
+        data: {
+          companyId: form.companyId,
+          emp_no: form.emp_no.trim(),
+          name: form.name.trim(),
+          email: form.email.trim(),
+          birth_date: form.birth.trim() ? normalizeBirth6(form.birth) : null,
+          org_text: form.org_text.trim(),
+          grade: form.grade.trim(),
+          role_level: form.role_level,
+        },
+        headers: await authHeaders(),
+      }),
+    onSuccess: (res) => {
+      const name = form.name.trim();
+      if (res.provisioned) {
+        toast.success(
+          `${name}${josa(name, "을/를")} 등록하고 계정이 만들어졌습니다. 안내 메일은 차수 발송에서 보냅니다.`,
+        );
+      } else {
+        toast.success(`${name}${josa(name, "을/를")} 명부에 등록했습니다.`);
+        toast.error(
+          `계정은 지금 만들지 못했습니다(${res.reason ?? "계정은 배포 환경에서 생성됩니다"}). 명단에서 [계정 생성]으로 다시 시도하세요.`,
+        );
+      }
+      onOpenChange(false);
+      void queryClient.invalidateQueries({ queryKey: ["participants"] });
+      void queryClient.invalidateQueries({ queryKey: ["participants-keys"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const canSave =
+    form.companyId.length > 0 &&
+    form.emp_no.trim().length > 0 &&
+    form.name.trim().length > 0 &&
+    form.email.trim().length > 0 &&
+    !birthInvalid;
+
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>참여자 추가</DialogTitle>
+          <DialogDescription>
+            한 명을 바로 등록합니다. 저장하면 규칙 비밀번호(기본: 생년월일 6자리+사번 뒤 4자리)로
+            계정까지 만들어지고, 안내 메일은 차수 발송에서 보냅니다.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label htmlFor="a-company">계열사 *</Label>
+            <Select value={form.companyId} onValueChange={(v) => set("companyId", v)}>
+              <SelectTrigger id="a-company">
+                <SelectValue placeholder="선택" />
+              </SelectTrigger>
+              <SelectContent>
+                {companies.map((c) => (
+                  <SelectItem key={c.id} value={c.id}>
+                    {c.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="a-empno">사번 *</Label>
+            <Input
+              id="a-empno"
+              value={form.emp_no}
+              onChange={(e) => set("emp_no", e.target.value)}
+              placeholder="20150908"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="a-name">이름 *</Label>
+            <Input id="a-name" value={form.name} onChange={(e) => set("name", e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="a-email">이메일 *</Label>
+            <Input
+              id="a-email"
+              type="email"
+              value={form.email}
+              onChange={(e) => set("email", e.target.value)}
+              placeholder="gildong.hong@seoyon.example"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="a-birth">생년월일 (YYMMDD)</Label>
+            <Input
+              id="a-birth"
+              inputMode="numeric"
+              value={form.birth}
+              onChange={(e) => set("birth", e.target.value)}
+              placeholder="900312"
+            />
+            {birthInvalid && (
+              <p className="text-xs text-destructive">YYMMDD 6자리로 적어 주세요. 예: 850312</p>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="a-grade">직급</Label>
+            <Input id="a-grade" value={form.grade} onChange={(e) => set("grade", e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="a-role-level">역할단계</Label>
+            <Select
+              value={form.role_level || "__none__"}
+              onValueChange={(v) => set("role_level", v === "__none__" ? "" : v)}
+            >
+              <SelectTrigger id="a-role-level">
+                <SelectValue placeholder="선택 안 함" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__none__">— 선택 안 함</SelectItem>
+                {roleLevels.map((r) => (
+                  <SelectItem key={r} value={r}>
+                    {r}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5 sm:col-span-2">
+            <Label htmlFor="a-org">소속</Label>
+            <Input
+              id="a-org"
+              value={form.org_text}
+              onChange={(e) => set("org_text", e.target.value)}
+              placeholder="경영기획본부 / 기획팀"
+            />
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+            취소
+          </Button>
+          <Button disabled={!canSave || save.isPending} onClick={() => save.mutate()}>
+            {save.isPending && <Loader2 className="size-4 animate-spin" />}
+            등록하고 계정 만들기
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1360,7 +1515,8 @@ function RosterListTab({
 
   const { selectedOrgId, setSelectedOrgId } = useOrgLens();
   const [includeSubOrgs, setIncludeSubOrgs] = useState(true);
-  const { density, setDensity, rowClass } = useDensity("participants");
+  // 행 높이는 넉넉한 한 가지로 고정한다 — 좁게/넓게 토글은 v4에서 뺐다.
+  const rowClass = "py-3 text-sm";
   const [visibleColumns, setVisibleColumns] = usePersistedState<ColumnKey[]>(
     "participants-columns",
     DEFAULT_COLUMNS,
@@ -1457,15 +1613,26 @@ function RosterListTab({
   const { data: responses } = useQuery({
     queryKey: ["participants-responses"],
     queryFn: () =>
-      fetchAll<{ id: string; participant_id: string; job_name: string | null; status: string }>(
-        (from, to) =>
-          supabase
-            .from("responses")
-            .select("id, participant_id, job_name, status")
-            .order("id")
-            .range(from, to),
+      fetchAll<{
+        id: string;
+        participant_id: string;
+        job_name: string | null;
+        status: string;
+        recheck_required: boolean;
+      }>((from, to) =>
+        supabase
+          .from("responses")
+          .select("id, participant_id, job_name, status, recheck_required")
+          .order("id")
+          .range(from, to),
       ),
   });
+  /** 변경 재확인이 선 응답을 가진 참여자 — ?recheck=1 필터의 모수 (기획 F10). */
+  const recheckIds = useMemo(() => {
+    const out = new Set<string>();
+    for (const r of responses ?? []) if (r.recheck_required) out.add(r.participant_id);
+    return out;
+  }, [responses]);
   const responseByParticipant = useMemo(() => {
     const map = new Map<string, ResponseRef>();
     for (const r of responses ?? []) {
@@ -1477,17 +1644,24 @@ function RosterListTab({
     return map;
   }, [responses]);
 
+  /** 상태 필터는 콤마로 여러 개를 받는다 — 대시보드 진행축 딥링크(미확인=초대발송,미접속)와 호환. */
+  const statusSet = useMemo(
+    () => (statusFilter === "all" ? null : new Set(statusFilter.split(","))),
+    [statusFilter],
+  );
+
   /** 소속 필터를 뺀 나머지 조건까지 적용한 행 — 트리의 인원수는 이 모수로 센다. */
   const baseRows = useMemo(() => {
     const q = searchText.trim().toLowerCase();
     return (data ?? []).filter((p) => {
       if (!includeArchived && p.archived_at) return false;
-      if (statusFilter !== "all" && p.account_status !== statusFilter) return false;
+      if (statusSet && !statusSet.has(p.account_status)) return false;
       if (tagFilter !== "all" && !(p.tags ?? []).includes(tagFilter)) return false;
+      if (search.recheck && !recheckIds.has(p.id)) return false;
       if (!q) return true;
       return [p.name, p.emp_no, p.email ?? ""].some((v) => v.toLowerCase().includes(q));
     });
-  }, [data, searchText, statusFilter, tagFilter, includeArchived]);
+  }, [data, searchText, statusSet, tagFilter, includeArchived, search.recheck, recheckIds]);
 
   const rows = useMemo(
     () =>
@@ -1760,9 +1934,11 @@ function RosterListTab({
       case "role_level":
         return p.role_level ?? <span className="text-muted-foreground">-</span>;
       case "status":
+        // 상태 2축 (기획 5) — 진행 배지에, 제출 이후 건은 검토 배지를 병기한다.
         return (
           <span className="inline-flex flex-wrap items-center gap-1.5">
-            <StatusBadge status={p.account_status} withHelp />
+            <StatusBadge status={p.account_status} axis="progress" />
+            <StatusBadge status={p.account_status} axis="review" />
             <BounceBadge participant={p} />
           </span>
         );
@@ -1820,6 +1996,12 @@ function RosterListTab({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">전체 상태</SelectItem>
+                  {/* 딥링크로 여러 상태가 묶여 온 경우 — 그 묶음 자체를 항목으로 보여 준다. */}
+                  {statusFilter.includes(",") && (
+                    <SelectItem value={statusFilter}>
+                      {statusFilter.split(",").join(" · ")}
+                    </SelectItem>
+                  )}
                   {ACCOUNT_STATUS_LABELS.map((s) => (
                     <SelectItem key={s} value={s}>
                       {s}
@@ -1859,6 +2041,18 @@ function RosterListTab({
                 />
                 보관 포함
               </label>
+              {search.recheck && (
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs font-semibold text-warning">
+                  재확인이 필요한 참여자만 보는 중
+                  <button
+                    type="button"
+                    className="underline underline-offset-2"
+                    onClick={() => patch({ recheck: undefined })}
+                  >
+                    해제
+                  </button>
+                </span>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button
@@ -1939,14 +2133,6 @@ function RosterListTab({
               </Button>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setDensity(density === "compact" ? "comfortable" : "compact")}
-              >
-                <Rows3 className="size-4" />
-                {density === "compact" ? "넓게 보기" : "좁게 보기"}
-              </Button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button variant="outline" size="sm">
@@ -2184,7 +2370,13 @@ function RosterListTab({
             onAction={() => {
               selectOrg(null);
               setSearchText("");
-              patch({ q: undefined, status: undefined, tag: undefined, archived: undefined });
+              patch({
+                q: undefined,
+                status: undefined,
+                tag: undefined,
+                archived: undefined,
+                recheck: undefined,
+              });
             }}
           />
         ) : (
@@ -2223,7 +2415,8 @@ function RosterListTab({
                       </div>
                     </div>
                     <div className="flex shrink-0 flex-col items-end gap-1">
-                      <StatusBadge status={p.account_status} withHelp />
+                      <StatusBadge status={p.account_status} axis="progress" />
+                      <StatusBadge status={p.account_status} axis="review" />
                       <BounceBadge participant={p} />
                     </div>
                   </div>
@@ -2350,9 +2543,7 @@ function RosterListTab({
       </Sheet>
 
       {adding && (
-        <ParticipantFormDialog
-          open
-          participant={null}
+        <AddParticipantDialog
           companies={companies ?? []}
           defaultCompanyId={companyId !== "all" ? companyId : ((companies ?? [])[0]?.id ?? "")}
           onOpenChange={(open) => !open && setAdding(false)}
@@ -2363,8 +2554,6 @@ function RosterListTab({
           key={editing.id}
           open
           participant={editing}
-          companies={companies ?? []}
-          defaultCompanyId={editing.company_id}
           onOpenChange={(open) => !open && setEditing(null)}
         />
       )}

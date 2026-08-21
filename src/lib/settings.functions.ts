@@ -647,49 +647,17 @@ export const listAuditLogs = createServerFn({ method: "POST" })
     return { rows: list, actions };
   });
 
-/* ─────────────────── 운영 자동화 (기획 F2·F3·F4·F5) ─────────────────── */
+/* ─────────────────── 백업 설정 (기획 F3) ─────────────────── */
 
 /**
- * 정기 실행·백업·독려 규칙·진행 리포트의 서버 창구.
- *
- * 실행 본체는 서버 전용 모듈(cron.server / backup.server / reminders.server / report.server)에
+ * 백업 화면이 읽는 설정값. 실행 본체는 서버 전용 모듈(backup.server / reminders.server)에
  * 있고, 여기서는 관리자 권한 확인과 기록만 얹는다.
+ * (v4: 정기 실행 현황·진행 리포트 화면은 기획 13에 따라 내렸다.)
  */
 
-export type JobCard = {
-  job: string;
-  label: string;
-  desc: string;
-  /** 한 번도 실행되지 않았으면 null — 화면에서 "실행 기록 없음"으로 구분한다. */
-  last: {
-    status: string;
-    at: string;
-    durationMs: number | null;
-    count: number | null;
-    detail: string;
-    error: string | null;
-  } | null;
-};
-
 export type AutomationStatus = {
-  jobs: JobCard[];
-  report: { enabled: boolean; weekday: number; recipients: string[] };
   retentionDays: number;
-  mailDailyCap: number;
 };
-
-/** 실행 결과의 세부 내용을 한 줄로 만든다. */
-function detailLine(detail: unknown): { text: string; count: number | null } {
-  if (!detail || typeof detail !== "object") return { text: "", count: null };
-  const entries = Object.entries(detail as Record<string, unknown>);
-  const countEntry = entries.find(([key]) => key === "건수");
-  const rest = entries
-    .filter(([key]) => key !== "건수")
-    .map(([key, value]) => `${key} ${String(value)}`)
-    .join(" · ");
-  const count = countEntry?.[1];
-  return { text: rest, count: typeof count === "number" ? count : null };
-}
 
 export const getAutomationStatus = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -697,106 +665,17 @@ export const getAutomationStatus = createServerFn({ method: "GET" })
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { CRON_JOBS, CRON_JOB_LABELS } = await import("@/lib/cron.server");
 
-    const [{ data: runs }, { data: system }] = await Promise.all([
-      supabaseAdmin
-        .from("cron_runs")
-        .select("job, status, detail, error_message, duration_ms, finished_at, started_at")
-        .order("started_at", { ascending: false })
-        .limit(200),
-      supabaseAdmin.from("system_settings").select("*").maybeSingle(),
-    ]);
-
-    type RunRow = NonNullable<typeof runs>[number];
-    const latest = new Map<string, RunRow>();
-    for (const row of runs ?? []) if (!latest.has(row.job)) latest.set(row.job, row);
-
-    const settings = (system ?? {}) as {
-      report_enabled?: boolean;
-      report_weekday?: number;
-      report_recipients?: string[];
-      backup_retention_days?: number;
-      mail_daily_cap?: number;
-    };
-
-    return {
-      jobs: CRON_JOBS.map((job) => {
-        const info = CRON_JOB_LABELS[job];
-        const row = latest.get(job);
-        if (!row) return { job, label: info.label, desc: info.desc, last: null };
-        const { text, count } = detailLine(row.detail);
-        return {
-          job,
-          label: info.label,
-          desc: info.desc,
-          last: {
-            status: row.status,
-            at: row.finished_at ?? row.started_at,
-            durationMs: row.duration_ms,
-            count,
-            detail: text,
-            error: row.error_message,
-          },
-        };
-      }),
-      report: {
-        enabled: settings.report_enabled ?? false,
-        weekday: settings.report_weekday ?? 1,
-        recipients: settings.report_recipients ?? [],
-      },
-      retentionDays: settings.backup_retention_days ?? 30,
-      mailDailyCap: settings.mail_daily_cap ?? 500,
-    };
+    const { data: system } = await supabaseAdmin.from("system_settings").select("*").maybeSingle();
+    const settings = (system ?? {}) as { backup_retention_days?: number };
+    return { retentionDays: settings.backup_retention_days ?? 30 };
   });
-
-export const runJobNow = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) =>
-    z.object({ job: z.string().trim().min(1).max(40) }).parse(input),
-  )
-  .handler(async ({ data, context }) => {
-    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { runCronJob, isCronJob, CRON_JOB_LABELS } = await import("@/lib/cron.server");
-
-    if (!isCronJob(data.job)) throw new Error("없는 작업입니다.");
-    const result = await runCronJob(data.job);
-    await writeAudit(supabaseAdmin, {
-      actor_id: context.userId,
-      action: "정기 실행 수동 실행",
-      target_type: "cron_runs",
-      detail: { 작업: CRON_JOB_LABELS[data.job].label, 결과: result.status, 세부: result.detail },
-    });
-
-    const { text, count } = detailLine(result.detail);
-    return {
-      status: result.status,
-      detail: text,
-      count,
-      error: result.error ?? null,
-      durationMs: result.durationMs,
-    };
-  });
-
-const recipientsSchema = z
-  .array(z.string().trim().max(200))
-  .max(20)
-  .transform((list) => [...new Set(list.map((v) => v.trim()).filter((v) => v !== ""))])
-  .refine(
-    (list) => list.every((v) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v)),
-    "메일 주소 형식이 올바르지 않습니다.",
-  );
 
 export const updateAutomationSettings = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
     z
       .object({
-        reportEnabled: z.boolean().optional(),
-        reportWeekday: z.number().int().min(0).max(6).optional(),
-        reportRecipients: recipientsSchema.optional(),
         backupRetentionDays: z.number().int().min(7).max(365).optional(),
       })
       .parse(input),
@@ -807,9 +686,6 @@ export const updateAutomationSettings = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
     const patch: Record<string, unknown> = {};
-    if (data.reportEnabled !== undefined) patch["report_enabled"] = data.reportEnabled;
-    if (data.reportWeekday !== undefined) patch["report_weekday"] = data.reportWeekday;
-    if (data.reportRecipients !== undefined) patch["report_recipients"] = data.reportRecipients;
     if (data.backupRetentionDays !== undefined) {
       patch["backup_retention_days"] = data.backupRetentionDays;
     }
@@ -1063,4 +939,69 @@ export const runReminderRuleNow = createServerFn({ method: "POST" })
       reason: result.reason ?? null,
       error: result.error ?? null,
     };
+  });
+
+/* ─────────────────── 계열사 켜고 끄기 (기획 11) ─────────────────── */
+
+/**
+ * 계열사 운영 상태 변경. 중지하면 화면·집계·발송에서 빠지고 소속 참여자는
+ * 로그인할 수 없게 되지만, 데이터는 지워지지 않는다.
+ */
+export const setCompanyStatus = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        companyId: z.string().uuid(),
+        status: z.enum(["active", "inactive"]),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: row, error } = await supabaseAdmin
+      .from("companies")
+      .update({ status: data.status })
+      .eq("id", data.companyId)
+      .select("name")
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!row) throw new Error("계열사를 찾을 수 없습니다.");
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: data.status === "active" ? "계열사 운영 재개" : "계열사 운영 중지",
+      target_type: "companies",
+      target_id: data.companyId,
+      detail: { 이름: row.name, 상태: data.status === "active" ? "운영 중" : "중지" },
+    });
+    return { ok: true };
+  });
+
+/** 계열사를 중지하면 무엇이 영향을 받는지 — 끄기 전 확인 다이얼로그에 보여 준다. */
+export const companyOffImpact = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ companyId: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const [{ count: participants }, { count: waves }] = await Promise.all([
+      supabaseAdmin
+        .from("participants")
+        .select("id", { count: "exact", head: true })
+        .eq("company_id", data.companyId)
+        .is("archived_at", null),
+      supabaseAdmin
+        .from("survey_waves")
+        .select("id", { count: "exact", head: true })
+        .eq("company_id", data.companyId)
+        .eq("status", "진행"),
+    ]);
+
+    return { participants: participants ?? 0, activeWaves: waves ?? 0 };
   });

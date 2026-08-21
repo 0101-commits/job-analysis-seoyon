@@ -1,15 +1,15 @@
-// 설정 화면의 운영 자동화 세 묶음 (기획 F2·F3·F4·F5).
+// 설정 화면의 운영 자동화 두 묶음 (기획 F3·F4).
 //
-// - AutomationPanel     정기 실행 현황 + 진행 리포트 발송 설정
 // - BackupPanel         백업 목록 + 지금 백업 + 되돌리기(차이 확인 후 반영)
 // - ReminderRulesPanel  독려 규칙 추가·수정·삭제 + 대상 미리보기 + 지금 실행
 //
 // 설정 화면(settings.tsx)이 길어 탭 본문만 여기로 뺐다. 저장 결과는 전역 알림이 아니라
 // 누른 자리에 남긴다(설정 화면의 SaveRow 와 같은 원칙).
+// (v4: 정기 실행 현황·진행 리포트 화면(F2·F5)은 기획 13에 따라 내렸다.)
 
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Check, Loader2, Play, Plus, Save, Trash2, X } from "lucide-react";
+import { AlertTriangle, Check, Loader2, Play, Plus, Save, Trash2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -42,14 +42,10 @@ import {
   getReminderRules,
   listBackupFiles,
   previewBackupRestore,
-  runJobNow,
   runReminderRuleNow,
   saveReminderRule,
-  systemStatus,
   updateAutomationSettings,
 } from "@/lib/settings.functions";
-
-const WEEKDAYS = ["일요일", "월요일", "화요일", "수요일", "목요일", "금요일", "토요일"];
 
 async function authHeaders() {
   const { data } = await supabase.auth.getSession();
@@ -81,22 +77,6 @@ function Intro({ children }: { children: React.ReactNode }) {
   );
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const tone =
-    status === "성공"
-      ? "bg-success/15 text-success"
-      : status === "실패"
-        ? "bg-destructive/15 text-destructive"
-        : "bg-secondary text-muted-foreground";
-  return (
-    <span
-      className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${tone}`}
-    >
-      {status}
-    </span>
-  );
-}
-
 /** 눌린 자리에 남기는 결과 한 줄. */
 type Feedback = { tone: "ok" | "error"; text: string };
 
@@ -121,309 +101,6 @@ function FeedbackLine({ value }: { value?: Feedback | undefined }) {
       <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
       <span>{value.text}</span>
     </span>
-  );
-}
-
-/* ─────────────────── F2 · F5 정기 실행 + 진행 리포트 ─────────────────── */
-
-export function AutomationPanel() {
-  const queryClient = useQueryClient();
-  const [feedback, setFeedback] = useState<Record<string, Feedback>>({});
-  const [reportEnabled, setReportEnabled] = useState(false);
-  const [weekday, setWeekday] = useState("1");
-  const [recipients, setRecipients] = useState<string[]>([]);
-  const [recipientInput, setRecipientInput] = useState("");
-
-  const { data, isLoading } = useQuery({
-    queryKey: ["admin-automation"],
-    queryFn: async () => getAutomationStatus({ headers: await authHeaders() }),
-  });
-
-  // 메일 실발송/연습 모드는 이미 설정 화면의 연결 상태가 판정한다 — 같은 값을 여기서도 읽는다.
-  const { data: status } = useQuery({
-    queryKey: ["admin-system-status"],
-    queryFn: async () => systemStatus({ headers: await authHeaders() }),
-  });
-  const simulation = status?.items.find((i) => i.key === "mail")?.warn ?? false;
-
-  useEffect(() => {
-    if (!data) return;
-    setReportEnabled(data.report.enabled);
-    setWeekday(String(data.report.weekday));
-    setRecipients(data.report.recipients);
-  }, [data]);
-
-  const run = useMutation({
-    mutationFn: async (job: string) => ({
-      job,
-      res: await runJobNow({ data: { job }, headers: await authHeaders() }),
-    }),
-    onSuccess: ({ job, res }) => {
-      const parts = [
-        res.status,
-        res.count === null ? null : `${res.count}건`,
-        res.detail || null,
-        res.error,
-      ].filter(Boolean);
-      setFeedback((prev) => ({
-        ...prev,
-        [job]: { tone: res.error ? "error" : "ok", text: parts.join(" · ") },
-      }));
-      void queryClient.invalidateQueries({ queryKey: ["admin-automation"] });
-      void queryClient.invalidateQueries({ queryKey: ["admin-backups"] });
-      void queryClient.invalidateQueries({ queryKey: ["admin-reminder-rules"] });
-    },
-    onError: (err, job) =>
-      setFeedback((prev) => ({ ...prev, [job]: { tone: "error", text: errorMessage(err) } })),
-  });
-
-  const saveReport = useMutation({
-    mutationFn: async () =>
-      updateAutomationSettings({
-        data: {
-          reportEnabled,
-          reportWeekday: Number(weekday),
-          reportRecipients: recipients,
-        },
-        headers: await authHeaders(),
-      }),
-    onSuccess: () => {
-      setFeedback((prev) => ({ ...prev, report: { tone: "ok", text: "저장했습니다" } }));
-      void queryClient.invalidateQueries({ queryKey: ["admin-automation"] });
-    },
-    onError: (err) =>
-      setFeedback((prev) => ({
-        ...prev,
-        report: { tone: "error", text: `저장하지 못했습니다 — ${errorMessage(err)}` },
-      })),
-  });
-
-  function addRecipient() {
-    const value = recipientInput.trim();
-    if (!value) return;
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(value)) {
-      setFeedback((prev) => ({
-        ...prev,
-        report: { tone: "error", text: "메일 주소 형식이 올바르지 않습니다. 예: hr@seoyon.com" },
-      }));
-      return;
-    }
-    if (recipients.includes(value)) {
-      setFeedback((prev) => ({
-        ...prev,
-        report: { tone: "error", text: "이미 있는 주소입니다." },
-      }));
-      return;
-    }
-    setRecipients((prev) => [...prev, value]);
-    setRecipientInput("");
-  }
-
-  return (
-    <div className="space-y-5">
-      <Intro>
-        이 탭에서는 <strong>사람이 누르지 않아도 매일 자동으로 도는 일</strong>을 확인합니다. 예약
-        안내 발송·독려 안내·자동 백업·진행 리포트가 <strong>매일 오전 6시와 오후 6시</strong>에
-        차례로 돕니다. 필요하면 여기에서 바로 실행할 수도 있습니다.
-      </Intro>
-
-      <CollapsibleSection
-        storageKey="settings"
-        id="auto-jobs"
-        title="정기 실행 현황"
-        subtitle="각 작업이 마지막으로 언제 돌았고 무엇을 했는지"
-      >
-        <div className="rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-          {isLoading ? (
-            <p className="text-sm text-muted-foreground">불러오는 중...</p>
-          ) : (
-            <div className="space-y-3">
-              {(data?.jobs ?? []).map((card) => (
-                <div key={card.job} className="rounded-lg border p-3">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-sm font-semibold">{card.label}</p>
-                      <p className="text-xs text-muted-foreground">{card.desc}</p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {card.last ? <StatusBadge status={card.last.status} /> : null}
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        disabled={run.isPending}
-                        onClick={() => run.mutate(card.job)}
-                      >
-                        {run.isPending && run.variables === card.job ? (
-                          <Loader2 className="size-4 animate-spin" />
-                        ) : (
-                          <Play className="size-4" />
-                        )}
-                        지금 실행
-                      </Button>
-                    </div>
-                  </div>
-
-                  {card.last ? (
-                    <dl className="mt-2 grid gap-1 text-xs sm:grid-cols-3">
-                      <div>
-                        <dt className="text-muted-foreground">마지막 실행</dt>
-                        <dd className="tabular-nums">{when(card.last.at)}</dd>
-                      </div>
-                      <div>
-                        <dt className="text-muted-foreground">처리 건수</dt>
-                        <dd className="tabular-nums">
-                          {card.last.count === null ? "—" : `${card.last.count}건`}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-muted-foreground">걸린 시간</dt>
-                        <dd className="tabular-nums">
-                          {card.last.durationMs === null
-                            ? "—"
-                            : `${(card.last.durationMs / 1000).toFixed(1)}초`}
-                        </dd>
-                      </div>
-                      {card.last.detail ? (
-                        <div className="sm:col-span-3">
-                          <dt className="text-muted-foreground">내용</dt>
-                          <dd>{card.last.detail}</dd>
-                        </div>
-                      ) : null}
-                      {card.last.error ? (
-                        <div className="sm:col-span-3">
-                          <dt className="text-muted-foreground">실패 사유</dt>
-                          <dd className="text-destructive">{card.last.error}</dd>
-                        </div>
-                      ) : null}
-                    </dl>
-                  ) : (
-                    <p className="mt-2 flex items-start gap-1.5 text-xs text-warning">
-                      <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-                      실행 기록 없음 — 이 작업은 아직 한 번도 돌지 않았습니다.
-                    </p>
-                  )}
-
-                  <div className="mt-2">
-                    <FeedbackLine value={feedback[card.job]} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        storageKey="settings"
-        id="auto-report"
-        title="진행 리포트 자동 발송"
-        subtitle="계열사별 응답률·미제출 명단·검토 대기를 정해진 요일에 메일로 받습니다"
-      >
-        <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-          {simulation && (
-            <p className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-3 text-xs text-warning">
-              <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden />
-              <span>
-                <strong>메일 연습 모드 — 실제로 발송되지 않습니다.</strong> 정해진 요일이 되면
-                리포트를 만들어 기록만 남기고, 받을 사람에게는 보내지 않습니다. 아래 설정은 지금
-                저장해 두면 실발송으로 바꾸는 즉시 그대로 적용됩니다.
-              </span>
-            </p>
-          )}
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
-              <Label htmlFor="report-enabled" className="cursor-pointer">
-                자동 발송
-              </Label>
-              <Switch
-                id="report-enabled"
-                checked={reportEnabled}
-                onCheckedChange={setReportEnabled}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="report-weekday">보내는 요일</Label>
-              <Select value={weekday} onValueChange={setWeekday}>
-                <SelectTrigger id="report-weekday">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {WEEKDAYS.map((name, index) => (
-                    <SelectItem key={name} value={String(index)}>
-                      {name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="report-recipient">받을 사람</Label>
-            <div className="flex flex-wrap gap-2">
-              {recipients.map((mail) => (
-                <span
-                  key={mail}
-                  className="inline-flex items-center gap-1.5 rounded-full bg-secondary px-3 py-1.5 text-sm"
-                >
-                  {mail}
-                  <button
-                    type="button"
-                    aria-label={`${mail} 삭제`}
-                    className="text-muted-foreground hover:text-destructive"
-                    onClick={() => setRecipients((prev) => prev.filter((v) => v !== mail))}
-                  >
-                    <X className="size-3.5" />
-                  </button>
-                </span>
-              ))}
-              {recipients.length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  받을 사람이 없으면 자동 발송은 건너뜁니다.
-                </p>
-              )}
-            </div>
-            <div className="flex gap-2">
-              <Input
-                id="report-recipient"
-                aria-label="받을 사람 추가"
-                value={recipientInput}
-                onChange={(e) => setRecipientInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    addRecipient();
-                  }
-                }}
-                placeholder="예: hr@seoyon.com"
-                inputMode="email"
-              />
-              <Button type="button" variant="outline" onClick={addRecipient}>
-                <Plus className="size-4" />
-                추가
-              </Button>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-3">
-            <Button
-              type="button"
-              disabled={saveReport.isPending}
-              onClick={() => saveReport.mutate()}
-            >
-              <Save className="size-4" />
-              {saveReport.isPending ? "저장 중..." : "저장"}
-            </Button>
-            <FeedbackLine value={feedback["report"]} />
-          </div>
-          <p className="text-xs text-muted-foreground">
-            위 「정기 실행 현황」의 진행 리포트에서 [지금 실행]을 누르면, 정해진 요일이 아닐 때는
-            보내지 않고 그 이유를 알려 줍니다.
-          </p>
-        </section>
-      </CollapsibleSection>
-    </div>
   );
 }
 

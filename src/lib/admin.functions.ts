@@ -36,6 +36,82 @@ async function findAuthUserByEmail(
   return null;
 }
 
+/** 계정 발급 규칙 — system_settings 미설정이면 기본 규칙. */
+async function fetchPasswordRule(admin: SupabaseClient) {
+  const { data: settings } = await admin
+    .from("system_settings")
+    .select("password_rule")
+    .maybeSingle();
+  return (settings?.password_rule as string | undefined) ?? "{birth6}{empno_last4}";
+}
+
+/**
+ * 계정 발급 1인분 — 일괄 생성(provisionAccounts)과 즉시 추가(addParticipant)가 같이 쓴다.
+ * initial_password 는 초대 메일 {초기PW} 안내에 필요해 평문으로 남긴다.
+ * 최초 로그인(must_change_password 소진) 이후 비우는 정리 작업은 이번 범위 밖.
+ */
+async function provisionOne(
+  admin: SupabaseClient,
+  rule: string,
+  p: {
+    id: string;
+    email: string;
+    emp_no: string;
+    birth_date: string | null;
+    user_id: string | null;
+    account_status: string;
+  },
+): Promise<"created" | "updated"> {
+  const { renderPasswordRule } = await import("@/lib/password-rule");
+  const password = ensureMinLength(renderPasswordRule(rule, p));
+  let userId = p.user_id;
+  let result: "created" | "updated";
+  if (userId) {
+    const { error } = await admin.auth.admin.updateUserById(userId, { password });
+    if (error) throw new Error(error.message);
+    result = "updated";
+  } else {
+    const { data: createdUser, error } = await admin.auth.admin.createUser({
+      email: p.email,
+      password,
+      email_confirm: true,
+    });
+    if (error || !createdUser.user) {
+      const existing = await findAuthUserByEmail(admin.auth.admin, p.email);
+      if (!existing) throw new Error(error?.message ?? "계정 생성 실패");
+      await admin.auth.admin.updateUserById(existing.id, { password });
+      userId = existing.id;
+      result = "updated";
+    } else {
+      userId = createdUser.user.id;
+      result = "created";
+    }
+  }
+
+  await admin
+    .from("user_roles")
+    .upsert(
+      { user_id: userId, role: "respondent" },
+      { onConflict: "user_id,role", ignoreDuplicates: true },
+    );
+
+  await admin
+    .from("participants")
+    .update({
+      user_id: userId,
+      initial_password: password,
+      must_change_password: true,
+      failed_login_count: 0,
+      locked_until: null,
+      invited_at: new Date().toISOString(),
+      account_status: ["미발송", "초대발송"].includes(p.account_status)
+        ? "초대발송"
+        : p.account_status,
+    })
+    .eq("id", p.id);
+  return result;
+}
+
 export const provisionAccounts = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
@@ -45,13 +121,8 @@ export const provisionAccounts = createServerFn({ method: "POST" })
     const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { renderPasswordRule } = await import("@/lib/password-rule");
 
-    const { data: settings } = await supabaseAdmin
-      .from("system_settings")
-      .select("password_rule")
-      .maybeSingle();
-    const rule = settings?.password_rule ?? "{birth6}{empno_last4}";
+    const rule = await fetchPasswordRule(supabaseAdmin);
 
     const { data: participants } = await supabaseAdmin
       .from("participants")
@@ -67,54 +138,10 @@ export const provisionAccounts = createServerFn({ method: "POST" })
         failures.push({ name: p.name, reason: "이메일 없음" });
         continue;
       }
-      const password = ensureMinLength(renderPasswordRule(rule, p));
       try {
-        let userId = p.user_id as string | null;
-        if (userId) {
-          const { error } = await supabaseAdmin.auth.admin.updateUserById(userId, { password });
-          if (error) throw new Error(error.message);
-          updated += 1;
-        } else {
-          const { data: createdUser, error } = await supabaseAdmin.auth.admin.createUser({
-            email: p.email,
-            password,
-            email_confirm: true,
-          });
-          if (error || !createdUser.user) {
-            const existing = await findAuthUserByEmail(supabaseAdmin.auth.admin, p.email);
-            if (!existing) throw new Error(error?.message ?? "계정 생성 실패");
-            await supabaseAdmin.auth.admin.updateUserById(existing.id, { password });
-            userId = existing.id;
-            updated += 1;
-          } else {
-            userId = createdUser.user.id;
-            created += 1;
-          }
-        }
-
-        await supabaseAdmin
-          .from("user_roles")
-          .upsert(
-            { user_id: userId, role: "respondent" },
-            { onConflict: "user_id,role", ignoreDuplicates: true },
-          );
-
-        // initial_password 는 초대 메일 {초기PW} 안내에 필요해 평문으로 남긴다.
-        // 최초 로그인(must_change_password 소진) 이후 비우는 정리 작업은 이번 범위 밖.
-        await supabaseAdmin
-          .from("participants")
-          .update({
-            user_id: userId,
-            initial_password: password,
-            must_change_password: true,
-            failed_login_count: 0,
-            locked_until: null,
-            invited_at: new Date().toISOString(),
-            account_status: ["미발송", "초대발송"].includes(p.account_status)
-              ? "초대발송"
-              : p.account_status,
-          })
-          .eq("id", p.id);
+        const result = await provisionOne(supabaseAdmin, rule, { ...p, email: p.email });
+        if (result === "created") created += 1;
+        else updated += 1;
       } catch (err) {
         failures.push({ name: p.name, reason: err instanceof Error ? err.message : "오류" });
       }
@@ -237,7 +264,12 @@ async function assertOrgUnitInCompany(admin: SupabaseClient, orgUnitId: string, 
   if (data.company_id !== companyId) throw new Error("다른 계열사의 조직은 지정할 수 없습니다.");
 }
 
-export const createParticipant = createServerFn({ method: "POST" })
+/**
+ * 참여자 즉시 추가 (기획 15). 명부 행을 만들고, 같은 요청 안에서 계정까지 발급한다
+ * (규칙 PW = 계정 발급 규칙, 기본 생년월일6+사번뒤4 — 명부 업로드 경로의 provisionOne 재사용).
+ * 계정 발급이 실패해도 명부 행은 남긴다 — 명단에서 [계정 생성]으로 다시 시도할 수 있다.
+ */
+export const addParticipant = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
     z
@@ -245,6 +277,8 @@ export const createParticipant = createServerFn({ method: "POST" })
         companyId: z.string().uuid(),
         emp_no: z.string().trim().min(1).max(40),
         ...rosterFields,
+        // 계정을 바로 만드는 경로라 이메일이 필수다(로그인 아이디).
+        email: z.string().trim().min(1).max(200),
       })
       .parse(input),
   )
@@ -253,7 +287,7 @@ export const createParticipant = createServerFn({ method: "POST" })
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-    if (data.email) await assertEmailAllowed(supabaseAdmin, data.email);
+    await assertEmailAllowed(supabaseAdmin, data.email);
 
     // (company_id, emp_no) 유니크 제약이 있지만, DB 오류 문구 대신 읽을 수 있는 안내를 준다.
     const { data: dup } = await supabaseAdmin
@@ -264,6 +298,17 @@ export const createParticipant = createServerFn({ method: "POST" })
       .maybeSingle();
     if (dup) throw new Error(`같은 계열사에 사번 ${data.emp_no}(${dup.name})가 이미 있습니다.`);
 
+    // 이메일은 로그인 아이디라 전 계열사에서 하나여야 한다.
+    const { data: emailDup } = await supabaseAdmin
+      .from("participants")
+      .select("name, emp_no")
+      .ilike("email", data.email)
+      .limit(1);
+    const owner = emailDup?.[0];
+    if (owner) {
+      throw new Error(`이메일 ${data.email}은 ${owner.name}(${owner.emp_no})이 이미 씁니다.`);
+    }
+
     if (data.orgUnitId) await assertOrgUnitInCompany(supabaseAdmin, data.orgUnitId, data.companyId);
 
     const { data: created, error } = await supabaseAdmin
@@ -272,25 +317,44 @@ export const createParticipant = createServerFn({ method: "POST" })
         company_id: data.companyId,
         emp_no: data.emp_no,
         name: data.name,
-        email: data.email || null,
+        email: data.email,
         birth_date: data.birth_date ?? null,
         org_text: data.org_text ?? null,
         grade: data.grade ?? null,
         role_level: data.role_level ?? null,
         org_unit_id: data.orgUnitId ?? null,
+        account_status: "미발송",
       })
       .select("id")
       .single();
     if (error || !created) throw new Error(error?.message ?? "참여자 등록 실패");
+
+    // 계정 발급 — 실패는 명부 등록을 되돌리지 않고 사유만 돌려준다.
+    let provisioned = false;
+    let reason: string | null = null;
+    try {
+      const rule = await fetchPasswordRule(supabaseAdmin);
+      await provisionOne(supabaseAdmin, rule, {
+        id: created.id,
+        email: data.email,
+        emp_no: data.emp_no,
+        birth_date: data.birth_date ?? null,
+        user_id: null,
+        account_status: "미발송",
+      });
+      provisioned = true;
+    } catch (err) {
+      reason = err instanceof Error ? err.message : "계정 생성 실패";
+    }
 
     await writeAudit(supabaseAdmin, {
       actor_id: context.userId,
       action: "참여자 추가",
       target_type: "participant",
       target_id: created.id,
-      detail: { emp_no: data.emp_no, name: data.name },
+      detail: { emp_no: data.emp_no, name: data.name, provisioned },
     });
-    return { id: created.id };
+    return { id: created.id, provisioned, reason };
   });
 
 export const updateParticipant = createServerFn({ method: "POST" })
@@ -1125,6 +1189,9 @@ export const sendMailBatch = createServerFn({ method: "POST" })
           companyId: z.string().uuid().nullable().optional(),
           statuses: z.array(z.string()).optional(),
           participantIds: z.array(z.string().uuid()).optional(),
+          // v4: 차수 발송. 대상을 이 차수 배정자로 좁히고, 배치 행에도 wave_id 로 남긴다.
+          // 예약 배치가 발송 시각에 조건을 다시 계산할 때도 filters 안의 이 값이 그대로 쓰인다.
+          waveId: z.string().uuid().optional(),
         }),
         scheduledAt: z.string().datetime().nullable().optional(),
         origin: z.string().url().optional(),
@@ -1143,6 +1210,7 @@ export const sendMailBatch = createServerFn({ method: "POST" })
         name: data.name,
         template_id: data.templateId,
         company_id: data.filters.companyId ?? null,
+        wave_id: data.filters.waveId ?? null,
         filters: data.filters,
         scheduled_at: data.scheduledAt ?? null,
         status: data.scheduledAt ? "예약" : "대기",

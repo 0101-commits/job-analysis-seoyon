@@ -7,6 +7,8 @@ import type { Database } from "@/integrations/supabase/types";
 const filtersSchema = z.object({
   companyId: z.string().uuid().nullable().optional(),
   statuses: z.array(z.string()).optional(),
+  /** v4: 차수 발송 — 대상을 이 차수 배정자로 좁힌다. */
+  waveId: z.string().uuid().optional(),
 });
 
 /**
@@ -180,31 +182,6 @@ export const mailHealth = createServerFn({ method: "GET" })
       bouncedParticipants: bouncedPeople.count ?? 0,
       asOf: new Date().toISOString(),
     };
-  });
-
-/** 마지막 발송이 되돌아온 참여자 명단. 참여자 화면은 다른 담당 소유라 데이터만 내준다. */
-export const listBouncedParticipants = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) =>
-    z.object({ companyId: z.string().uuid().nullable().optional() }).parse(input),
-  )
-  .handler(async ({ data, context }) => {
-    const { requireAdmin } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    let query = supabaseAdmin
-      .from("participants")
-      .select(
-        "id, name, emp_no, email, org_text, company_id, account_status, mail_bounced_at, mail_bounce_reason",
-      )
-      .not("mail_bounced_at", "is", null)
-      .order("mail_bounced_at", { ascending: false })
-      .limit(500);
-    if (data.companyId) query = query.eq("company_id", data.companyId);
-    const { data: rows, error } = await query;
-    if (error) throw new Error(error.message);
-    return { rows: rows ?? [], asOf: new Date().toISOString() };
   });
 
 export const listTemplates = createServerFn({ method: "GET" })
@@ -539,22 +516,11 @@ export const sendTestMail = createServerFn({ method: "POST" })
     return { to, status, simulated, error: errorMessage };
   });
 
-export const countRecipients = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => filtersSchema.parse(input))
-  .handler(async ({ data, context }) => {
-    const { requireAdmin } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { selectTargets } = await import("@/lib/mailer.server");
-    const targets = await selectTargets(supabaseAdmin, {
-      companyId: data.companyId ?? null,
-      statuses: data.statuses ?? [],
-    });
-    return { count: targets.length };
-  });
-
-/** 발송 확인 다이얼로그용 실제 수신 대상 명단. countRecipients 와 같은 selectTargets 를 쓴다. */
+/**
+ * 발송 확인 다이얼로그용 수신 대상 미리보기 (v4).
+ * 실제 발송(processBatch)과 같은 selectTargets 를 쓴다 — 미리본 수와 나가는 수가 달라지면 안 된다.
+ * 명단은 200명까지만 내려보내고, count 는 전체 수를 그대로 준다.
+ */
 export const listRecipientPreview = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => filtersSchema.parse(input))
@@ -566,10 +532,15 @@ export const listRecipientPreview = createServerFn({ method: "POST" })
     const targets = await selectTargets(supabaseAdmin, {
       companyId: data.companyId ?? null,
       statuses: data.statuses ?? [],
+      waveId: data.waveId ?? null,
     });
     return {
       count: targets.length,
-      recipients: targets.map((t) => ({ name: t.name, email: t.email as string })),
+      recipients: targets.slice(0, 200).map((t) => ({
+        name: t.name,
+        email: t.email as string,
+        status: t.account_status,
+      })),
     };
   });
 
@@ -681,17 +652,26 @@ export const resendFailedLogs = createServerFn({ method: "POST" })
 
 export const listBatches = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .handler(async ({ context }) => {
+  // waveId 를 주면 그 차수의 발송만 — 차수 상세 화면(waves.tsx)의 이력 구획이 쓴다.
+  .inputValidator((input: unknown) =>
+    z
+      .object({ waveId: z.string().uuid().optional() })
+      .optional()
+      .parse(input ?? undefined),
+  )
+  .handler(async ({ data: input, context }) => {
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from("mail_batches")
       .select(
-        "id, name, status, total_count, sent_count, failed_count, simulated, scheduled_at, finished_at, created_at, filters, companies(name), mail_templates(name)",
+        "id, name, status, total_count, sent_count, failed_count, simulated, scheduled_at, finished_at, created_at, filters, wave_id, company_id, companies(name), mail_templates(name), survey_waves(name)",
       )
       .order("created_at", { ascending: false })
       .limit(100);
+    if (input?.waveId) query = query.eq("wave_id", input.waveId);
+    const { data, error } = await query;
     if (error) throw new Error(error.message);
     const rows = data ?? [];
 

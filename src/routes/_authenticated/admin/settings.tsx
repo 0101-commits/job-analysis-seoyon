@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { AlertTriangle, Check, Eye, Plus, Save, X } from "lucide-react";
+import { AlertTriangle, Check, Download, Eye, Plus, Save, X } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,27 +16,38 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SectionNav, CollapsibleSection, type SectionDef } from "@/components/SectionNav";
 import {
-  AutomationPanel,
-  BackupPanel,
-  ReminderRulesPanel,
-} from "@/components/admin/AutomationPanels";
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { SectionNav, CollapsibleSection, type SectionDef } from "@/components/SectionNav";
+import { BackupPanel, ReminderRulesPanel } from "@/components/admin/AutomationPanels";
 import { FieldHint } from "@/components/FieldHint";
 import { EmptyState } from "@/components/EmptyState";
 import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { PASSWORD_TOKENS, validatePasswordRule } from "@/lib/password-rule";
+import { listAllCompanies } from "@/lib/companies";
+import { downloadText } from "@/lib/xlsx";
+import { exportAuditLog } from "@/lib/export.functions";
 import {
   DEFAULT_OPS,
   EMAIL_DOMAIN_RE,
   OPS_LIMITS,
   REMINDER_TARGETS,
+  companyOffImpact,
   getOpsImpact,
   getOpsValues,
   getSettings,
   listAuditLogs,
   normalizeEmailDomain,
   previewPasswordRule,
+  setCompanyStatus,
   systemStatus,
   updateOpsValues,
   updateSystemSettings,
@@ -318,6 +329,21 @@ function OpsNumber({
   );
 }
 
+/** 배포 판 한 줄 표기 — 값이 없으면 없다고 말한다 (구 상단 표시줄의 로직 이식, 기획 2). */
+function buildLine() {
+  const version = import.meta.env["VITE_APP_VERSION"] as string | undefined;
+  const builtAt = import.meta.env["VITE_BUILD_TIME"] as string | undefined;
+  if (!version && !builtAt) return "빌드 정보 확인 불가";
+  const when = builtAt ? new Date(builtAt) : null;
+  const stamp =
+    when && !Number.isNaN(when.getTime())
+      ? when.toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" })
+      : null;
+  return [version ? `버전 v${version.slice(0, 7)}` : null, stamp ? `빌드 ${stamp}` : null]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 /** 탭 맨 위의 한 줄 설명 — 이 탭에서 무엇을 정하는지 (기획 P12). */
 function TabIntro({ children }: { children: React.ReactNode }) {
   return (
@@ -435,6 +461,56 @@ function SettingsPage() {
         data: { limit: 50, ...(auditAction === "all" ? {} : { action: auditAction }) },
         headers: await authHeaders(),
       }),
+  });
+
+  /** 감사 기록 전체를 CSV 파일로 (기획 9 후속). */
+  const downloadAudit = useMutation({
+    mutationFn: async () => exportAuditLog({ data: {}, headers: await authHeaders() }),
+    onSuccess: (csv) => {
+      const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      downloadText(`서연_감사기록_${stamp}.csv`, csv, "text/csv;charset=utf-8");
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  /* ── 계열사 켜고 끄기 (기획 11) — 이 탭만 중지 포함 전체 목록을 본다 ── */
+  const { data: allCompanies } = useQuery({
+    queryKey: ["companies-all"],
+    queryFn: listAllCompanies,
+  });
+
+  /** 끄기 전 확인 다이얼로그에 띄울 영향 수치. null 이면 다이얼로그 닫힘. */
+  const [pausing, setPausing] = useState<{
+    id: string;
+    name: string;
+    participants: number;
+    activeWaves: number;
+  } | null>(null);
+
+  const askPause = useMutation({
+    mutationFn: async (company: { id: string; name: string }) => ({
+      company,
+      impact: await companyOffImpact({
+        data: { companyId: company.id },
+        headers: await authHeaders(),
+      }),
+    }),
+    onSuccess: ({ company, impact }) =>
+      setPausing({ id: company.id, name: company.name, ...impact }),
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const switchCompany = useMutation({
+    mutationFn: async (input: { companyId: string; status: "active" | "inactive" }) =>
+      setCompanyStatus({ data: input, headers: await authHeaders() }),
+    onSuccess: () => {
+      setPausing(null);
+      // 헤더 스위처(운영 중만)와 이 탭(전체)이 함께 갱신되어야 한다.
+      void queryClient.invalidateQueries({ queryKey: ["companies"] });
+      void queryClient.invalidateQueries({ queryKey: ["companies-all"] });
+      void queryClient.invalidateQueries({ queryKey: ["admin-settings"] });
+    },
+    onError: (err) => toast.error(errorMessage(err)),
   });
 
   function updateDraft(companyId: string, patch: Partial<SurveyDraft>) {
@@ -634,7 +710,7 @@ function SettingsPage() {
     { id: "ops-usage", label: "화면·발송" },
     { id: "ops-status", label: "연결 상태" },
   ];
-  const surveySections: SectionDef[] = (data?.companies ?? []).map((c) => ({
+  const surveySections: SectionDef[] = (allCompanies ?? []).map((c) => ({
     id: `survey-${c.id}`,
     label: c.name,
   }));
@@ -664,7 +740,6 @@ function SettingsPage() {
             <TabsTrigger value="password">초기 비밀번호</TabsTrigger>
             <TabsTrigger value="survey">계열사 운영</TabsTrigger>
             <TabsTrigger value="levels">역할단계</TabsTrigger>
-            <TabsTrigger value="automation">운영 자동화</TabsTrigger>
             <TabsTrigger value="reminders">독려 규칙</TabsTrigger>
             <TabsTrigger value="backup">백업</TabsTrigger>
             <TabsTrigger value="security">보안</TabsTrigger>
@@ -1020,103 +1095,169 @@ function SettingsPage() {
 
             <SectionNav sections={surveySections} />
 
-            {data?.companies.map((c) => {
+            {(allCompanies ?? []).map((c) => {
               const draft = drafts[c.id];
               if (!draft) return null;
+              const inactive = c.status === "inactive";
               const impactLine = staleImpact(c.id, draft.staleDays);
               return (
-                <CollapsibleSection
-                  key={c.id}
-                  storageKey="settings"
-                  id={`survey-${c.id}`}
-                  title={c.name}
-                  subtitle={`계열사 코드 ${c.code}`}
-                >
-                  <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <div className="space-y-1.5">
-                        <Label htmlFor={`deadline-${c.id}`}>제출 마감</Label>
-                        <Input
-                          id={`deadline-${c.id}`}
-                          type="date"
-                          value={draft.deadline}
-                          onChange={(e) => updateDraft(c.id, { deadline: e.target.value })}
-                        />
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <Label htmlFor={`days-${c.id}`}>독려 안내 일자 (D-N)</Label>
-                        <Input
-                          id={`days-${c.id}`}
-                          value={draft.reminderDays}
-                          onChange={(e) => updateDraft(c.id, { reminderDays: e.target.value })}
-                          placeholder="7, 3, 1"
-                          inputMode="numeric"
-                        />
-                        <p className="text-xs text-muted-foreground">
-                          마감 며칠 전에 보낼지 쉼표로 구분해 입력합니다.
-                        </p>
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <Label htmlFor={`target-${c.id}`}>발송 대상</Label>
-                        <Select
-                          value={draft.reminderTarget}
-                          onValueChange={(v) =>
-                            updateDraft(c.id, { reminderTarget: v as ReminderTarget })
-                          }
+                <div key={c.id} className={inactive ? "opacity-60" : undefined}>
+                  <CollapsibleSection
+                    storageKey="settings"
+                    id={`survey-${c.id}`}
+                    title={c.name}
+                    subtitle={`계열사 코드 ${c.code}`}
+                    aside={
+                      <div className="flex shrink-0 items-center gap-2">
+                        {inactive && (
+                          <span className="rounded-full bg-secondary px-2.5 py-1 text-xs font-semibold text-muted-foreground">
+                            중지됨
+                          </span>
+                        )}
+                        <Label
+                          htmlFor={`company-on-${c.id}`}
+                          className="cursor-pointer text-xs text-muted-foreground"
                         >
-                          <SelectTrigger id={`target-${c.id}`}>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {REMINDER_TARGETS.map((t) => (
-                              <SelectItem key={t} value={t}>
-                                {t} 대상
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <span className="flex items-center gap-1.5 text-sm font-medium">
-                          미진행 기준일 (일)
-                          <FieldHint
-                            term="미진행 기준일"
-                            text="마지막 접속·안내 이후 이 일수가 지나도록 제출하지 않으면 진행 현황 화면에서 '미진행'으로 셉니다. 짧게 잡을수록 미진행 인원이 늘어납니다."
-                          />
-                        </span>
-                        <Input
-                          id={`stale-${c.id}`}
-                          aria-label="미진행 기준일"
-                          type="number"
-                          min={1}
-                          max={60}
-                          value={draft.staleDays}
-                          onChange={(e) => updateDraft(c.id, { staleDays: e.target.value })}
-                          inputMode="numeric"
-                        />
-                        {impactLine && <p className="text-xs text-primary">{impactLine}</p>}
-                      </div>
-
-                      <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
-                        <Label htmlFor={`auto-${c.id}`} className="cursor-pointer">
-                          자동 발송
+                          {inactive ? "중지" : "운영 중"}
                         </Label>
                         <Switch
-                          id={`auto-${c.id}`}
-                          checked={draft.reminderAuto}
-                          onCheckedChange={(v) => updateDraft(c.id, { reminderAuto: v })}
+                          id={`company-on-${c.id}`}
+                          aria-label={`${c.name} 운영 상태`}
+                          checked={!inactive}
+                          disabled={askPause.isPending || switchCompany.isPending}
+                          onCheckedChange={(on) =>
+                            on
+                              ? switchCompany.mutate({ companyId: c.id, status: "active" })
+                              : askPause.mutate({ id: c.id, name: c.name })
+                          }
                         />
                       </div>
-                    </div>
+                    }
+                  >
+                    <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
+                      <p className="text-xs text-muted-foreground">
+                        차수를 만들면 차수의 마감·독려 일정이 우선하고, 이 값은 기본값으로만
+                        쓰입니다.
+                      </p>
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <div className="space-y-1.5">
+                          <Label htmlFor={`deadline-${c.id}`}>제출 마감</Label>
+                          <Input
+                            id={`deadline-${c.id}`}
+                            type="date"
+                            value={draft.deadline}
+                            onChange={(e) => updateDraft(c.id, { deadline: e.target.value })}
+                          />
+                        </div>
 
-                    <SaveRow status={saves[`survey:${c.id}`]} onSave={() => submitSurvey(c.id)} />
-                  </section>
-                </CollapsibleSection>
+                        <div className="space-y-1.5">
+                          <Label htmlFor={`days-${c.id}`}>독려 안내 일자 (D-N)</Label>
+                          <Input
+                            id={`days-${c.id}`}
+                            value={draft.reminderDays}
+                            onChange={(e) => updateDraft(c.id, { reminderDays: e.target.value })}
+                            placeholder="7, 3, 1"
+                            inputMode="numeric"
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            마감 며칠 전에 보낼지 쉼표로 구분해 입력합니다.
+                          </p>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <Label htmlFor={`target-${c.id}`}>발송 대상</Label>
+                          <Select
+                            value={draft.reminderTarget}
+                            onValueChange={(v) =>
+                              updateDraft(c.id, { reminderTarget: v as ReminderTarget })
+                            }
+                          >
+                            <SelectTrigger id={`target-${c.id}`}>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {REMINDER_TARGETS.map((t) => (
+                                <SelectItem key={t} value={t}>
+                                  {t} 대상
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <span className="flex items-center gap-1.5 text-sm font-medium">
+                            미진행 기준일 (일)
+                            <FieldHint
+                              term="미진행 기준일"
+                              text="마지막 접속·안내 이후 이 일수가 지나도록 제출하지 않으면 진행 현황 화면에서 '미진행'으로 셉니다. 짧게 잡을수록 미진행 인원이 늘어납니다."
+                            />
+                          </span>
+                          <Input
+                            id={`stale-${c.id}`}
+                            aria-label="미진행 기준일"
+                            type="number"
+                            min={1}
+                            max={60}
+                            value={draft.staleDays}
+                            onChange={(e) => updateDraft(c.id, { staleDays: e.target.value })}
+                            inputMode="numeric"
+                          />
+                          {impactLine && <p className="text-xs text-primary">{impactLine}</p>}
+                        </div>
+
+                        <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
+                          <Label htmlFor={`auto-${c.id}`} className="cursor-pointer">
+                            자동 발송
+                          </Label>
+                          <Switch
+                            id={`auto-${c.id}`}
+                            checked={draft.reminderAuto}
+                            onCheckedChange={(v) => updateDraft(c.id, { reminderAuto: v })}
+                          />
+                        </div>
+                      </div>
+
+                      <SaveRow status={saves[`survey:${c.id}`]} onSave={() => submitSurvey(c.id)} />
+                    </section>
+                  </CollapsibleSection>
+                </div>
               );
             })}
+
+            {/* 끄기 전 확인 — 무엇이 숨겨지는지 수치로 먼저 보여 준다 (기획 11) */}
+            <AlertDialog
+              open={pausing !== null}
+              onOpenChange={(open) => {
+                if (!open) setPausing(null);
+              }}
+            >
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>「{pausing?.name}」 운영을 중지할까요?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    참여자 {pausing?.participants ?? 0}명 · 진행 중 차수 {pausing?.activeWaves ?? 0}
+                    건이 화면에서 숨겨지고, 소속 참여자는 로그인할 수 없게 됩니다. 데이터는 지워지지
+                    않습니다.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>취소</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                    disabled={switchCompany.isPending}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (pausing) {
+                        switchCompany.mutate({ companyId: pausing.id, status: "inactive" });
+                      }
+                    }}
+                  >
+                    {switchCompany.isPending ? "중지하는 중..." : "운영 중지"}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </TabsContent>
 
           {/* 3. 역할단계 명칭 세트 */}
@@ -1199,11 +1340,6 @@ function SettingsPage() {
                 />
               </section>
             </CollapsibleSection>
-          </TabsContent>
-
-          {/* 4. 운영 자동화 — 정기 실행 현황 + 진행 리포트 (기획 F2·F5) */}
-          <TabsContent value="automation" className="mt-4">
-            <AutomationPanel />
           </TabsContent>
 
           {/* 5. 독려 규칙 (기획 F4) */}
@@ -1443,8 +1579,24 @@ function SettingsPage() {
                     </table>
                   </div>
                 )}
+
+                {/* 화면은 최근 50건만 — 전체가 필요하면 파일로 (기획 9 후속) */}
+                <div className="mt-4 border-t pt-4">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={downloadAudit.isPending}
+                    onClick={() => downloadAudit.mutate()}
+                  >
+                    <Download className="size-4" />
+                    {downloadAudit.isPending ? "만드는 중..." : "감사기록 내려받기 (CSV)"}
+                  </Button>
+                </div>
               </div>
             </CollapsibleSection>
+
+            {/* 지금 보고 있는 화면이 어느 판인지 (기획 2 — 구 상단 표시줄에서 이동) */}
+            <p className="text-right text-xs text-muted-foreground">{buildLine()}</p>
           </TabsContent>
         </Tabs>
       )}

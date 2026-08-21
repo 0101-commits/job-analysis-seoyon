@@ -10,19 +10,23 @@ const LOCK_MINUTES = 30;
 async function findByEmail(admin: SupabaseClient, email: string) {
   const { data } = await admin
     .from("participants")
-    .select("id, email, failed_login_count, first_login_at, locked_until")
+    .select("id, email, role, company_id, failed_login_count, first_login_at, locked_until")
     .ilike("email", email);
   const target = email.toLowerCase();
   return (
-    (data as
-      | {
-          id: string;
-          email: string | null;
-          failed_login_count: number;
-          first_login_at: string | null;
-          locked_until: string | null;
-        }[]
-      | null)?.find((row) => (row.email ?? "").toLowerCase() === target) ?? null
+    (
+      data as
+        | {
+            id: string;
+            email: string | null;
+            role: string;
+            company_id: string | null;
+            failed_login_count: number;
+            first_login_at: string | null;
+            locked_until: string | null;
+          }[]
+        | null
+    )?.find((row) => (row.email ?? "").toLowerCase() === target) ?? null
   );
 }
 
@@ -50,7 +54,8 @@ async function passwordGrant(email: string, password: string) {
   if (!res.ok) throw new Error("로그인 처리 중 오류가 발생했습니다.");
 
   const body = (await res.json()) as { access_token?: string; refresh_token?: string };
-  if (!body.access_token || !body.refresh_token) throw new Error("로그인 처리 중 오류가 발생했습니다.");
+  if (!body.access_token || !body.refresh_token)
+    throw new Error("로그인 처리 중 오류가 발생했습니다.");
   return { access_token: body.access_token, refresh_token: body.refresh_token };
 }
 
@@ -92,6 +97,18 @@ export const signInWithLock = createServerFn({ method: "POST" })
     }
 
     if (participant) {
+      // 중지된 계열사 소속 참여자는 인증이 맞아도 들여보내지 않는다 (기획 11).
+      // 명부 없이 만든 admin 계정과 명부의 admin 역할은 그대로 통과한다.
+      if (participant.role !== "admin" && participant.company_id) {
+        const { data: company } = await supabaseAdmin
+          .from("companies")
+          .select("status")
+          .eq("id", participant.company_id)
+          .maybeSingle();
+        if (company?.status === "inactive") {
+          throw new Error("소속 계열사의 조사가 잠시 중지되었습니다. 관리자에게 문의해 주세요.");
+        }
+      }
       await supabaseAdmin
         .from("participants")
         .update({

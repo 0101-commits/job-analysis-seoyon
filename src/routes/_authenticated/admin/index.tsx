@@ -1,11 +1,10 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
-import { Button } from "@/components/ui/button";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { StatusBadge, STATUS_ORDER } from "@/components/StatusBadge";
-import { josa } from "@/lib/glossary";
+import { PROGRESS_OF, PROGRESS_ORDER, josa } from "@/lib/glossary";
 import { SignalCard, type SignalAction, type SignalTone } from "@/components/SignalCard";
 import { EmptyState } from "@/components/EmptyState";
 import { SectionNav, CollapsibleSection } from "@/components/SectionNav";
@@ -57,7 +56,7 @@ const ORG_SIGNAL_LIMIT = 3;
 /**
  * 딥링크 규약 (기획 P6).
  * 화면에 보이는 모든 수치는 그 수치를 만든 대상 목록으로 갈 수 있어야 한다.
- *   참여자 목록  /admin/participants?status=<상태>&org=<소속id|unassigned>
+ *   참여자 목록  /admin/participants?status=<상태[,상태]>&org=<소속id|unassigned>
  *   메일 화면    /admin/mail?org=<소속id>&status=<상태,상태>   (template·ids 는 쓰지 않는다)
  *   검토 대기    /admin/review?status=submitted
  */
@@ -76,11 +75,12 @@ function mailLink(orgId: string, statuses: string[]) {
 
 const REVIEW_LINK = "/admin/review?status=submitted";
 /**
- * 문의함·재확인 화면은 아직 만들어지지 않았다(각각 다른 담당). 그 화면이 생기면 이
- * 규약대로 탭을 열게 맞춰 달라고 최종 보고에 남긴다.
+ * 문의함 화면은 아직 만들어지지 않았다(다른 담당). 그 화면이 생기면 이 규약대로
+ * 탭을 열게 맞춰 달라고 최종 보고에 남긴다.
  */
 const INQUIRY_LINK = "/admin/review?tab=inquiry";
-const RECHECK_LINK = "/admin/master?tab=recheck";
+/** 재확인 대상은 참여자 명부의 recheck 필터로 본다 (기획 15). */
+const RECHECK_LINK = "/admin/participants?recheck=1";
 
 /** 개시 준비 항목별로 가야 할 화면 — 못 채운 항목은 카드로 남기고 그 화면으로 보낸다. */
 const READINESS_LINKS: Record<string, { label: string; href: string }> = {
@@ -228,29 +228,10 @@ function buildModel(
 
 type Model = ReturnType<typeof buildModel>;
 
-type PeriodKey = "today" | "week" | "all";
-
-const PERIODS: { key: PeriodKey; label: string }[] = [
-  { key: "today", label: "오늘" },
-  { key: "week", label: "이번 주" },
-  { key: "all", label: "조사 전체" },
-];
-
-/** 기간의 시작 시각. 「조사 전체」는 경계가 없다. */
-function periodStart(key: PeriodKey): Date | null {
-  if (key === "all") return null;
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  if (key === "week") d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // 월요일 시작
-  return d;
-}
-
 function DashboardPage() {
   const { companyId } = useCompanyScope();
   const { selectedOrgId, setSelectedOrgId } = useOrgLens();
   const { selectedWaveId, setSelectedWaveId } = useWaveLens();
-  const [period, setPeriod] = useState<PeriodKey>("all");
-  const [copyState, setCopyState] = useState<"idle" | "ok" | "fail">("idle");
 
   const {
     data: overview,
@@ -359,12 +340,15 @@ function DashboardPage() {
     [signals, model], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
+  // 진행 퍼널은 원상태 7종이 아니라 진행축 4단으로 접는다 (기획 5). 딥링크는 원상태 목록을 넘긴다.
   const funnel = useMemo(
     () =>
-      STATUS_ORDER.map((status) => {
-        const rows = respondents.filter((r) => r.account_status === status);
+      PROGRESS_ORDER.map((stage) => {
+        const statuses: string[] = STATUS_ORDER.filter((s) => PROGRESS_OF[s] === stage);
+        const rows = respondents.filter((r) => statuses.includes(r.account_status));
         return {
-          status,
+          stage,
+          statuses,
           count: rows.length,
           // 「기록이 없는」 미발송은 정체가 아니라 발송이 안 된 것이다 — 경과일이 있는 사람만 센다.
           stalled: rows.filter(
@@ -372,6 +356,16 @@ function DashboardPage() {
           ).length,
         };
       }),
+    [respondents],
+  );
+
+  // 검토축 요약 — 제출 이후 건이 어떤 판정 상태인지 한 줄로 (기획 5).
+  const reviewCounts = useMemo(
+    () => ({
+      waiting: respondents.filter((r) => r.account_status === "제출").length,
+      rejected: respondents.filter((r) => r.account_status === "반려").length,
+      approved: respondents.filter((r) => r.account_status === "승인").length,
+    }),
     [respondents],
   );
 
@@ -424,30 +418,11 @@ function DashboardPage() {
   /** 한 명이라도 안내를 받았다면 조사는 이미 시작된 것이다 — 개시 점검은 뒤로 접는다. */
   const launched = respondents.some((r) => r.account_status !== "미발송");
 
-  const report = buildReport({
-    period,
-    respondents,
-    scoped,
-    integrityTotal: integrity?.total ?? 0,
-    scopeLabel,
-    asOf,
-  });
-
   const sections = [
     { id: "funnel", label: "진행 단계", count: total },
     { id: "signals", label: "확인할 일", count: cards.length + unmetReadiness.length },
     { id: "orgs", label: "소속별 현황", count: orgRows.length },
-    { id: "report", label: "마감 리포트" },
   ];
-
-  const copySummary = async () => {
-    try {
-      await navigator.clipboard.writeText(report.text);
-      setCopyState("ok");
-    } catch {
-      setCopyState("fail");
-    }
-  };
 
   if (error) {
     return (
@@ -490,10 +465,10 @@ function DashboardPage() {
             selectedId={orgId}
             onSelect={setSelectedOrgId}
             counts={treeCounts}
-            title="소속으로 좁히기"
+            title="소속별 조회"
           />
           <p className="px-1 text-xs leading-relaxed text-muted-foreground">
-            고른 소속과 그 하위로 이 화면 전체가 좁혀집니다.
+            고른 소속과 그 하위 기준으로 이 화면 전체를 조회합니다.
           </p>
         </aside>
 
@@ -525,12 +500,13 @@ function DashboardPage() {
                 <div className="overflow-x-auto pb-1">
                   <ol className="flex items-stretch gap-1">
                     {funnel.map((stage, i) => (
-                      <li key={stage.status} className="flex shrink-0 items-stretch gap-1">
+                      <li key={stage.stage} className="flex shrink-0 items-stretch gap-1">
                         <a
-                          href={participantsLink({ status: stage.status })}
+                          href={participantsLink({ status: stage.statuses.join(",") })}
                           className="flex w-[136px] flex-col gap-2 rounded-lg border bg-card p-3 transition-colors hover:bg-secondary/50"
+                          title={`포함 상태: ${stage.statuses.join(", ")}`}
                         >
-                          <StatusBadge status={stage.status} withHelp />
+                          <StatusBadge status={stage.statuses[0]!} axis="progress" />
                           <span className="text-xl font-bold tabular-nums">{stage.count}명</span>
                           <div className="h-1.5 overflow-hidden rounded-full bg-secondary">
                             <div
@@ -540,7 +516,6 @@ function DashboardPage() {
                           </div>
                           <span className="text-xs text-muted-foreground">
                             전체의 {pct(stage.count, total)}%
-                            {stage.status === "제출" ? " · 검토 대기" : ""}
                           </span>
                         </a>
                         {i < funnel.length - 1 ? (
@@ -550,9 +525,9 @@ function DashboardPage() {
                             </span>
                             {stage.stalled > 0 ? (
                               <a
-                                href={participantsLink({ status: stage.status })}
+                                href={participantsLink({ status: stage.statuses.join(",") })}
                                 className="text-[11px] font-medium leading-tight text-warning underline underline-offset-2"
-                                title={`${stage.status} 단계에서 기준일 이상 움직임이 없는 인원`}
+                                title={`${stage.stage} 단계에서 기준일 이상 움직임이 없는 인원`}
                               >
                                 {stage.stalled}명 정체
                               </a>
@@ -563,6 +538,30 @@ function DashboardPage() {
                     ))}
                   </ol>
                 </div>
+                {/* 검토축 요약 — 제출 이후 건의 판정 상태 (기획 5) */}
+                <p className="mt-3 text-sm">
+                  <span className="text-muted-foreground">검토 현황 </span>
+                  <a
+                    href={REVIEW_LINK}
+                    className="font-medium text-primary underline underline-offset-2"
+                  >
+                    검토 대기 {reviewCounts.waiting}
+                  </a>
+                  <span className="text-muted-foreground"> · </span>
+                  <a
+                    href={participantsLink({ status: "반려" })}
+                    className="font-medium text-destructive underline underline-offset-2"
+                  >
+                    반려 {reviewCounts.rejected}
+                  </a>
+                  <span className="text-muted-foreground"> · </span>
+                  <a
+                    href={participantsLink({ status: "승인" })}
+                    className="font-medium text-success underline underline-offset-2"
+                  >
+                    승인 {reviewCounts.approved}
+                  </a>
+                </p>
               </CollapsibleSection>
 
               {/* B2 — 알림은 전부 신호·근거·행동 3단 규격 */}
@@ -749,69 +748,6 @@ function DashboardPage() {
                 )}
               </CollapsibleSection>
 
-              {/* B8 — 보고에 그대로 쓰는 한 장 요약 */}
-              <CollapsibleSection
-                storageKey="dashboard"
-                id="report"
-                title="마감 리포트"
-                subtitle="선택한 기간의 진행 상황을 한 장으로 요약합니다. 그대로 복사해 보고에 쓸 수 있습니다."
-                aside={
-                  <div className="flex shrink-0 gap-1">
-                    {PERIODS.map((p) => (
-                      <Button
-                        key={p.key}
-                        size="sm"
-                        variant={period === p.key ? "default" : "outline"}
-                        onClick={() => {
-                          setPeriod(p.key);
-                          setCopyState("idle");
-                        }}
-                      >
-                        {p.label}
-                      </Button>
-                    ))}
-                  </div>
-                }
-              >
-                <div className="space-y-3 rounded-xl border bg-card p-4 shadow-sm sm:p-5">
-                  {report.noChange ? (
-                    <p className="text-sm">
-                      변동 없음 —{" "}
-                      <span className="text-muted-foreground">
-                        {report.periodLabel} 동안 제출·검토 처리·접속 기록이 없습니다.
-                      </span>
-                    </p>
-                  ) : (
-                    <>
-                      <dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                        {report.metrics.map((m) => (
-                          <div key={m.label} className="rounded-lg border p-3">
-                            <dt className="text-xs text-muted-foreground">{m.label}</dt>
-                            <dd className="mt-1 text-lg font-bold tabular-nums">{m.value}</dd>
-                            <dd className="mt-0.5 text-xs text-muted-foreground">{m.note}</dd>
-                          </div>
-                        ))}
-                      </dl>
-                      <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg border bg-secondary/50 p-3 text-xs leading-relaxed">
-                        {report.text}
-                      </pre>
-                    </>
-                  )}
-                  <div className="flex flex-wrap items-center gap-3">
-                    <Button size="sm" variant="outline" onClick={() => void copySummary()}>
-                      요약 복사
-                    </Button>
-                    {copyState === "ok" ? (
-                      <span className="text-xs text-success">복사했습니다</span>
-                    ) : null}
-                    {copyState === "fail" ? (
-                      <span className="text-xs text-destructive">
-                        복사하지 못했습니다. 위 글상자를 직접 선택해 복사해 주세요.
-                      </span>
-                    ) : null}
-                  </div>
-                </div>
-              </CollapsibleSection>
             </>
           )}
         </div>
@@ -1077,7 +1013,7 @@ function buildSignalCards(args: {
       ],
       asOf,
       scope: `대상 ${model.respondents.length}명 중 재확인 대기 ${scoped.recheckResponses.length}건`,
-      actions: [{ label: "마스터 화면에서 확인", href: RECHECK_LINK }],
+      actions: [{ label: "참여자 명부에서 확인", href: RECHECK_LINK }],
     });
   }
 
@@ -1090,65 +1026,3 @@ function subtreeMembers(model: Model, rootId: string): Tracked[] {
   return ids.flatMap((id) => model.membersByUnit.get(id) ?? []);
 }
 
-function buildReport(args: {
-  period: PeriodKey;
-  respondents: Tracked[];
-  scoped: ScopedSignals;
-  integrityTotal: number;
-  scopeLabel: string;
-  asOf: string;
-}) {
-  const { period, respondents, scoped, integrityTotal, scopeLabel, asOf } = args;
-  const periodLabel = PERIODS.find((p) => p.key === period)?.label ?? "조사 전체";
-  const since = periodStart(period);
-  const within = (value: string | null) =>
-    value !== null && (since === null || new Date(value).getTime() >= since.getTime());
-
-  const total = respondents.length;
-  const started = respondents.filter((r) => r.started).length;
-  const submitted = respondents.filter((r) => r.done).length;
-  const approved = respondents.filter((r) => r.account_status === "승인").length;
-
-  const submittedInPeriod = scoped.responses.filter((r) => within(r.submitted_at)).length;
-  const reviewedInPeriod = scoped.responses.filter((r) => within(r.reviewed_at)).length;
-  const seenInPeriod = respondents.filter((r) => within(r.last_seen_at)).length;
-  const noChange =
-    period !== "all" && submittedInPeriod === 0 && reviewedInPeriod === 0 && seenInPeriod === 0;
-
-  const metrics = [
-    {
-      label: "착수율",
-      value: `${pct(started, total)}%`,
-      note: `대상 ${total}명 중 ${started}명`,
-    },
-    {
-      label: "제출률",
-      value: `${pct(submitted, total)}%`,
-      note: `제출·승인 ${submitted}명 · 승인 ${approved}명`,
-    },
-    {
-      label: "검토 적체",
-      value: `${scoped.backlog.length}건`,
-      note: `검토 대기 ${scoped.waiting}건 중 기준일 초과`,
-    },
-    {
-      label: "정합성 오류",
-      value: `${integrityTotal}건`,
-      note: "전사 기준 확인 필요 건수",
-    },
-  ];
-
-  const changeLine = `${periodLabel} 변동: 제출 ${submittedInPeriod}건 · 검토 처리 ${reviewedInPeriod}건 · 접속 ${seenInPeriod}명`;
-  const text = noChange
-    ? `[업무조사 ${periodLabel} 요약] 변동 없음 (기준 ${asOf} · ${scopeLabel})`
-    : [
-        `[업무조사 ${periodLabel} 요약] 기준 ${asOf} · ${scopeLabel}`,
-        `· 대상 ${total}명 / 착수 ${started}명(${pct(started, total)}%) / 제출 ${submitted}명(${pct(submitted, total)}%) / 승인 ${approved}명`,
-        `· 검토 대기 ${scoped.waiting}건, 이 중 기준일 초과 ${scoped.backlog.length}건`,
-        `· 미확정 AI 제안으로 승인 대기 ${scoped.aiBlocked}건 · 발송 실패 ${scoped.failedMails.length}건`,
-        `· 정합성 점검 확인 필요 ${integrityTotal}건 (전사 기준)`,
-        `· ${changeLine}`,
-      ].join("\n");
-
-  return { periodLabel, noChange, metrics, text };
-}

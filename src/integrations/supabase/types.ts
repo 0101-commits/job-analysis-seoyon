@@ -683,6 +683,7 @@ export type Database = {
           template_id: string | null
           total_count: number
           updated_at: string
+          wave_id: string | null
         }
         Insert: {
           company_id?: string | null
@@ -701,6 +702,7 @@ export type Database = {
           template_id?: string | null
           total_count?: number
           updated_at?: string
+          wave_id?: string | null
         }
         Update: {
           company_id?: string | null
@@ -719,6 +721,7 @@ export type Database = {
           template_id?: string | null
           total_count?: number
           updated_at?: string
+          wave_id?: string | null
         }
         Relationships: [
           {
@@ -733,6 +736,13 @@ export type Database = {
             columns: ["template_id"]
             isOneToOne: false
             referencedRelation: "mail_templates"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "mail_batches_wave_id_fkey"
+            columns: ["wave_id"]
+            isOneToOne: false
+            referencedRelation: "survey_waves"
             referencedColumns: ["id"]
           },
         ]

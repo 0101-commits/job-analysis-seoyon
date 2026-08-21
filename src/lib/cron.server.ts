@@ -11,7 +11,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 
-export const CRON_JOBS = ["scheduled-mail", "reminders", "backup", "report", "cleanup"] as const;
+export const CRON_JOBS = ["scheduled-mail", "reminders", "backup", "cleanup"] as const;
 export type CronJob = (typeof CRON_JOBS)[number];
 
 /** 화면에 그대로 나가는 이름. 작업 코드는 표에 노출하지 않는다. */
@@ -27,10 +27,6 @@ export const CRON_JOB_LABELS: Record<CronJob, { label: string; desc: string }> =
   backup: {
     label: "자동 백업",
     desc: "응답과 설정 전체를 파일 한 개로 저장합니다.",
-  },
-  report: {
-    label: "진행 리포트",
-    desc: "지정한 요일에 진행 현황을 메일로 보냅니다.",
   },
   cleanup: {
     label: "오래된 백업 정리",
@@ -120,11 +116,6 @@ const JOB_RUNNERS: Record<CronJob, (admin: SupabaseClient) => Promise<CronOutcom
         용량: `${Math.round(res.sizeBytes / 1024)}KB`,
       },
     };
-  },
-
-  report: async (admin) => {
-    const { sendProgressReport } = await import("./report.server");
-    return sendProgressReport(admin);
   },
 
   cleanup: async (admin) => {

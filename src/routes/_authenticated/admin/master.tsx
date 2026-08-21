@@ -45,7 +45,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -61,8 +60,6 @@ import { SignalCard } from "@/components/SignalCard";
 import { EmptyState } from "@/components/EmptyState";
 import { usePersistedState } from "@/hooks/use-persisted-ui";
 import { OrgCanvas, type CanvasRollup } from "@/components/admin/OrgCanvas";
-import { RecheckBoard } from "@/components/admin/RecheckBoard";
-import { DutyCompare } from "@/components/admin/DutyCompare";
 import { JobDiagnosisPanel } from "@/components/admin/JobDiagnosisPanel";
 import {
   ImpactCountBadge,
@@ -72,6 +69,8 @@ import {
   type ImpactTarget,
 } from "@/components/admin/ImpactInspector";
 import { getOrgOverview, type OrgOverview } from "@/lib/dashboard.functions";
+import { downloadXlsx } from "@/lib/xlsx";
+import { listActiveCompanies } from "@/lib/companies";
 import { parseRosterFile } from "@/lib/roster";
 import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { similarity } from "@/components/survey/validation";
@@ -89,11 +88,9 @@ import {
   DUTY_ORG_LIMIT,
   getMasterStatus,
   inspectImpact,
-  jobCatalogTemplateCsv,
   listCatalogVersions,
   listDutyCharts,
   moveOrgUnit,
-  orgTemplateCsv,
   previewImpact,
   renameOrgUnit,
   restoreCatalogVersion,
@@ -114,8 +111,11 @@ import {
   type UploadReport,
 } from "@/lib/master.functions";
 
-/** 화면 안의 위치를 URL 이 갖는다 — 대시보드·검토·전역 검색이 이 규약으로 링크를 보낸다 (기획 D4·P6). */
-const MASTER_TABS = ["org", "job", "duty", "compare", "recheck", "status"] as const;
+/**
+ * 화면 안의 위치를 URL 이 갖는다 — 대시보드·검토·전역 검색이 이 규약으로 링크를 보낸다 (기획 D4·P6).
+ * 없어진 탭(compare·recheck·status)으로 오는 옛 링크는 validateSearch 가 값을 버려 기본 탭으로 온다.
+ */
+const MASTER_TABS = ["org", "job", "duty"] as const;
 type MasterTab = (typeof MASTER_TABS)[number];
 
 /**
@@ -165,17 +165,125 @@ function errorMessage(err: unknown) {
   return err instanceof Error ? err.message : "처리 중 오류가 발생했습니다.";
 }
 
-function downloadCsv(name: string, body: string) {
-  const url = URL.createObjectURL(new Blob([body], { type: "text/csv;charset=utf-8" }));
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = name;
-  link.click();
-  URL.revokeObjectURL(url);
+/**
+ * 템플릿 내려받기 (기획 7) — 시트1 「입력」(머리글+예시 행), 시트2 「작성 안내」(열별 규칙).
+ * 업로드는 첫 번째 시트만 읽으므로(parseRosterFile) 안내 시트가 딸려 올라와도 오인되지 않는다.
+ */
+function downloadOrgTemplate() {
+  downloadXlsx("조직도_템플릿.xlsx", [
+    {
+      name: "입력",
+      rows: [
+        ORG_FIELDS.map((f) => f.label),
+        ["서연", "", "경영기획본부", "본부", "1"],
+        ["서연", "경영기획본부", "기획팀", "팀", "1"],
+      ],
+      colWidths: [12, 18, 20, 10, 8],
+    },
+    {
+      name: "작성 안내",
+      rows: [
+        ["항목", "필수", "형식", "예시", "주의"],
+        [
+          "회사",
+          "필수",
+          "등록된 계열사 이름 그대로",
+          "서연",
+          "설정 › 계열사에 없는 이름은 오류가 됩니다.",
+        ],
+        [
+          "상위조직",
+          "선택",
+          "같은 파일 안의 조직명",
+          "경영기획본부",
+          "비우면 최상위 조직이 됩니다. 상위조직도 같은 파일 안에 한 행으로 있어야 하며(행 순서는 무관), 자기 자신이나 서로 물리는 지정은 오류가 됩니다.",
+        ],
+        [
+          "조직명",
+          "필수",
+          "같은 회사 안에서 중복 불가",
+          "기획팀",
+          "같은 회사에 같은 조직명이 두 번 나오면 오류가 됩니다.",
+        ],
+        ["레벨", "선택", "본부·팀 등 자유 표기", "팀", ""],
+        ["정렬", "선택", "정수", "1", "정수가 아니면 오류가 됩니다. 비우면 0으로 봅니다."],
+        [],
+        ["반영하면 파일에 나온 계열사의 기존 조직도 전체를 교체합니다. 반영 전 백업이 변경 기록에 저장됩니다."],
+        ["시트 순서를 바꾸지 마세요 — 업로드할 때 첫 번째 시트만 읽습니다."],
+      ],
+      colWidths: [10, 6, 26, 14, 64],
+    },
+  ]);
+}
+
+function downloadJobTemplate() {
+  downloadXlsx("직무분류_템플릿.xlsx", [
+    {
+      name: "입력",
+      rows: [
+        JOB_FIELDS.map((f) => f.label),
+        ["경영지원", "기획", "사업기획", "전사 사업계획 수립 및 실적 관리", "서연;서연이화"],
+      ],
+      colWidths: [12, 12, 16, 40, 20],
+    },
+    {
+      name: "작성 안내",
+      rows: [
+        ["항목", "필수", "형식", "예시", "주의"],
+        ["직군", "필수", "텍스트", "경영지원", ""],
+        ["직렬", "필수", "텍스트", "기획", ""],
+        [
+          "직무",
+          "필수",
+          "직군·직렬·직무 조합이 파일 안에서 중복 불가",
+          "사업기획",
+          "같은 조합이 두 번 나오면 오류가 됩니다.",
+        ],
+        ["정의", "선택", "한 문장(2,000자 이내)", "전사 사업계획 수립 및 실적 관리", ""],
+        [
+          "적용회사",
+          "선택",
+          "계열사 이름을 세미콜론(;)으로 구분해 여러 개",
+          "서연;서연이화",
+          "등록된 계열사 이름만 쓸 수 있습니다.",
+        ],
+        [],
+        ["적용회사를 적으면 그 계열사에 걸린 행만 교체하고 다른 계열사의 분류는 보존합니다."],
+        ["적용회사를 전부 비우면 계열사 공통 분류표로 보고 전체를 교체합니다."],
+        ["교체 직전 상태는 버전으로 자동 저장돼 되돌릴 수 있습니다."],
+        ["시트 순서를 바꾸지 마세요 — 업로드할 때 첫 번째 시트만 읽습니다."],
+      ],
+      colWidths: [10, 6, 34, 26, 64],
+    },
+  ]);
 }
 
 function formatDate(value: string) {
   return new Date(value).toLocaleString("ko-KR", { dateStyle: "medium", timeStyle: "short" });
+}
+
+/** 현황 탭을 대신하는 탭 하단 한 줄 — 지금 건수와 마지막 업로드 시각만 (기획 16). */
+const STATUS_LINE = {
+  org: { label: "조직", action: "조직도 업로드" },
+  job: { label: "직무", action: "직무 카탈로그 업로드" },
+  duty: { label: "업무분장표", action: "업무분장표 업로드" },
+} as const;
+
+function StatusLine({ kind }: { kind: keyof typeof STATUS_LINE }) {
+  const { data } = useQuery({
+    queryKey: ["master-status"],
+    queryFn: async () => getMasterStatus({ headers: await authHeaders() }),
+  });
+  if (!data) return null;
+  const count =
+    kind === "org" ? data.orgUnits : kind === "job" ? data.jobCatalog : data.dutyCharts;
+  const last = data.lastUploads.find((u) => u.action === STATUS_LINE[kind].action);
+  return (
+    <p className="text-xs text-muted-foreground">
+      {STATUS_LINE[kind].label} {count.toLocaleString("ko-KR")}건
+      {last ? ` · 최근 업로드 ${formatDate(last.at)}` : " · 업로드 이력 없음"}
+    </p>
+  );
 }
 
 /** 좁은 화면에서는 캔버스 대신 트리를 쓴다 — 노드 카드는 손가락 조작에 맞지 않는다. */
@@ -485,13 +593,14 @@ function PreviewTable({
 function MappingUploader({
   fields,
   templateName,
-  templateCsv,
+  onTemplate,
   onRun,
   onApplied,
 }: {
   fields: readonly FieldDef[];
+  /** 파일 입력 id 구분용 이름. */
   templateName: string;
-  templateCsv: () => string;
+  onTemplate: () => void;
   onRun: (rows: Record<string, string>[], confirm: boolean) => Promise<UploadReport>;
   onApplied: () => void;
 }) {
@@ -557,11 +666,7 @@ function MappingUploader({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => downloadCsv(templateName, templateCsv())}
-        >
+        <Button variant="outline" size="sm" onClick={onTemplate}>
           <Download className="size-4" />
           템플릿 내려받기
         </Button>
@@ -752,27 +857,17 @@ function OrgNodeEditor({
   );
 }
 
+/**
+ * 좁은 화면용 읽기 전용 조직 목록 (기획 6) — 캔버스가 유일한 편집 뷰가 되면서
+ * 트리는 보기·선택만 남았다. 노드 카드는 손가락 조작에 맞지 않아 편집은 PC 화면에서 한다.
+ */
 function OrgTree({
   units,
-  action,
-  busy,
   selectedId,
-  impactBadge,
-  onAction,
-  onCancel,
-  onSubmit,
-  onDelete,
   onSelect,
 }: {
   units: OrgUnit[];
-  action: OrgAction | null;
-  busy: boolean;
   selectedId: string | null;
-  impactBadge?: ReactNode;
-  onAction: (action: OrgAction) => void;
-  onCancel: () => void;
-  onSubmit: (values: { name: string; level: string; parentId: string | null }) => void;
-  onDelete: (unit: OrgUnit) => void;
   onSelect: (unit: OrgUnit) => void;
 }) {
   const byParent = new Map<string, OrgUnit[]>();
@@ -790,61 +885,21 @@ function OrgTree({
       <ul className={depth === 0 ? "space-y-1" : "mt-1 space-y-1 border-l pl-4"}>
         {children.map((unit) => (
           <li key={unit.id} id={`org-${unit.id}`} className="scroll-mt-24">
-            <div className="group flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => onSelect(unit)}
-                className={`rounded px-1 text-left text-sm hover:bg-secondary ${
-                  unit.id === selectedId ? "bg-primary/10 font-semibold ring-1 ring-primary" : ""
-                }`}
-              >
-                {unit.name}
-                {unit.level && (
-                  <span className="ml-2 text-xs text-muted-foreground">{unit.level}</span>
-                )}
-                {depth === 0 && unit.companies?.name && (
-                  <span className="ml-2 text-xs text-primary">{unit.companies.name}</span>
-                )}
-              </button>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-6 opacity-40 hover:opacity-100"
-                    aria-label={`${unit.name} 조직 관리`}
-                  >
-                    <MoreHorizontal className="size-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start">
-                  <DropdownMenuItem onSelect={() => onAction({ kind: "rename", unit })}>
-                    이름 변경
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={() => onAction({ kind: "child", unit })}>
-                    하위 조직 추가
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={() => onAction({ kind: "move", unit })}>
-                    상위 이동
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem className="text-destructive" onSelect={() => onDelete(unit)}>
-                    삭제
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-            {action?.unit.id === unit.id && (
-              <OrgNodeEditor
-                key={`${action.kind}-${unit.id}`}
-                action={action}
-                units={units}
-                busy={busy}
-                impactBadge={impactBadge}
-                onCancel={onCancel}
-                onSubmit={onSubmit}
-              />
-            )}
+            <button
+              type="button"
+              onClick={() => onSelect(unit)}
+              className={`rounded px-1 text-left text-sm hover:bg-secondary ${
+                unit.id === selectedId ? "bg-primary/10 font-semibold ring-1 ring-primary" : ""
+              }`}
+            >
+              {unit.name}
+              {unit.level && (
+                <span className="ml-2 text-xs text-muted-foreground">{unit.level}</span>
+              )}
+              {depth === 0 && unit.companies?.name && (
+                <span className="ml-2 text-xs text-primary">{unit.companies.name}</span>
+              )}
+            </button>
             {render(unit.id, depth + 1)}
           </li>
         ))}
@@ -941,14 +996,12 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
   const queryClient = useQueryClient();
   const [action, setAction] = useState<OrgAction | null>(null);
   const [newRoot, setNewRoot] = useState("");
-  const [orgView, setOrgView] = usePersistedState<"tree" | "canvas">("master-org-view", "tree");
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const [selectedOrgId, setSelectedOrgId] = useState<string | null>(highlightOrgId);
   const [notifyOnSave, setNotifyOnSave] = usePersistedState("master-notify-on-save", true);
   const gate = makeImpactGate(setPending);
+  // 캔버스가 기본이자 유일한 편집 뷰다 (기획 6). 좁은 화면에서만 읽기 전용 트리로 대체한다.
   const narrow = useNarrowScreen();
-  // 좁은 화면에서는 캔버스를 쓰지 않고 트리 목록으로 대체한다.
-  const effectiveView = narrow ? "tree" : orgView;
 
   // 딥링크(?org=)로 들어오면 그 조직을 골라 두고 트리에서 위치를 잡는다.
   useEffect(() => {
@@ -964,7 +1017,6 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
   const { data: overview } = useQuery({
     queryKey: ["org-overview"],
     queryFn: async () => getOrgOverview({ headers: await authHeaders() }),
-    enabled: effectiveView === "canvas" || selectedOrgId !== null,
   });
 
   const { data: units } = useQuery({
@@ -1150,7 +1202,7 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
         menu={[
           {
             label: "조직도 템플릿 내려받기",
-            onSelect: () => downloadCsv("조직도_템플릿.csv", orgTemplateCsv()),
+            onSelect: downloadOrgTemplate,
           },
           {
             label: "파일로 올리기 구획으로 이동",
@@ -1175,7 +1227,15 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
           }
           scope={selectedUnit.companies?.name ?? "하위 조직 포함"}
           actions={[
-            { label: "이 조직 이름 변경", onClick: () => setAction({ kind: "rename", unit: selectedUnit }) },
+            // 좁은 화면은 편집 뷰(캔버스)가 없어 이름 변경 편집기를 띄울 곳이 없다.
+            ...(!narrow
+              ? [
+                  {
+                    label: "이 조직 이름 변경",
+                    onClick: () => setAction({ kind: "rename", unit: selectedUnit }),
+                  },
+                ]
+              : []),
             {
               label: "참여자 관리에서 보기",
               href: "/admin/participants",
@@ -1191,71 +1251,48 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
         id="org-edit"
         title="조직도 편집"
         subtitle="각 조직의 ⋯ 버튼으로 이름 변경·하위 추가·상위 이동·삭제를 합니다."
-        aside={
-          <div className="flex items-center gap-2">
-            {!narrow && (
-              <div className="flex items-center rounded-lg border p-0.5">
-                <Button
-                  size="sm"
-                  variant={orgView === "tree" ? "secondary" : "ghost"}
-                  className="h-6 px-2 text-xs"
-                  onClick={() => setOrgView("tree")}
-                >
-                  트리
-                </Button>
-                <Button
-                  size="sm"
-                  variant={orgView === "canvas" ? "secondary" : "ghost"}
-                  className="h-6 px-2 text-xs"
-                  onClick={() => setOrgView("canvas")}
-                >
-                  캔버스
-                </Button>
-              </div>
-            )}
-          </div>
-        }
       >
         <div className="rounded-xl border bg-card p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm font-medium">조직도 {units ? `(${units.length})` : ""}</p>
-          <div className="flex items-center gap-2">
-            <Input
-              className="h-8 w-40"
-              value={newRoot}
-              placeholder="최상위 조직명"
-              aria-label="최상위 조직명"
-              onChange={(e) => setNewRoot(e.target.value)}
-            />
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-8"
-              disabled={edit.isPending || newRoot.trim() === "" || rootCompanyId === ""}
-              onClick={() =>
-                edit.mutate(async () =>
-                  createOrgUnit({
-                    data: {
-                      companyId: rootCompanyId,
-                      parentId: null,
-                      name: newRoot.trim(),
-                      level: "",
-                    },
-                    headers: await authHeaders(),
-                  }),
-                )
-              }
-            >
-              <Plus className="size-4" />
-              최상위 추가
-            </Button>
+            {!narrow && (
+              <div className="flex items-center gap-2">
+                <Input
+                  className="h-8 w-40"
+                  value={newRoot}
+                  placeholder="최상위 조직명"
+                  aria-label="최상위 조직명"
+                  onChange={(e) => setNewRoot(e.target.value)}
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  disabled={edit.isPending || newRoot.trim() === "" || rootCompanyId === ""}
+                  onClick={() =>
+                    edit.mutate(async () =>
+                      createOrgUnit({
+                        data: {
+                          companyId: rootCompanyId,
+                          parentId: null,
+                          name: newRoot.trim(),
+                          level: "",
+                        },
+                        headers: await authHeaders(),
+                      }),
+                    )
+                  }
+                >
+                  <Plus className="size-4" />
+                  최상위 추가
+                </Button>
+              </div>
+            )}
           </div>
-        </div>
           <p className="mt-1 text-xs text-muted-foreground">
             하위 조직이나 배정 인원이 있는 조직은 삭제되지 않습니다. 조직 이름을 누르면 그 조직의
             인원 현황이 위에 나타납니다.
             {companyId === "all" && " 최상위 추가는 계열사를 선택한 뒤 사용하세요."}
-            {narrow && " 화면이 좁아 캔버스 대신 트리 목록으로 보여 줍니다."}
           </p>
           {(units ?? []).length === 0 ? (
             <EmptyState
@@ -1264,20 +1301,14 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
               title="아직 등록된 조직이 없습니다"
               description="위 칸에 최상위 조직명을 넣어 하나 만들거나, 아래 「파일로 올리기」에서 조직도 파일을 올리세요."
             />
-          ) : effectiveView === "tree" ? (
-            <div className="mt-3">
+          ) : narrow ? (
+            <div className="mt-3 space-y-2">
+              <p className="text-xs text-muted-foreground">
+                조직도 편집은 PC 화면에서 할 수 있습니다.
+              </p>
               <OrgTree
                 units={units ?? []}
-                action={action}
-                busy={edit.isPending}
                 selectedId={selectedOrgId}
-                impactBadge={
-                  <ImpactCountBadge audience={audience} loading={audienceLoading} />
-                }
-                onAction={setAction}
-                onCancel={() => setAction(null)}
-                onSubmit={submitAction}
-                onDelete={handleDelete}
                 onSelect={(unit) => setSelectedOrgId(unit.id)}
               />
             </div>
@@ -1325,8 +1356,8 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
       >
         <MappingUploader
           fields={ORG_FIELDS}
-          templateName="조직도_템플릿.csv"
-          templateCsv={orgTemplateCsv}
+          templateName="org-template"
+          onTemplate={downloadOrgTemplate}
           onRun={async (rows, confirm) =>
             uploadOrgUnits({
               data: {
@@ -1348,6 +1379,8 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
           }}
         />
       </CollapsibleSection>
+
+      <StatusLine kind="org" />
 
       <ImpactConfirmDialog pending={pending} onClose={() => setPending(null)} />
     </EditorWithInspector>
@@ -2236,7 +2269,7 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
         menu={[
           {
             label: "직무분류 템플릿 내려받기",
-            onSelect: () => downloadCsv("직무분류_템플릿.csv", jobCatalogTemplateCsv()),
+            onSelect: downloadJobTemplate,
           },
           {
             label: "버전 관리 구획으로 이동",
@@ -2285,8 +2318,8 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
       >
         <MappingUploader
           fields={JOB_FIELDS}
-          templateName="직무분류_템플릿.csv"
-          templateCsv={jobCatalogTemplateCsv}
+          templateName="job-template"
+          onTemplate={downloadJobTemplate}
           onRun={async (rows, confirm) =>
             uploadJobCatalog({
               data: {
@@ -2421,6 +2454,8 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
         )}
       </div>
       </CollapsibleSection>
+
+      <StatusLine kind="job" />
     </EditorWithInspector>
   );
 }
@@ -2703,14 +2738,7 @@ function DutyTab() {
 
   const { data: companies } = useQuery({
     queryKey: ["companies"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("companies")
-        .select("id, name")
-        .order("created_at");
-      if (error) throw error;
-      return data;
-    },
+    queryFn: listActiveCompanies,
   });
 
   const { data: charts } = useQuery({
@@ -2913,117 +2941,8 @@ function DutyTab() {
         )}
       </div>
       </CollapsibleSection>
-    </div>
-  );
-}
 
-/* ───────────────────────── ④ 현황 ───────────────────────── */
-
-/* ─────────────────── ④ 업무분장 대조 (F11) ─────────────────── */
-
-function CompareTab() {
-  const { companyId } = useCompanyScope();
-  return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-sm font-semibold">업무분장 ↔ 응답 대조</h2>
-        <p className="mt-1 text-xs text-muted-foreground">
-          올려 둔 업무분장표의 과업과 실제 응답에 적힌 과업을 맞춰, 조사에서 빠진 일과 분장에 없는
-          일을 찾습니다.
-        </p>
-      </div>
-      <DutyCompare companyId={companyId === "all" ? null : companyId} />
-    </div>
-  );
-}
-
-/* ─────────────────── ⑤ 재확인 잔량 (F10) ─────────────────── */
-
-/** 진행 현황 화면의 「재확인 미확인 N건」 카드가 `?tab=recheck` 로 여기 직행한다. */
-function RecheckTab() {
-  const { companyId } = useCompanyScope();
-  return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-sm font-semibold">변경 재확인 미확인 잔량</h2>
-        <p className="mt-1 text-xs text-muted-foreground">
-          기준 정보를 고쳐 안내를 보낸 응답 중 참여자가 아직 확인하지 않은 건입니다.
-        </p>
-      </div>
-      <RecheckBoard companyId={companyId === "all" ? null : companyId} />
-    </div>
-  );
-}
-
-/* ───────────────────────── ⑥ 현황 ───────────────────────── */
-
-function StatusTab() {
-  const { data, isLoading } = useQuery({
-    queryKey: ["master-status"],
-    queryFn: async () => getMasterStatus({ headers: await authHeaders() }),
-  });
-
-  if (isLoading) return <p className="text-sm text-muted-foreground">불러오는 중...</p>;
-
-  const cards = [
-    { label: "조직 단위", value: data?.orgUnits ?? 0 },
-    { label: "직무분류표", value: data?.jobCatalog ?? 0 },
-    { label: "업무분장표", value: data?.dutyCharts ?? 0 },
-    { label: "응답", value: data?.responses ?? 0 },
-  ];
-
-  return (
-    <div className="space-y-6">
-      <SectionNav
-        sections={[
-          { id: "status-counts", label: "기준 정보 건수" },
-          { id: "status-uploads", label: "최근 업로드" },
-        ]}
-      />
-
-      <CollapsibleSection
-        storageKey="master-status"
-        id="status-counts"
-        title="기준 정보 건수"
-        subtitle="지금 시스템에 들어 있는 기준 정보의 규모입니다."
-      >
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        {cards.map((card) => (
-          <div key={card.label} className="rounded-xl border bg-card p-4 shadow-sm">
-            <p className="text-xs text-muted-foreground">{card.label}</p>
-            <p className="mt-1 text-2xl font-bold">{card.value.toLocaleString("ko-KR")}</p>
-          </div>
-        ))}
-      </div>
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        storageKey="master-status"
-        id="status-uploads"
-        title="최근 업로드"
-        subtitle="반영 전 백업은 변경 기록에 남아 되돌리기 지점으로 쓸 수 있습니다."
-      >
-      <div className="rounded-xl border bg-card p-4">
-        <p className="text-sm font-medium">최근 업로드</p>
-        {(data?.lastUploads ?? []).length === 0 ? (
-          <p className="mt-2 text-sm text-muted-foreground">업로드 이력이 없습니다.</p>
-        ) : (
-          <ul className="mt-2 space-y-1 text-sm">
-            {data?.lastUploads.map((entry) => (
-              <li key={entry.action} className="flex justify-between gap-3">
-                <span>{entry.action}</span>
-                <span className="text-muted-foreground">{formatDate(entry.at)}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      <p className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
-        반영 전 백업이 변경 기록에 저장됩니다. 잘못 반영한 경우 변경 기록의 백업을 되돌리기 지점으로
-        사용하세요.
-      </p>
-      </CollapsibleSection>
+      <StatusLine kind="duty" />
     </div>
   );
 }
@@ -3055,13 +2974,10 @@ function MasterPage() {
           })
         }
       >
-        <TabsList className="grid w-full grid-cols-2 sm:w-auto sm:grid-cols-6">
+        <TabsList className="grid w-full grid-cols-3 sm:w-auto">
           <TabsTrigger value="org">조직도</TabsTrigger>
           <TabsTrigger value="job">직무분류</TabsTrigger>
           <TabsTrigger value="duty">업무분장</TabsTrigger>
-          <TabsTrigger value="compare">업무분장 대조</TabsTrigger>
-          <TabsTrigger value="recheck">재확인 잔량</TabsTrigger>
-          <TabsTrigger value="status">현황</TabsTrigger>
         </TabsList>
         <TabsContent value="org" className="mt-4">
           <OrgTab highlightOrgId={search.focusOrg ?? null} />
@@ -3071,15 +2987,6 @@ function MasterPage() {
         </TabsContent>
         <TabsContent value="duty" className="mt-4">
           <DutyTab />
-        </TabsContent>
-        <TabsContent value="compare" className="mt-4">
-          <CompareTab />
-        </TabsContent>
-        <TabsContent value="recheck" className="mt-4">
-          <RecheckTab />
-        </TabsContent>
-        <TabsContent value="status" className="mt-4">
-          <StatusTab />
         </TabsContent>
       </Tabs>
     </div>

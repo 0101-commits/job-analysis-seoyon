@@ -80,8 +80,16 @@ export async function scheduleImpactNotice(
     toast.success(
       `영향 인원 ${notified}명에게 변경 안내를 예약했습니다 — 다음 접속 때 배너로 보입니다.` +
         (rechecked > 0
-          ? ` 이미 작성한 응답 ${rechecked}건은 재확인 대상으로 올렸습니다 (현황 탭에서 잔량 확인).`
+          ? ` 이미 작성한 응답 ${rechecked}건은 재확인 대상으로 올렸습니다 — 재확인 대상은 참여자 명부에서 확인할 수 있습니다.`
           : ""),
+      rechecked > 0
+        ? {
+            action: {
+              label: "참여자 명부 보기",
+              onClick: () => window.location.assign("/admin/participants?recheck=1"),
+            },
+          }
+        : undefined,
     );
   } catch (err) {
     toast.error(

@@ -6,6 +6,8 @@ export type BatchFilters = {
   companyId?: string | null;
   statuses?: string[];
   participantIds?: string[];
+  /** v4: 차수 발송. 있으면 대상을 이 차수 배정자(participants.wave_id)로 좁힌다. */
+  waveId?: string | null;
 };
 
 /** 리마인더 대상 상태. '미발송'(초대 메일 전)은 리마인드할 대상이 아니라 초대 대상이라 제외한다. */
@@ -133,6 +135,7 @@ export async function selectTargets(
     if (filters.participantIds?.length) query = query.in("id", filters.participantIds);
     if (filters.companyId) query = query.eq("company_id", filters.companyId);
     if (filters.statuses?.length) query = query.in("account_status", filters.statuses);
+    if (filters.waveId) query = query.eq("wave_id", filters.waveId);
     return query;
   });
 }

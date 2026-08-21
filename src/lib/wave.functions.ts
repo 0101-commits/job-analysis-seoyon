@@ -38,6 +38,10 @@ export type Wave = {
   note: string | null;
   assignedCount: number;
   submittedCount: number;
+  /** 배정자의 계정 상태 분포 (v4 차수 허브 화면용). 예: { 미발송: 3, 작성중: 12 } */
+  statusCounts: Record<string, number>;
+  /** 이 차수로 마지막 발송(mail_batches.wave_id)을 만든 시각. 없으면 null. */
+  lastSentAt: string | null;
 };
 
 /** 참여자 명부 화면이 배정 대상을 고를 때 쓰는 목록 — 회차별 배정·제출 인원을 함께 낸다. */
@@ -49,8 +53,8 @@ export const listWaves = createServerFn({ method: "GET" })
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-    const [{ data: waves, error: waveErr }, { data: people, error: peopleErr }] = await Promise.all(
-      [
+    const [{ data: waves, error: waveErr }, { data: people, error: peopleErr }, { data: batches }] =
+      await Promise.all([
         supabaseAdmin
           .from("survey_waves")
           .select("id, seq, name, kind, deadline, status, reminder_days, note")
@@ -63,18 +67,35 @@ export const listWaves = createServerFn({ method: "GET" })
           .eq("role", "respondent")
           .is("archived_at", null)
           .not("wave_id", "is", null),
-      ],
-    );
+        // 차수별 마지막 발송 시각 (v4). 최신순이라 차수마다 처음 만난 행이 마지막 발송이다.
+        supabaseAdmin
+          .from("mail_batches")
+          .select("wave_id, created_at")
+          .eq("company_id", data.companyId)
+          .not("wave_id", "is", null)
+          .order("created_at", { ascending: false })
+          .limit(500),
+      ]);
     if (waveErr) throw new Error(waveErr.message);
     if (peopleErr) throw new Error(peopleErr.message);
 
-    const tally = new Map<string, { assigned: number; submitted: number }>();
+    const tally = new Map<
+      string,
+      { assigned: number; submitted: number; byStatus: Record<string, number> }
+    >();
     for (const p of people ?? []) {
       const key = p.wave_id as string;
-      const t = tally.get(key) ?? { assigned: 0, submitted: 0 };
+      const t = tally.get(key) ?? { assigned: 0, submitted: 0, byStatus: {} };
       t.assigned += 1;
       if (DONE_STATUSES.includes(p.account_status)) t.submitted += 1;
+      t.byStatus[p.account_status] = (t.byStatus[p.account_status] ?? 0) + 1;
       tally.set(key, t);
+    }
+
+    const lastSent = new Map<string, string>();
+    for (const b of batches ?? []) {
+      const key = b.wave_id as string;
+      if (!lastSent.has(key)) lastSent.set(key, b.created_at);
     }
 
     return (waves ?? []).map((w) => ({
@@ -88,6 +109,8 @@ export const listWaves = createServerFn({ method: "GET" })
       note: w.note,
       assignedCount: tally.get(w.id)?.assigned ?? 0,
       submittedCount: tally.get(w.id)?.submitted ?? 0,
+      statusCounts: tally.get(w.id)?.byStatus ?? {},
+      lastSentAt: lastSent.get(w.id) ?? null,
     }));
   });
 
