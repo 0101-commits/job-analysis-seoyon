@@ -36,7 +36,11 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -115,9 +119,9 @@ const MASTER_TABS = ["org", "job", "duty", "compare", "recheck", "status"] as co
 type MasterTab = (typeof MASTER_TABS)[number];
 
 /**
- * `focusOrg`·`job` 은 조직도·직무분류 탭에서 특정 항목 하나를 강조·스크롤하는 딥링크 대상이고,
- * `org`(계열사·소속 렌즈의 소속 값)와는 뜻이 다르다 — 같은 이름을 쓰면 두 딥링크가 서로 값을
- * 덮어쓰게 되어 갈라 둔다.
+ * `focusOrg`·`job` 은 조직도·직무분류 탭에서 특정 항목 하나를 강조·스크롤하는 딥링크 값이고,
+ * `org`(계열사·소속 렌즈의 소속)와는 뜻이 다르다. 같은 이름을 쓰면 두 딥링크가 서로 값을
+ * 덮어쓰므로 이름을 갈라 둔다.
  */
 type MasterSearch = LensSearch & { tab?: MasterTab; job?: string; focusOrg?: string };
 
@@ -132,10 +136,11 @@ export const Route = createFileRoute("/_authenticated/admin/master")({
     const job = pickString(search["job"]);
     const focusOrg = pickString(search["focusOrg"]);
     return {
-      ...pickLens(search),
       ...(tab && (MASTER_TABS as readonly string[]).includes(tab) ? { tab: tab as MasterTab } : {}),
       ...(job ? { job } : {}),
       ...(focusOrg ? { focusOrg } : {}),
+      // 계열사·소속 렌즈는 전 화면 공통이라 한 곳(lens-search)에서만 판다.
+      ...pickLens(search),
     };
   },
   head: () => ({
@@ -201,8 +206,7 @@ function TabSummary({
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border bg-card px-4 py-3">
       {items.map((item) => (
         <span key={item.label} className="text-xs text-muted-foreground">
-          {item.label}{" "}
-          <span className="font-semibold tabular-nums text-foreground">{item.value}</span>
+          {item.label} <span className="font-semibold tabular-nums text-foreground">{item.value}</span>
         </span>
       ))}
       {menu && menu.length > 0 && (
@@ -858,10 +862,7 @@ function OrgTree({
 const ORG_DONE_STATUSES = ["제출", "승인"];
 
 /** 조직별 하위 합산 대상/제출 롤업 — 캔버스 노드의 제출률 링에 쓴다. */
-function buildCanvasRollup(
-  overview: OrgOverview | undefined,
-  units: OrgUnit[],
-): CanvasRollup | null {
+function buildCanvasRollup(overview: OrgOverview | undefined, units: OrgUnit[]): CanvasRollup | null {
   if (!overview) return null;
   const ids = new Set(units.map((u) => u.id));
   const childIds = new Map<string, string[]>();
@@ -900,7 +901,11 @@ function buildCanvasRollup(
 }
 
 /** 선택한 조직(하위 포함)의 인원 진행 상태 — 노드를 눌렀을 때 옆에 보여 준다 (P6). */
-function orgMemberStats(overview: OrgOverview | undefined, units: OrgUnit[], orgId: string | null) {
+function orgMemberStats(
+  overview: OrgOverview | undefined,
+  units: OrgUnit[],
+  orgId: string | null,
+) {
   if (!overview || !orgId) return null;
   const childIds = new Map<string, string[]>();
   for (const unit of units) {
@@ -1170,10 +1175,7 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
           }
           scope={selectedUnit.companies?.name ?? "하위 조직 포함"}
           actions={[
-            {
-              label: "이 조직 이름 변경",
-              onClick: () => setAction({ kind: "rename", unit: selectedUnit }),
-            },
+            { label: "이 조직 이름 변경", onClick: () => setAction({ kind: "rename", unit: selectedUnit }) },
             {
               label: "참여자 관리에서 보기",
               href: "/admin/participants",
@@ -1217,38 +1219,38 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
         <div className="rounded-xl border bg-card p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm font-medium">조직도 {units ? `(${units.length})` : ""}</p>
-            <div className="flex items-center gap-2">
-              <Input
-                className="h-8 w-40"
-                value={newRoot}
-                placeholder="최상위 조직명"
-                aria-label="최상위 조직명"
-                onChange={(e) => setNewRoot(e.target.value)}
-              />
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8"
-                disabled={edit.isPending || newRoot.trim() === "" || rootCompanyId === ""}
-                onClick={() =>
-                  edit.mutate(async () =>
-                    createOrgUnit({
-                      data: {
-                        companyId: rootCompanyId,
-                        parentId: null,
-                        name: newRoot.trim(),
-                        level: "",
-                      },
-                      headers: await authHeaders(),
-                    }),
-                  )
-                }
-              >
-                <Plus className="size-4" />
-                최상위 추가
-              </Button>
-            </div>
+          <div className="flex items-center gap-2">
+            <Input
+              className="h-8 w-40"
+              value={newRoot}
+              placeholder="최상위 조직명"
+              aria-label="최상위 조직명"
+              onChange={(e) => setNewRoot(e.target.value)}
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8"
+              disabled={edit.isPending || newRoot.trim() === "" || rootCompanyId === ""}
+              onClick={() =>
+                edit.mutate(async () =>
+                  createOrgUnit({
+                    data: {
+                      companyId: rootCompanyId,
+                      parentId: null,
+                      name: newRoot.trim(),
+                      level: "",
+                    },
+                    headers: await authHeaders(),
+                  }),
+                )
+              }
+            >
+              <Plus className="size-4" />
+              최상위 추가
+            </Button>
           </div>
+        </div>
           <p className="mt-1 text-xs text-muted-foreground">
             하위 조직이나 배정 인원이 있는 조직은 삭제되지 않습니다. 조직 이름을 누르면 그 조직의
             인원 현황이 위에 나타납니다.
@@ -1269,7 +1271,9 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
                 action={action}
                 busy={edit.isPending}
                 selectedId={selectedOrgId}
-                impactBadge={<ImpactCountBadge audience={audience} loading={audienceLoading} />}
+                impactBadge={
+                  <ImpactCountBadge audience={audience} loading={audienceLoading} />
+                }
                 onAction={setAction}
                 onCancel={() => setAction(null)}
                 onSubmit={submitAction}
@@ -1285,7 +1289,9 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
                   action={action}
                   units={units ?? []}
                   busy={edit.isPending}
-                  impactBadge={<ImpactCountBadge audience={audience} loading={audienceLoading} />}
+                  impactBadge={
+                    <ImpactCountBadge audience={audience} loading={audienceLoading} />
+                  }
                   onCancel={() => setAction(null)}
                   onSubmit={submitAction}
                 />
@@ -1301,9 +1307,9 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
                 onSelect={(unit) => setSelectedOrgId(unit.id)}
               />
               <p className="text-xs text-muted-foreground">
-                휠이나 오른쪽 위 버튼으로 확대·축소·화면 맞춤, 빈 곳을 끌어 이동합니다. 노드를
-                누르면 그 조직의 인원 현황이 위에 나타나고, 다른 노드 위에 끌어 놓으면 그 조직의
-                하위로 이동합니다. 링은 하위 조직을 합산한 제출률입니다.
+                휠이나 오른쪽 위 버튼으로 확대·축소·화면 맞춤, 빈 곳을 끌어 이동합니다. 노드를 누르면
+                그 조직의 인원 현황이 위에 나타나고, 다른 노드 위에 끌어 놓으면 그 조직의 하위로
+                이동합니다. 링은 하위 조직을 합산한 제출률입니다.
               </p>
             </div>
           )}
@@ -1762,7 +1768,9 @@ function CatalogVersionPanel() {
     <div className="space-y-3 rounded-xl border bg-card p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <p className="text-sm font-medium">버전 관리 {versions ? `(${versions.length})` : ""}</p>
+          <p className="text-sm font-medium">
+            버전 관리 {versions ? `(${versions.length})` : ""}
+          </p>
           <p className="mt-1 text-xs text-muted-foreground">
             AI 가안 반영·업로드 교체·복원 전에 자동 백업 버전이 만들어집니다. 개별 행 편집은 버전을
             만들지 않습니다.
@@ -1810,7 +1818,8 @@ function CatalogVersionPanel() {
                 <div className="min-w-0 flex-1">
                   <p className="truncate font-medium">{v.label}</p>
                   <p className="text-xs text-muted-foreground">
-                    {formatDate(v.createdAt)} · {v.rowCount}행{v.note ? ` · ${v.note}` : ""}
+                    {formatDate(v.createdAt)} · {v.rowCount}행
+                    {v.note ? ` · ${v.note}` : ""}
                   </p>
                 </div>
                 <Button
@@ -2324,95 +2333,93 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
         subtitle="자유 입력된 직군·직렬·직무를 직무분류표 항목과 대조합니다."
         defaultCollapsed
       >
-        <div className="space-y-3 rounded-xl border bg-card p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <p className="text-sm font-medium">기존 응답 연결 제안</p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                응답자가 자유 입력한 직군·직렬·직무를 직무분류표 항목과 대조해 유사도 60% 이상만
-                제안합니다. 적용회사 열은 세미콜론(;)으로 복수 지정합니다.
-              </p>
-            </div>
-            <Button size="sm" disabled={suggest.isPending} onClick={() => suggest.mutate()}>
-              <Sparkles className="size-4" />
-              제안 받기
-            </Button>
+      <div className="space-y-3 rounded-xl border bg-card p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="text-sm font-medium">기존 응답 연결 제안</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              응답자가 자유 입력한 직군·직렬·직무를 직무분류표 항목과 대조해 유사도 60% 이상만
+              제안합니다. 적용회사 열은 세미콜론(;)으로 복수 지정합니다.
+            </p>
           </div>
-
-          {suggestions && suggestions.length > 0 && (
-            <>
-              <div className="overflow-x-auto rounded-lg border">
-                <table className="w-full min-w-[640px] text-xs">
-                  <thead className="bg-secondary text-left text-muted-foreground">
-                    <tr>
-                      <th className="w-10 px-3 py-2" />
-                      <th className="px-3 py-2 font-medium">응답자</th>
-                      <th className="px-3 py-2 font-medium">현재 표기</th>
-                      <th className="px-3 py-2 font-medium">직무분류표 제안</th>
-                      <th className="px-3 py-2 font-medium">유사도</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {suggestions.map((s) => (
-                      <tr key={s.responseId} className="border-t">
-                        <td className="px-3 py-2">
-                          <Checkbox
-                            checked={selected.has(s.responseId)}
-                            aria-label={`${s.participantName} 제안 선택`}
-                            onCheckedChange={(checked) =>
-                              setSelected((prev) => {
-                                const next = new Set(prev);
-                                if (checked === true) next.add(s.responseId);
-                                else next.delete(s.responseId);
-                                return next;
-                              })
-                            }
-                          />
-                        </td>
-                        <td className="px-3 py-2 font-medium">{s.participantName || "-"}</td>
-                        <td className="px-3 py-2 text-muted-foreground">
-                          {[s.current.job_group, s.current.job_series, s.current.job_name]
-                            .filter(Boolean)
-                            .join(" / ") || "-"}
-                        </td>
-                        <td className="px-3 py-2">
-                          {[
-                            s.suggested.job_group,
-                            s.suggested.job_series,
-                            s.suggested.job_name,
-                          ].join(" / ")}
-                        </td>
-                        <td className="px-3 py-2">{Math.round(s.score * 100)}%</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    setSelected((prev) =>
-                      prev.size === suggestions.length
-                        ? new Set()
-                        : new Set(suggestions.map((s) => s.responseId)),
-                    )
-                  }
-                >
-                  {selected.size === suggestions.length ? "전체 해제" : "전체 선택"}
-                </Button>
-                <Button
-                  size="sm"
-                  disabled={apply.isPending || selected.size === 0}
-                  onClick={() => apply.mutate()}
-                >
-                  선택 {selected.size}건 적용
-                </Button>
-              </div>
-            </>
-          )}
+          <Button size="sm" disabled={suggest.isPending} onClick={() => suggest.mutate()}>
+            <Sparkles className="size-4" />
+            제안 받기
+          </Button>
         </div>
+
+        {suggestions && suggestions.length > 0 && (
+          <>
+            <div className="overflow-x-auto rounded-lg border">
+              <table className="w-full min-w-[640px] text-xs">
+                <thead className="bg-secondary text-left text-muted-foreground">
+                  <tr>
+                    <th className="w-10 px-3 py-2" />
+                    <th className="px-3 py-2 font-medium">응답자</th>
+                    <th className="px-3 py-2 font-medium">현재 표기</th>
+                    <th className="px-3 py-2 font-medium">직무분류표 제안</th>
+                    <th className="px-3 py-2 font-medium">유사도</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {suggestions.map((s) => (
+                    <tr key={s.responseId} className="border-t">
+                      <td className="px-3 py-2">
+                        <Checkbox
+                          checked={selected.has(s.responseId)}
+                          aria-label={`${s.participantName} 제안 선택`}
+                          onCheckedChange={(checked) =>
+                            setSelected((prev) => {
+                              const next = new Set(prev);
+                              if (checked === true) next.add(s.responseId);
+                              else next.delete(s.responseId);
+                              return next;
+                            })
+                          }
+                        />
+                      </td>
+                      <td className="px-3 py-2 font-medium">{s.participantName || "-"}</td>
+                      <td className="px-3 py-2 text-muted-foreground">
+                        {[s.current.job_group, s.current.job_series, s.current.job_name]
+                          .filter(Boolean)
+                          .join(" / ") || "-"}
+                      </td>
+                      <td className="px-3 py-2">
+                        {[s.suggested.job_group, s.suggested.job_series, s.suggested.job_name].join(
+                          " / ",
+                        )}
+                      </td>
+                      <td className="px-3 py-2">{Math.round(s.score * 100)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setSelected((prev) =>
+                    prev.size === suggestions.length
+                      ? new Set()
+                      : new Set(suggestions.map((s) => s.responseId)),
+                  )
+                }
+              >
+                {selected.size === suggestions.length ? "전체 해제" : "전체 선택"}
+              </Button>
+              <Button
+                size="sm"
+                disabled={apply.isPending || selected.size === 0}
+                onClick={() => apply.mutate()}
+              >
+                선택 {selected.size}건 적용
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
       </CollapsibleSection>
     </EditorWithInspector>
   );
@@ -2475,10 +2482,7 @@ function DutyDraftPanel({ onApplied }: { onApplied: () => void }) {
               confirm: true,
               companyId: c.companyId,
               orgName: c.orgName,
-              rows: c.rows.map((r) => ({
-                "주요 업무": r.main.trim(),
-                "세부 업무": r.detail.trim(),
-              })),
+              rows: c.rows.map((r) => ({ "주요 업무": r.main.trim(), "세부 업무": r.detail.trim() })),
             },
             headers,
           }),
@@ -2620,7 +2624,9 @@ function DutyDraftPanel({ onApplied }: { onApplied: () => void }) {
                             onClick={() =>
                               setCharts((prev) =>
                                 (prev ?? []).map((c, i) =>
-                                  i === ci ? { ...c, rows: c.rows.filter((_, j) => j !== ri) } : c,
+                                  i === ci
+                                    ? { ...c, rows: c.rows.filter((_, j) => j !== ri) }
+                                    : c,
                                 ),
                               )
                             }
@@ -2798,74 +2804,74 @@ function DutyTab() {
         subtitle="회사·조직을 정해 자유 양식 그대로 올립니다."
         defaultCollapsed
       >
-        <div className="space-y-4 rounded-xl border bg-card p-4">
-          <p className="text-xs text-muted-foreground">
-            자유 양식 그대로 업로드합니다. 모든 열이 보존되며 같은 회사·조직명으로 다시 올리면 이전
-            업로드를 교체합니다. 응답자 화면 참고 패널 연결은 추후 제공됩니다.
-          </p>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label className="text-xs">회사</Label>
-              <Select value={targetCompany} onValueChange={setTargetCompany}>
-                <SelectTrigger aria-label="회사 선택">
-                  <SelectValue placeholder="회사를 선택하세요" />
-                </SelectTrigger>
-                <SelectContent>
-                  {companies?.map((c) => (
-                    <SelectItem key={c.id} value={c.id}>
-                      {c.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1">
-              <Label className="text-xs" htmlFor="duty-org">
-                조직명
-              </Label>
-              <Input
-                id="duty-org"
-                value={orgName}
-                placeholder="예: 경영기획본부 기획팀"
-                onChange={(e) => setOrgName(e.target.value)}
-              />
-            </div>
+      <div className="space-y-4 rounded-xl border bg-card p-4">
+        <p className="text-xs text-muted-foreground">
+          자유 양식 그대로 업로드합니다. 모든 열이 보존되며 같은 회사·조직명으로 다시 올리면 이전
+          업로드를 교체합니다. 응답자 화면 참고 패널 연결은 추후 제공됩니다.
+        </p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label className="text-xs">회사</Label>
+            <Select value={targetCompany} onValueChange={setTargetCompany}>
+              <SelectTrigger aria-label="회사 선택">
+                <SelectValue placeholder="회사를 선택하세요" />
+              </SelectTrigger>
+              <SelectContent>
+                {companies?.map((c) => (
+                  <SelectItem key={c.id} value={c.id}>
+                    {c.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <Label
-              htmlFor="duty-file"
-              className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-md border bg-card px-3 text-sm font-medium hover:bg-secondary"
-            >
-              <Upload className="size-4" />
-              파일 선택
+          <div className="space-y-1">
+            <Label className="text-xs" htmlFor="duty-org">
+              조직명
             </Label>
-            <input
-              id="duty-file"
-              type="file"
-              accept=".csv,.xlsx,.xls"
-              className="sr-only"
-              onChange={(e) => void handleFile(e.target.files?.[0])}
+            <Input
+              id="duty-org"
+              value={orgName}
+              placeholder="예: 경영기획본부 기획팀"
+              onChange={(e) => setOrgName(e.target.value)}
             />
-            {fileName && (
-              <span className="text-sm text-muted-foreground">
-                {fileName} · {rows.length}건
-              </span>
-            )}
-            <Button disabled={!ready || upload.isPending} onClick={() => upload.mutate()}>
-              업로드
-            </Button>
           </div>
-
-          {rows.length > 0 && (
-            <PreviewTable
-              headers={headers}
-              rows={rows}
-              errorRows={new Set((report?.issues ?? []).map((i) => i.rowNo))}
-            />
-          )}
-          {report && <ReportPanel report={report} />}
         </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Label
+            htmlFor="duty-file"
+            className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-md border bg-card px-3 text-sm font-medium hover:bg-secondary"
+          >
+            <Upload className="size-4" />
+            파일 선택
+          </Label>
+          <input
+            id="duty-file"
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            className="sr-only"
+            onChange={(e) => void handleFile(e.target.files?.[0])}
+          />
+          {fileName && (
+            <span className="text-sm text-muted-foreground">
+              {fileName} · {rows.length}건
+            </span>
+          )}
+          <Button disabled={!ready || upload.isPending} onClick={() => upload.mutate()}>
+            업로드
+          </Button>
+        </div>
+
+        {rows.length > 0 && (
+          <PreviewTable
+            headers={headers}
+            rows={rows}
+            errorRows={new Set((report?.issues ?? []).map((i) => i.rowNo))}
+          />
+        )}
+        {report && <ReportPanel report={report} />}
+      </div>
       </CollapsibleSection>
 
       <CollapsibleSection
@@ -2874,40 +2880,38 @@ function DutyTab() {
         title="올라온 업무분장표"
         subtitle="같은 회사·조직명으로 다시 올리면 이전 업로드를 교체합니다."
       >
-        <div className="space-y-3">
-          {(charts ?? []).length === 0 ? (
-            <EmptyState
-              kind="nothing"
-              title="아직 올라온 업무분장표가 없습니다"
-              description="위 「AI 업무분장 가안」으로 초안을 만들거나, 「파일로 올리기」에서 조직별 파일을 올리세요."
-            />
-          ) : (
-            (charts ?? []).map((chart) => (
-              <div key={chart.id} className="rounded-xl border bg-card p-4">
-                <div className="flex flex-wrap items-baseline justify-between gap-2">
-                  <p className="text-sm font-semibold">
-                    {chart.orgName}
-                    <span className="ml-2 text-xs font-normal text-primary">
-                      {chart.companyName}
-                    </span>
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {chart.rowCount}건 · {formatDate(chart.uploadedAt)}
-                  </p>
-                </div>
-                {chart.preview.length > 0 && (
-                  <div className="mt-3">
-                    <PreviewTable
-                      headers={chart.columns}
-                      rows={chart.preview}
-                      errorRows={new Set<number>()}
-                    />
-                  </div>
-                )}
+      <div className="space-y-3">
+        {(charts ?? []).length === 0 ? (
+          <EmptyState
+            kind="nothing"
+            title="아직 올라온 업무분장표가 없습니다"
+            description="위 「AI 업무분장 가안」으로 초안을 만들거나, 「파일로 올리기」에서 조직별 파일을 올리세요."
+          />
+        ) : (
+          (charts ?? []).map((chart) => (
+            <div key={chart.id} className="rounded-xl border bg-card p-4">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <p className="text-sm font-semibold">
+                  {chart.orgName}
+                  <span className="ml-2 text-xs font-normal text-primary">{chart.companyName}</span>
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {chart.rowCount}건 · {formatDate(chart.uploadedAt)}
+                </p>
               </div>
-            ))
-          )}
-        </div>
+              {chart.preview.length > 0 && (
+                <div className="mt-3">
+                  <PreviewTable
+                    headers={chart.columns}
+                    rows={chart.preview}
+                    errorRows={new Set<number>()}
+                  />
+                </div>
+              )}
+            </div>
+          ))
+        )}
+      </div>
       </CollapsibleSection>
     </div>
   );
@@ -2983,14 +2987,14 @@ function StatusTab() {
         title="기준 정보 건수"
         subtitle="지금 시스템에 들어 있는 기준 정보의 규모입니다."
       >
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          {cards.map((card) => (
-            <div key={card.label} className="rounded-xl border bg-card p-4 shadow-sm">
-              <p className="text-xs text-muted-foreground">{card.label}</p>
-              <p className="mt-1 text-2xl font-bold">{card.value.toLocaleString("ko-KR")}</p>
-            </div>
-          ))}
-        </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {cards.map((card) => (
+          <div key={card.label} className="rounded-xl border bg-card p-4 shadow-sm">
+            <p className="text-xs text-muted-foreground">{card.label}</p>
+            <p className="mt-1 text-2xl font-bold">{card.value.toLocaleString("ko-KR")}</p>
+          </div>
+        ))}
+      </div>
       </CollapsibleSection>
 
       <CollapsibleSection
@@ -2999,26 +3003,26 @@ function StatusTab() {
         title="최근 업로드"
         subtitle="반영 전 백업은 변경 기록에 남아 되돌리기 지점으로 쓸 수 있습니다."
       >
-        <div className="rounded-xl border bg-card p-4">
-          <p className="text-sm font-medium">최근 업로드</p>
-          {(data?.lastUploads ?? []).length === 0 ? (
-            <p className="mt-2 text-sm text-muted-foreground">업로드 이력이 없습니다.</p>
-          ) : (
-            <ul className="mt-2 space-y-1 text-sm">
-              {data?.lastUploads.map((entry) => (
-                <li key={entry.action} className="flex justify-between gap-3">
-                  <span>{entry.action}</span>
-                  <span className="text-muted-foreground">{formatDate(entry.at)}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+      <div className="rounded-xl border bg-card p-4">
+        <p className="text-sm font-medium">최근 업로드</p>
+        {(data?.lastUploads ?? []).length === 0 ? (
+          <p className="mt-2 text-sm text-muted-foreground">업로드 이력이 없습니다.</p>
+        ) : (
+          <ul className="mt-2 space-y-1 text-sm">
+            {data?.lastUploads.map((entry) => (
+              <li key={entry.action} className="flex justify-between gap-3">
+                <span>{entry.action}</span>
+                <span className="text-muted-foreground">{formatDate(entry.at)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
 
-        <p className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
-          반영 전 백업이 변경 기록에 저장됩니다. 잘못 반영한 경우 변경 기록의 백업을 되돌리기
-          지점으로 사용하세요.
-        </p>
+      <p className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+        반영 전 백업이 변경 기록에 저장됩니다. 잘못 반영한 경우 변경 기록의 백업을 되돌리기 지점으로
+        사용하세요.
+      </p>
       </CollapsibleSection>
     </div>
   );
