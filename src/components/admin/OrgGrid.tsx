@@ -2,7 +2,7 @@
 // 행 = 조직(부모 다음 자식, 형제는 정렬→이름 순), 열 = 깊이(레벨1~N) + 구분 + 정렬 + 인원 + 작업.
 // 칸을 그 자리에서 고치고 Enter 나 다른 곳 누름으로 저장한다. 검증·확인·고지는 부모(master.tsx)가 담당.
 import { useMemo, useRef, useState, type ReactNode } from "react";
-import { MoreHorizontal, X } from "lucide-react";
+import { ChevronDown, ChevronUp, MoreHorizontal, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -26,7 +26,8 @@ export type OrgGridUnit = {
 /** 조직별 하위 합산 대상/제출 인원 — 인원 열에 쓴다. */
 export type OrgRollup = Map<string, { total: number; done: number }>;
 
-type GridRow = { unit: OrgGridUnit; depth: number; prevSiblingId: string | null };
+/** siblings/index 는 ↑↓ 순서 이동과 들여쓰기 후보 계산에 쓴다 (표시 순서 기준 형제 목록). */
+type GridRow = { unit: OrgGridUnit; depth: number; siblings: OrgGridUnit[]; index: number };
 
 /** 트리 위상 순서로 편다. 형제는 정렬(sort)→이름 순, 순환 데이터는 seen 으로 방어. */
 function flatten(units: OrgGridUnit[]) {
@@ -44,16 +45,16 @@ function flatten(units: OrgGridUnit[]) {
   const rows: GridRow[] = [];
   let maxDepth = 0;
   const seen = new Set<string>();
-  const walk = (u: OrgGridUnit, depth: number, prevSiblingId: string | null) => {
+  const walk = (u: OrgGridUnit, depth: number, siblings: OrgGridUnit[], index: number) => {
     if (seen.has(u.id)) return;
     seen.add(u.id);
     maxDepth = Math.max(maxDepth, depth);
-    rows.push({ unit: u, depth, prevSiblingId });
+    rows.push({ unit: u, depth, siblings, index });
     const kids = byParent.get(u.id) ?? [];
-    kids.forEach((k, i) => walk(k, depth + 1, i > 0 ? kids[i - 1]!.id : null));
+    kids.forEach((k, i) => walk(k, depth + 1, kids, i));
   };
   const roots = byParent.get(null) ?? [];
-  roots.forEach((r, i) => walk(r, 0, i > 0 ? roots[i - 1]!.id : null));
+  roots.forEach((r, i) => walk(r, 0, roots, i));
   return { rows, maxDepth };
 }
 
@@ -189,6 +190,7 @@ export function OrgGrid({
   onEditStart,
   onRename,
   onMove,
+  onReorder,
   onCreate,
   onDelete,
 }: {
@@ -203,6 +205,8 @@ export function OrgGrid({
   onEditStart: (unit: OrgGridUnit) => void;
   onRename: (unit: OrgGridUnit, values: { name: string; level: string; sort: number }) => void;
   onMove: (unit: OrgGridUnit, parentId: string | null, title: string) => void;
+  /** ↑↓ 순서 이동 — 형제 전체의 정렬값을 표시 순서대로 다시 매겨 한 번에 저장한다. */
+  onReorder: (items: { id: string; sort: number }[]) => void;
   onCreate: (input: {
     companyId: string;
     parentId: string | null;
@@ -249,6 +253,15 @@ export function OrgGrid({
     return <p className="text-sm text-muted-foreground">등록된 조직이 없습니다.</p>;
   }
 
+  /** 형제 사이 한 칸 이동. 동률 sort 는 표시 순서대로 0,1,2… 로 다시 매겨 함께 저장한다. */
+  function moveSibling(siblings: OrgGridUnit[], index: number, dir: -1 | 1) {
+    const target = index + dir;
+    if (target < 0 || target >= siblings.length) return;
+    const order = [...siblings];
+    [order[index], order[target]] = [order[target]!, order[index]!];
+    onReorder(order.map((u, i) => ({ id: u.id, sort: i })));
+  }
+
   return (
     <div className="space-y-3">
       {groups.map((group) => (
@@ -268,13 +281,13 @@ export function OrgGrid({
                   <th className="px-2 py-2 font-medium">구분</th>
                   <th className="px-2 py-2 font-medium">정렬</th>
                   <th className="whitespace-nowrap px-2 py-2 font-medium">인원</th>
-                  <th className="w-10 px-2 py-2" aria-label="행 작업" />
+                  <th className="w-24 px-2 py-2" aria-label="행 작업" />
                 </tr>
               </thead>
               <tbody>
-                {group.rows.map(({ unit, depth, prevSiblingId }) => {
+                {group.rows.map(({ unit, depth, siblings, index }) => {
                   const stats = rollup?.get(unit.id);
-                  const prevSibling = prevSiblingId ? byId.get(prevSiblingId) : undefined;
+                  const prevSibling = index > 0 ? siblings[index - 1] : undefined;
                   const parent = unit.parent_id ? byId.get(unit.parent_id) : undefined;
                   return (
                     <FragmentRow key={unit.id}>
@@ -348,77 +361,99 @@ export function OrgGrid({
                           {stats ? `${stats.total}명 · 제출 ${stats.done}` : "-"}
                         </td>
                         <td className="px-1 py-1">
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="size-7"
-                                aria-label={`${unit.name} 조직 관리`}
-                                disabled={busy}
-                              >
-                                <MoreHorizontal className="size-4" />
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end">
-                              <DropdownMenuItem
-                                onSelect={() =>
-                                  setDraft({
-                                    anchorId: unit.id,
-                                    parentId: unit.id,
-                                    companyId: unit.company_id,
-                                    depth: depth + 1,
-                                  })
-                                }
-                              >
-                                하위 조직 추가
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                onSelect={() =>
-                                  setDraft({
-                                    anchorId: unit.id,
-                                    parentId: unit.parent_id,
-                                    companyId: unit.company_id,
-                                    depth,
-                                  })
-                                }
-                              >
-                                같은 레벨 추가
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                disabled={!prevSibling}
-                                onSelect={() => {
-                                  if (!prevSibling) return;
-                                  onMove(
-                                    unit,
-                                    prevSibling.id,
-                                    `「${unit.name}」 을(를) 「${prevSibling.name}」 하위로 이동`,
-                                  );
-                                }}
-                              >
-                                들여쓰기 (위 조직의 하위로)
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                disabled={!unit.parent_id}
-                                onSelect={() =>
-                                  onMove(
-                                    unit,
-                                    parent?.parent_id ?? null,
-                                    `「${unit.name}」 을(를) 한 단계 위로 이동`,
-                                  )
-                                }
-                              >
-                                내어쓰기 (한 단계 위로)
-                              </DropdownMenuItem>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuItem
-                                className="text-destructive"
-                                onSelect={() => onDelete(unit)}
-                              >
-                                삭제
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
+                          <div className="flex items-center gap-0.5">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-7"
+                              aria-label={`${unit.name} 위로 이동`}
+                              disabled={busy || index === 0}
+                              onClick={() => moveSibling(siblings, index, -1)}
+                            >
+                              <ChevronUp className="size-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-7"
+                              aria-label={`${unit.name} 아래로 이동`}
+                              disabled={busy || index === siblings.length - 1}
+                              onClick={() => moveSibling(siblings, index, 1)}
+                            >
+                              <ChevronDown className="size-4" />
+                            </Button>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="size-7"
+                                  aria-label={`${unit.name} 조직 관리`}
+                                  disabled={busy}
+                                >
+                                  <MoreHorizontal className="size-4" />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end">
+                                <DropdownMenuItem
+                                  onSelect={() =>
+                                    setDraft({
+                                      anchorId: unit.id,
+                                      parentId: unit.id,
+                                      companyId: unit.company_id,
+                                      depth: depth + 1,
+                                    })
+                                  }
+                                >
+                                  하위 조직 추가
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  onSelect={() =>
+                                    setDraft({
+                                      anchorId: unit.id,
+                                      parentId: unit.parent_id,
+                                      companyId: unit.company_id,
+                                      depth,
+                                    })
+                                  }
+                                >
+                                  같은 레벨 추가
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  disabled={!prevSibling}
+                                  onSelect={() => {
+                                    if (!prevSibling) return;
+                                    onMove(
+                                      unit,
+                                      prevSibling.id,
+                                      `「${unit.name}」 을(를) 「${prevSibling.name}」 하위로 이동`,
+                                    );
+                                  }}
+                                >
+                                  들여쓰기 (위 조직의 하위로)
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  disabled={!unit.parent_id}
+                                  onSelect={() =>
+                                    onMove(
+                                      unit,
+                                      parent?.parent_id ?? null,
+                                      `「${unit.name}」 을(를) 한 단계 위로 이동`,
+                                    )
+                                  }
+                                >
+                                  내어쓰기 (한 단계 위로)
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  className="text-destructive"
+                                  onSelect={() => onDelete(unit)}
+                                >
+                                  삭제
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </div>
                         </td>
                       </tr>
                       {draft && draft.anchorId === unit.id && (

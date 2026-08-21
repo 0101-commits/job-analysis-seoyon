@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { AlertTriangle, Check, Loader2, Send, Sparkles, Wand2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
@@ -107,6 +108,8 @@ export function AiInspector({
 }) {
   const queryClient = useQueryClient();
   const [run, setRun] = useState<RunState>({ phase: "idle" });
+  // 반영 방식 선택 — 기본은 즉시 반영. 켜면 자동 채움 제안을 응답자 확인 카드로 보낸다.
+  const [askAuthor, setAskAuthor] = useState(false);
 
   const { data: proxy } = useQuery({
     queryKey: ["ai-proxy-status"],
@@ -358,28 +361,32 @@ export function AiInspector({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm font-semibold">AI 제안 {pending.length}건</p>
             {pending.some((s) => s.route === "B" && s.status === "제안") && (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={review.isPending}
-                onClick={() =>
-                  review.mutate(
-                    pending.filter((s) => s.route === "B" && s.status === "제안").map((s) => s.id),
-                  )
-                }
-              >
-                {review.isPending ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <Send className="size-4" />
-                )}
+              <label className="flex items-center gap-2 text-xs">
+                <Checkbox
+                  checked={askAuthor}
+                  onCheckedChange={(v) => setAskAuthor(v === true)}
+                  aria-label="작성자에게 확인 요청"
+                />
                 작성자에게 확인 요청
-              </Button>
+              </label>
             )}
           </div>
+          {askAuthor && (
+            <p className="text-xs text-muted-foreground">
+              켜져 있는 동안에는 자동 채움 제안을 바로 반영하지 않고 작성자(응답자) 화면에 확인
+              카드로 보냅니다. 오탈자 제안은 항상 관리자가 직접 반영합니다.
+            </p>
+          )}
           <ul className="space-y-2">
             {pending.map((s) => (
-              <SuggestionRow key={s.id} suggestion={s} onDone={invalidate} />
+              <SuggestionRow
+                key={s.id}
+                suggestion={s}
+                onDone={invalidate}
+                {...(askAuthor && s.route === "B" && s.status === "제안"
+                  ? { onRequestReview: () => review.mutate([s.id]) }
+                  : {})}
+              />
             ))}
           </ul>
         </div>
@@ -407,13 +414,19 @@ export function AiInspector({
 
 type SuggestionItem = Awaited<ReturnType<typeof listSuggestions>>[number];
 
-/** 제안 한 건 — 원문과 나란히 놓고 수락·수정·거절한다. */
+/**
+ * 제안 한 건 — 원문과 나란히 놓고 수락·수정·거절한다.
+ * onRequestReview 가 있으면(「작성자에게 확인 요청」이 켜진 자동 채움 건) 즉시 반영 대신
+ * 응답자 확인 카드로 보내는 버튼이 뜬다.
+ */
 function SuggestionRow({
   suggestion: s,
   onDone,
+  onRequestReview,
 }: {
   suggestion: SuggestionItem;
   onDone: () => void;
+  onRequestReview?: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(s.suggested_value);
@@ -465,30 +478,38 @@ function SuggestionRow({
       )}
 
       <div className="mt-2 flex flex-wrap gap-1.5">
-        <Button
-          size="sm"
-          disabled={decide.isPending}
-          onClick={() =>
-            editing
-              ? decide.mutate({ decision: "수정", editedValue: draft })
-              : decide.mutate({ decision: "수락" })
-          }
-        >
-          <Check className="size-4" /> {editing ? "수정해서 반영" : "수락"}
-        </Button>
-        {/* 신규 역량 제안은 구조화된 값이라 자유 편집 시 반영이 깨진다 — 수락·거절만 둔다. */}
-        {!isNewSkill && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={decide.isPending}
-            onClick={() => {
-              setDraft(s.suggested_value);
-              setEditing((v) => !v);
-            }}
-          >
-            {editing ? "수정 취소" : "수정"}
+        {onRequestReview ? (
+          <Button size="sm" disabled={decide.isPending} onClick={onRequestReview}>
+            <Send className="size-4" /> 작성자 확인 요청
           </Button>
+        ) : (
+          <>
+            <Button
+              size="sm"
+              disabled={decide.isPending}
+              onClick={() =>
+                editing
+                  ? decide.mutate({ decision: "수정", editedValue: draft })
+                  : decide.mutate({ decision: "수락" })
+              }
+            >
+              <Check className="size-4" /> {editing ? "수정해서 반영" : "수락"}
+            </Button>
+            {/* 신규 역량 제안은 구조화된 값이라 자유 편집 시 반영이 깨진다 — 수락·거절만 둔다. */}
+            {!isNewSkill && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={decide.isPending}
+                onClick={() => {
+                  setDraft(s.suggested_value);
+                  setEditing((v) => !v);
+                }}
+              >
+                {editing ? "수정 취소" : "수정"}
+              </Button>
+            )}
+          </>
         )}
         <Button
           size="sm"

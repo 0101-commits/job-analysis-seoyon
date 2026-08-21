@@ -645,26 +645,35 @@ export type Database = {
         Row: {
           company_ids: string[]
           definition: string | null
+          group_sort: number
           id: string
           job_group: string
           job_name: string
           job_series: string
+          series_sort: number
+          sort: number
         }
         Insert: {
           company_ids?: string[]
           definition?: string | null
+          group_sort?: number
           id?: string
           job_group: string
           job_name: string
           job_series: string
+          series_sort?: number
+          sort?: number
         }
         Update: {
           company_ids?: string[]
           definition?: string | null
+          group_sort?: number
           id?: string
           job_group?: string
           job_name?: string
           job_series?: string
+          series_sort?: number
+          sort?: number
         }
         Relationships: []
       }

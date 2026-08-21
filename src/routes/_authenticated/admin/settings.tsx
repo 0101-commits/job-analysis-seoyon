@@ -1200,8 +1200,7 @@ function SettingsPage() {
                   >
                     <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
                       <p className="text-xs text-muted-foreground">
-                        차수를 만들면 차수의 마감·독려 일정이 우선하고, 이 값은 기본값으로만
-                        쓰입니다.
+                        차수를 만들면 차수의 마감일이 우선하고, 독려 일정은 이 값을 따릅니다.
                       </p>
                       <div className="grid gap-4 sm:grid-cols-2">
                         <div className="space-y-1.5">

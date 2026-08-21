@@ -68,6 +68,7 @@ import {
   orgPathLabel,
   orgSubtreeIds,
   useOrgLens,
+  UNASSIGNED_ORG,
 } from "@/components/admin/OrgTreeFilter";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { pickLens, type LensSearch } from "@/lib/lens-search";
@@ -103,6 +104,7 @@ import { getAllowedEmailDomains, getSettings } from "@/lib/settings.functions";
 import { listActiveCompanies } from "@/lib/companies";
 import { downloadXlsx } from "@/lib/xlsx";
 import { fetchAll } from "@/lib/paginate";
+import { ScreenAlert } from "@/components/admin/ScreenAlert";
 
 /**
  * 이 화면이 URL 로 주고받는 규약 (기획 D4).
@@ -113,6 +115,7 @@ import { fetchAll } from "@/lib/paginate";
  *                    대시보드 진행축 딥링크가 「미확인=초대발송,미접속」처럼 묶어 보낸다)
  *   ?recheck=1       변경 재확인이 필요한 응답이 있는 참여자만 (기획 F10)
  *   ?co=<계열사id> ?org=<소속id>   계열사·소속 렌즈 (기획 v2 P2) — 모든 관리 화면이 공유한다
+ *                    ?org=none 은 「미소속」 — 조직도에 연결되지 않은 참여자만 (v6 G4)
  *   ?q=<검색어> ?tag=<태그> ?archived=1 ?tab=list|upload
  *   ?assignWave=<차수id> 차수 관리 화면이 보낸다 — 그 차수로 배정하는 흐름을 연다
  *
@@ -1621,9 +1624,9 @@ function RosterListTab({
     patch({ org: id ?? undefined });
   }
 
-  /** 선택 소속 + (토글 시) 하위 소속 전체의 id 집합. 전체면 null. */
+  /** 선택 소속 + (토글 시) 하위 소속 전체의 id 집합. 전체·미소속이면 null. */
   const orgIdSet = useMemo(() => {
-    if (!selectedOrgId) return null;
+    if (!selectedOrgId || selectedOrgId === UNASSIGNED_ORG) return null;
     if (!includeSubOrgs) return new Set([selectedOrgId]);
     return new Set(orgSubtreeIds(units, selectedOrgId) ?? [selectedOrgId]);
   }, [selectedOrgId, includeSubOrgs, units]);
@@ -1682,11 +1685,13 @@ function RosterListTab({
     });
   }, [data, searchText, statusSet, tagFilter, includeArchived, search.recheck, recheckIds]);
 
-  const rows = useMemo(
-    () =>
-      orgIdSet ? baseRows.filter((p) => p.org_unit_id && orgIdSet.has(p.org_unit_id)) : baseRows,
-    [baseRows, orgIdSet],
-  );
+  const rows = useMemo(() => {
+    // 「미소속」(?org=none) — 조직도에 연결되지 않은 참여자만 (v6 G4). CSV 도 이 rows 를 쓴다.
+    if (selectedOrgId === UNASSIGNED_ORG) return baseRows.filter((p) => !p.org_unit_id);
+    return orgIdSet
+      ? baseRows.filter((p) => p.org_unit_id && orgIdSet.has(p.org_unit_id))
+      : baseRows;
+  }, [baseRows, orgIdSet, selectedOrgId]);
 
   /**
    * 소속별 인원수 — 자기 소속과 하위 소속을 합친 값. 트리에서 규모를 바로 본다.
@@ -1854,7 +1859,8 @@ function RosterListTab({
     waveAssign.isPending;
   const columnsChanged = !sameColumns(visibleColumns, DEFAULT_COLUMNS);
   const shownColumns = LIST_COLUMNS.filter((c) => visibleColumns.includes(c.key));
-  const remindTarget = selectedIds.length > 0 || !!selectedOrgId;
+  const remindTarget =
+    selectedIds.length > 0 || (!!selectedOrgId && selectedOrgId !== UNASSIGNED_ORG);
 
   /** 현재 필터가 적용된 rows 그대로 CSV 로 만든다. 엑셀 호환을 위해 BOM 을 붙인다. */
   function downloadRoster() {
@@ -1981,650 +1987,655 @@ function RosterListTab({
   }
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[240px_minmax(0,1fr)]">
-      {/* 관리의 기본 단위는 개인이 아니라 소속이다 (기획 B4·P5). */}
-      <OrgTreeFilter
-        units={units}
-        selectedId={selectedOrgId}
-        onSelect={selectOrg}
-        counts={orgCounts}
-        title="소속"
-        className="h-fit lg:sticky lg:top-[var(--sticky-top)]"
-      />
+    <div className="space-y-4">
+      {/* 이 화면 몫의 경고 — 미착수 정체·변경 재확인 (v6 G4) */}
+      <ScreenAlert screen="participants" />
+      <div className="grid gap-4 lg:grid-cols-[240px_minmax(0,1fr)]">
+        {/* 관리의 기본 단위는 개인이 아니라 소속이다 (기획 B4·P5). */}
+        <OrgTreeFilter
+          units={units}
+          selectedId={selectedOrgId}
+          onSelect={selectOrg}
+          counts={orgCounts}
+          title="소속"
+          allowUnassigned
+          className="h-fit lg:sticky lg:top-[var(--sticky-top)]"
+        />
 
-      <div className="min-w-0 space-y-4">
-        <div className="space-y-3 rounded-xl border bg-card p-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={searchText}
-                  onChange={(e) => setSearchText(e.target.value)}
-                  placeholder="이름 · 사번 · 이메일"
-                  aria-label="참여자 검색"
-                  className="w-[220px] pl-8"
-                />
-              </div>
-              <Select
-                value={statusFilter}
-                onValueChange={(v) => patch({ status: v === "all" ? undefined : v })}
-              >
-                <SelectTrigger className="w-[140px]" aria-label="상태 필터">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">전체 상태</SelectItem>
-                  {/* 딥링크로 여러 상태가 묶여 온 경우 — 그 묶음 자체를 항목으로 보여 준다. */}
-                  {statusFilter.includes(",") && (
-                    <SelectItem value={statusFilter}>
-                      {statusFilter.split(",").join(" · ")}
-                    </SelectItem>
-                  )}
-                  {ACCOUNT_STATUS_LABELS.map((s) => (
-                    <SelectItem key={s} value={s}>
-                      {s}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Select
-                value={tagFilter}
-                onValueChange={(v) => patch({ tag: v === "all" ? undefined : v })}
-              >
-                <SelectTrigger className="w-[140px]" aria-label="태그 필터">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">전체 태그</SelectItem>
-                  {allTags.map((t) => (
-                    <SelectItem key={t} value={t}>
-                      {t}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {selectedOrgId && (
+        <div className="min-w-0 space-y-4">
+          <div className="space-y-3 rounded-xl border bg-card p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={searchText}
+                    onChange={(e) => setSearchText(e.target.value)}
+                    placeholder="이름 · 사번 · 이메일"
+                    aria-label="참여자 검색"
+                    className="w-[220px] pl-8"
+                  />
+                </div>
+                <Select
+                  value={statusFilter}
+                  onValueChange={(v) => patch({ status: v === "all" ? undefined : v })}
+                >
+                  <SelectTrigger className="w-[140px]" aria-label="상태 필터">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">전체 상태</SelectItem>
+                    {/* 딥링크로 여러 상태가 묶여 온 경우 — 그 묶음 자체를 항목으로 보여 준다. */}
+                    {statusFilter.includes(",") && (
+                      <SelectItem value={statusFilter}>
+                        {statusFilter.split(",").join(" · ")}
+                      </SelectItem>
+                    )}
+                    {ACCOUNT_STATUS_LABELS.map((s) => (
+                      <SelectItem key={s} value={s}>
+                        {s}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={tagFilter}
+                  onValueChange={(v) => patch({ tag: v === "all" ? undefined : v })}
+                >
+                  <SelectTrigger className="w-[140px]" aria-label="태그 필터">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">전체 태그</SelectItem>
+                    {allTags.map((t) => (
+                      <SelectItem key={t} value={t}>
+                        {t}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {selectedOrgId && selectedOrgId !== UNASSIGNED_ORG && (
+                  <label className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={includeSubOrgs}
+                      onCheckedChange={(v) => setIncludeSubOrgs(v === true)}
+                    />
+                    하위 소속 포함
+                  </label>
+                )}
                 <label className="flex items-center gap-2 text-sm">
                   <Checkbox
-                    checked={includeSubOrgs}
-                    onCheckedChange={(v) => setIncludeSubOrgs(v === true)}
+                    checked={includeArchived}
+                    onCheckedChange={(v) => patch({ archived: v === true ? true : undefined })}
                   />
-                  하위 소속 포함
+                  보관 포함
                 </label>
-              )}
-              <label className="flex items-center gap-2 text-sm">
-                <Checkbox
-                  checked={includeArchived}
-                  onCheckedChange={(v) => patch({ archived: v === true ? true : undefined })}
-                />
-                보관 포함
-              </label>
-              {search.recheck && (
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs font-semibold text-warning">
-                  재확인이 필요한 참여자만 보는 중
-                  <button
-                    type="button"
-                    className="underline underline-offset-2"
-                    onClick={() => patch({ recheck: undefined })}
-                  >
-                    해제
-                  </button>
-                </span>
-              )}
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={rows.length === 0}
-                onClick={() =>
-                  setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))
-                }
-              >
-                {allSelected ? "전체 해제" : "전체 선택"}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={rows.length === 0}
-                onClick={downloadRoster}
-              >
-                <Download className="size-4" />
-                명단 내려받기
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={orgMatch.isPending}
-                onClick={() => orgMatch.mutate()}
-              >
-                {orgMatch.isPending ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <Link2 className="size-4" />
-                )}
-                소속 일괄 매칭
-              </Button>
-              <Button size="sm" onClick={() => setAdding(true)}>
-                <Plus className="size-4" />
-                참여자 추가
-              </Button>
-            </div>
-          </div>
-
-          {/* 지금 무엇을 보고 있는지와, 표를 어떻게 보고 있는지 (기획 P9·D6) */}
-          <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3">
-            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <span className="rounded-full bg-secondary px-2.5 py-1 font-medium text-foreground">
-                {orgPathLabel(units, selectedOrgId)}
-              </span>
-              <span className="tabular-nums">
-                {rows.length}명 표시 중 · 선택 {selectedIds.length}명
-              </span>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={!remindTarget}
-                title={
-                  remindTarget ? undefined : "독려할 인원을 선택하거나 왼쪽에서 소속을 고르세요."
-                }
-                asChild={remindTarget}
-              >
-                {remindTarget ? (
-                  <Link
-                    to="/admin/mail"
-                    search={remindSearch({
-                      participantIds: selectedIds,
-                      orgId: selectedOrgId,
-                      status: statusFilter,
-                    })}
-                  >
-                    <Mail className="size-4" />
-                    독려 메일 보내기
-                  </Link>
-                ) : (
-                  <>
-                    <Mail className="size-4" />
-                    독려 메일 보내기
-                  </>
-                )}
-              </Button>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="outline" size="sm">
-                    <TableProperties className="size-4" />열 고르기
-                    {columnsChanged && (
-                      <span className="ml-1 rounded-full bg-warning/15 px-1.5 py-0.5 text-[11px] font-semibold text-warning">
-                        기본값과 다름
-                      </span>
-                    )}
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-52">
-                  <DropdownMenuLabel>표에 보일 열</DropdownMenuLabel>
-                  <DropdownMenuSeparator />
-                  {LIST_COLUMNS.map((c) => {
-                    const on = visibleColumns.includes(c.key);
-                    return (
-                      <DropdownMenuItem
-                        key={c.key}
-                        // 여러 열을 연달아 켜고 끄는 동작이라 메뉴를 닫지 않는다.
-                        onSelect={(e) => {
-                          e.preventDefault();
-                          setVisibleColumns((prev) =>
-                            on ? prev.filter((k) => k !== c.key) : [...prev, c.key],
-                          );
-                        }}
-                      >
-                        <Checkbox checked={on} aria-hidden className="pointer-events-none" />
-                        {c.label}
-                      </DropdownMenuItem>
-                    );
-                  })}
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    disabled={!columnsChanged}
-                    onSelect={() => setVisibleColumns(DEFAULT_COLUMNS)}
-                  >
-                    기본값으로 되돌리기
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          </div>
-
-          {/* 차수 관리 화면에서 「이 차수로 배정」을 눌러 들어온 경우 (기획 F8) */}
-          {search.assignWave && (
-            <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-sm">
-              <span className="rounded-full bg-primary-soft px-2.5 py-1 text-xs font-semibold">
-                차수 배정 중
-              </span>
-              <span className="min-w-0 flex-1">
-                {!waveAvailable ? (
-                  <span className="text-destructive">
-                    차수 목록을 불러오지 못했습니다. 잠시 뒤 다시 시도해 주세요.
-                  </span>
-                ) : waveNameById.has(search.assignWave) ? (
-                  <>
-                    <strong>{waveNameById.get(search.assignWave)}</strong>에 배정할 사람을 고르고,
-                    아래 [차수 배정]을 누르세요. 지금 선택 {selectedIds.length}명.
-                    {mixedCompanies ? (
-                      <span className="text-destructive">
-                        {" "}
-                        여러 계열사가 섞여 있습니다 — 한 계열사의 참여자만 선택해 주세요.
-                      </span>
-                    ) : null}
-                  </>
-                ) : (
-                  <span className="text-destructive">
-                    이 차수는 지금 보고 있는 계열사의 것이 아닙니다. 계열사 범위를 바꿔 주세요.
+                {search.recheck && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs font-semibold text-warning">
+                    재확인이 필요한 참여자만 보는 중
+                    <button
+                      type="button"
+                      className="underline underline-offset-2"
+                      onClick={() => patch({ recheck: undefined })}
+                    >
+                      해제
+                    </button>
                   </span>
                 )}
-              </span>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={rows.length === 0}
-                onClick={() => setSelected(new Set(rows.map((r) => r.id)))}
-              >
-                표시된 {rows.length}명 모두 고르기
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  setBulkWaveId("");
-                  patch({ assignWave: undefined });
-                }}
-              >
-                배정 그만두기
-              </Button>
-            </div>
-          )}
-
-          {waveResult && (
-            <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-sm">
-              <span>
-                <strong>{waveResult.waveName}</strong>에 {waveResult.updated}명을 배정했습니다.
-                {waveResult.protectedResponses > 0 ? (
-                  <span className="text-warning">
-                    {" "}
-                    응답 {waveResult.protectedResponses}건은 마감된 차수라 유지됨
-                  </span>
-                ) : (
-                  " 마감된 차수 때문에 유지된 응답은 없습니다."
-                )}
-              </span>
-              <Button variant="ghost" size="sm" onClick={() => setWaveResult(null)}>
-                닫기
-              </Button>
-            </div>
-          )}
-
-          {selectedIds.length > 0 && (
-            <div className="flex flex-wrap items-center gap-2 border-t pt-3">
-              <Button disabled={busy} onClick={() => provision.mutate(selectedIds)}>
-                {provision.isPending ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <UserPlus className="size-4" />
-                )}
-                계정 생성
-              </Button>
-              <Button
-                variant="outline"
-                disabled={busy}
-                onClick={() => bulkReset.mutate(selectedIds)}
-              >
-                {bulkReset.isPending ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <KeyRound className="size-4" />
-                )}
-                비밀번호 초기화
-              </Button>
-              <Input
-                value={tagInput}
-                onChange={(e) => setTagInput(e.target.value)}
-                placeholder="태그 (쉼표로 여러 개)"
-                aria-label="일괄 적용할 태그"
-                className="w-[200px]"
-              />
-              <Button
-                variant="secondary"
-                size="sm"
-                disabled={busy || !hasTagInput}
-                onClick={() => tagMutation.mutate("add")}
-              >
-                태그 부여
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={busy || !hasTagInput}
-                onClick={() => tagMutation.mutate("remove")}
-              >
-                태그 제거
-              </Button>
-              <Select
-                value={bulkOrgId || "__pick__"}
-                onValueChange={(v) => setBulkOrgId(v === "__pick__" ? "" : v)}
-              >
-                <SelectTrigger className="w-[200px]" aria-label="일괄 배정할 소속">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__pick__">— 소속 선택</SelectItem>
-                  {orgOptions.map((o) => (
-                    <SelectItem key={o.id} value={o.id}>
-                      {o.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                variant="secondary"
-                size="sm"
-                disabled={busy || !bulkOrgId}
-                onClick={() => orgAssign.mutate()}
-              >
-                {orgAssign.isPending && <Loader2 className="size-4 animate-spin" />}
-                소속 배정
-              </Button>
-              {/* 차수를 고를 수 없는 상황이면 그 이유를 그대로 보여 준다. */}
-              <Select
-                value={bulkWaveId || "__pick__"}
-                onValueChange={(v) => setBulkWaveId(v === "__pick__" ? "" : v)}
-                disabled={!waveAvailable || mixedCompanies}
-              >
-                <SelectTrigger
-                  className="w-[190px]"
-                  aria-label="일괄 배정할 조사 차수"
-                  title={
-                    !waveAvailable
-                      ? "조사 차수를 불러오지 못했습니다."
-                      : mixedCompanies
-                        ? "한 계열사의 참여자만 선택해 주세요."
-                        : undefined
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={rows.length === 0}
+                  onClick={() =>
+                    setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)))
                   }
                 >
-                  <SelectValue
-                    placeholder={mixedCompanies ? "한 계열사만 선택하세요" : "차수 고를 수 없음"}
-                  />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__pick__">— 차수 선택</SelectItem>
-                  {waveOptions.map((w) => (
-                    // 마감된 차수에는 새로 배정할 수 없다(서버가 거부한다). 고르지 못하게 막는다.
-                    <SelectItem key={w.id} value={w.id} disabled={w.status === "마감"}>
-                      {w.seq}차 {w.name} · {w.status} · 배정 {w.assignedCount}명
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                variant="secondary"
-                size="sm"
-                disabled={busy || !bulkWaveId || mixedCompanies}
-                onClick={() => waveAssign.mutate()}
-              >
-                {waveAssign.isPending && <Loader2 className="size-4 animate-spin" />}
-                차수 배정
-              </Button>
-            </div>
-          )}
-        </div>
-
-        {isLoading ? (
-          <p className="text-sm text-muted-foreground">불러오는 중...</p>
-        ) : rows.length === 0 ? (
-          <EmptyState
-            kind="nothing"
-            title="조건에 맞는 참여자가 없습니다"
-            description={
-              baseRows.length > 0
-                ? `${orgPathLabel(units, selectedOrgId)} 소속으로는 0명입니다. 다른 조건에서는 ${baseRows.length}명이 있습니다.`
-                : "지금 걸린 검색어·상태·태그 조건에 맞는 사람이 없습니다. 조건을 풀거나 명부를 올려 참여자를 등록하세요."
-            }
-            actionLabel="조건 모두 지우기"
-            onAction={() => {
-              selectOrg(null);
-              setSearchText("");
-              patch({
-                q: undefined,
-                status: undefined,
-                tag: undefined,
-                archived: undefined,
-                recheck: undefined,
-              });
-            }}
-          />
-        ) : (
-          <>
-            {/* 모바일: 카드 스택 */}
-            <ul className="space-y-3 md:hidden">
-              {rows.map((p) => (
-                <li
-                  key={p.id}
-                  className={`rounded-xl border bg-card p-4 shadow-sm ${p.archived_at ? "opacity-60" : ""} ${
-                    search.p === p.id ? "ring-2 ring-primary" : ""
-                  }`}
+                  {allSelected ? "전체 해제" : "전체 선택"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={rows.length === 0}
+                  onClick={downloadRoster}
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex min-w-0 items-start gap-3">
-                      <Checkbox
-                        checked={selected.has(p.id)}
-                        onCheckedChange={() => toggle(p.id)}
-                        aria-label={`${p.name} 선택`}
-                      />
-                      <div className="min-w-0">
-                        <button
-                          type="button"
-                          onClick={() => openDetail(p.id)}
-                          className="text-left font-semibold hover:underline"
-                        >
-                          {p.name}
-                          <span className="ml-2 text-xs font-normal tabular-nums text-muted-foreground">
-                            {p.emp_no}
-                          </span>
-                        </button>
-                        <p className="mt-1 truncate text-xs text-muted-foreground">
-                          {p.companies?.name} ·{" "}
-                          {p.org_unit_id ? unitNameById.get(p.org_unit_id) : p.org_text}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex shrink-0 flex-col items-end gap-1">
-                      <StatusBadge status={p.account_status} axis="progress" />
-                      <StatusBadge status={p.account_status} axis="review" />
-                      <BounceBadge participant={p} />
-                    </div>
-                  </div>
-                  <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                    <div>
-                      <dt className="text-muted-foreground">직무</dt>
-                      <dd className="mt-0.5 truncate font-medium">
-                        {responseByParticipant.get(p.id)?.job_name ?? "-"}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt className="text-muted-foreground">역할단계</dt>
-                      <dd className="mt-0.5 font-medium">{p.role_level ?? "-"}</dd>
-                    </div>
-                  </dl>
-                  <TagChips participant={p} />
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <Button size="sm" variant="outline" onClick={() => openDetail(p.id)}>
-                      상세 · 계정
-                    </Button>
-                    <RowMenu
-                      participant={p}
-                      response={responseByParticipant.get(p.id) ?? null}
-                      resetting={resetPassword.isPending}
-                      onDetail={() => openDetail(p.id)}
-                      onEdit={() => setEditing(p)}
-                      onReset={() => resetPassword.mutate(p.id)}
-                      onRemove={() => setRemoving(p)}
-                    />
-                  </div>
-                </li>
-              ))}
-            </ul>
+                  <Download className="size-4" />
+                  명단 내려받기
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={orgMatch.isPending}
+                  onClick={() => orgMatch.mutate()}
+                >
+                  {orgMatch.isPending ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Link2 className="size-4" />
+                  )}
+                  소속 일괄 매칭
+                </Button>
+                <Button size="sm" onClick={() => setAdding(true)}>
+                  <Plus className="size-4" />
+                  참여자 추가
+                </Button>
+              </div>
+            </div>
 
-            {/* 데스크톱: 표. 500행을 훑어도 머리글을 잃지 않게 표 안에서 스크롤한다 (기획 D6). */}
-            <div className="hidden max-h-[calc(100vh-19rem)] overflow-auto rounded-xl border bg-card shadow-sm md:block">
-              <table className="w-full text-sm">
-                <thead className="sticky top-0 z-10 bg-secondary text-left text-xs text-muted-foreground">
-                  <tr>
-                    <th className="w-10 border-b px-4 py-3" />
-                    {shownColumns.map((c) => (
-                      <th key={c.key} className="border-b px-4 py-3 font-medium">
-                        {c.label}
-                      </th>
-                    ))}
-                    <th className="w-14 border-b px-4 py-3 font-medium">관리</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((p) => (
-                    <tr
-                      key={p.id}
-                      className={`border-t ${p.archived_at ? "opacity-60" : ""} ${
-                        search.p === p.id ? "bg-primary-soft" : ""
-                      }`}
+            {/* 지금 무엇을 보고 있는지와, 표를 어떻게 보고 있는지 (기획 P9·D6) */}
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <span className="rounded-full bg-secondary px-2.5 py-1 font-medium text-foreground">
+                  {selectedOrgId === UNASSIGNED_ORG ? "미소속" : orgPathLabel(units, selectedOrgId)}
+                </span>
+                <span className="tabular-nums">
+                  {rows.length}명 표시 중 · 선택 {selectedIds.length}명
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!remindTarget}
+                  title={
+                    remindTarget ? undefined : "독려할 인원을 선택하거나 왼쪽에서 소속을 고르세요."
+                  }
+                  asChild={remindTarget}
+                >
+                  {remindTarget ? (
+                    <Link
+                      to="/admin/mail"
+                      search={remindSearch({
+                        participantIds: selectedIds,
+                        orgId: selectedOrgId === UNASSIGNED_ORG ? null : selectedOrgId,
+                        status: statusFilter,
+                      })}
                     >
-                      <td className={`px-4 ${rowClass}`}>
+                      <Mail className="size-4" />
+                      독려 메일 보내기
+                    </Link>
+                  ) : (
+                    <>
+                      <Mail className="size-4" />
+                      독려 메일 보내기
+                    </>
+                  )}
+                </Button>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="sm">
+                      <TableProperties className="size-4" />열 고르기
+                      {columnsChanged && (
+                        <span className="ml-1 rounded-full bg-warning/15 px-1.5 py-0.5 text-[11px] font-semibold text-warning">
+                          기본값과 다름
+                        </span>
+                      )}
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-52">
+                    <DropdownMenuLabel>표에 보일 열</DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    {LIST_COLUMNS.map((c) => {
+                      const on = visibleColumns.includes(c.key);
+                      return (
+                        <DropdownMenuItem
+                          key={c.key}
+                          // 여러 열을 연달아 켜고 끄는 동작이라 메뉴를 닫지 않는다.
+                          onSelect={(e) => {
+                            e.preventDefault();
+                            setVisibleColumns((prev) =>
+                              on ? prev.filter((k) => k !== c.key) : [...prev, c.key],
+                            );
+                          }}
+                        >
+                          <Checkbox checked={on} aria-hidden className="pointer-events-none" />
+                          {c.label}
+                        </DropdownMenuItem>
+                      );
+                    })}
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={!columnsChanged}
+                      onSelect={() => setVisibleColumns(DEFAULT_COLUMNS)}
+                    >
+                      기본값으로 되돌리기
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            </div>
+
+            {/* 차수 관리 화면에서 「이 차수로 배정」을 눌러 들어온 경우 (기획 F8) */}
+            {search.assignWave && (
+              <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-sm">
+                <span className="rounded-full bg-primary-soft px-2.5 py-1 text-xs font-semibold">
+                  차수 배정 중
+                </span>
+                <span className="min-w-0 flex-1">
+                  {!waveAvailable ? (
+                    <span className="text-destructive">
+                      차수 목록을 불러오지 못했습니다. 잠시 뒤 다시 시도해 주세요.
+                    </span>
+                  ) : waveNameById.has(search.assignWave) ? (
+                    <>
+                      <strong>{waveNameById.get(search.assignWave)}</strong>에 배정할 사람을 고르고,
+                      아래 [차수 배정]을 누르세요. 지금 선택 {selectedIds.length}명.
+                      {mixedCompanies ? (
+                        <span className="text-destructive">
+                          {" "}
+                          여러 계열사가 섞여 있습니다 — 한 계열사의 참여자만 선택해 주세요.
+                        </span>
+                      ) : null}
+                    </>
+                  ) : (
+                    <span className="text-destructive">
+                      이 차수는 지금 보고 있는 계열사의 것이 아닙니다. 계열사 범위를 바꿔 주세요.
+                    </span>
+                  )}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={rows.length === 0}
+                  onClick={() => setSelected(new Set(rows.map((r) => r.id)))}
+                >
+                  표시된 {rows.length}명 모두 고르기
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setBulkWaveId("");
+                    patch({ assignWave: undefined });
+                  }}
+                >
+                  배정 그만두기
+                </Button>
+              </div>
+            )}
+
+            {waveResult && (
+              <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-sm">
+                <span>
+                  <strong>{waveResult.waveName}</strong>에 {waveResult.updated}명을 배정했습니다.
+                  {waveResult.protectedResponses > 0 ? (
+                    <span className="text-warning">
+                      {" "}
+                      응답 {waveResult.protectedResponses}건은 마감된 차수라 유지됨
+                    </span>
+                  ) : (
+                    " 마감된 차수 때문에 유지된 응답은 없습니다."
+                  )}
+                </span>
+                <Button variant="ghost" size="sm" onClick={() => setWaveResult(null)}>
+                  닫기
+                </Button>
+              </div>
+            )}
+
+            {selectedIds.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+                <Button disabled={busy} onClick={() => provision.mutate(selectedIds)}>
+                  {provision.isPending ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <UserPlus className="size-4" />
+                  )}
+                  계정 생성
+                </Button>
+                <Button
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => bulkReset.mutate(selectedIds)}
+                >
+                  {bulkReset.isPending ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <KeyRound className="size-4" />
+                  )}
+                  비밀번호 초기화
+                </Button>
+                <Input
+                  value={tagInput}
+                  onChange={(e) => setTagInput(e.target.value)}
+                  placeholder="태그 (쉼표로 여러 개)"
+                  aria-label="일괄 적용할 태그"
+                  className="w-[200px]"
+                />
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={busy || !hasTagInput}
+                  onClick={() => tagMutation.mutate("add")}
+                >
+                  태그 부여
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy || !hasTagInput}
+                  onClick={() => tagMutation.mutate("remove")}
+                >
+                  태그 제거
+                </Button>
+                <Select
+                  value={bulkOrgId || "__pick__"}
+                  onValueChange={(v) => setBulkOrgId(v === "__pick__" ? "" : v)}
+                >
+                  <SelectTrigger className="w-[200px]" aria-label="일괄 배정할 소속">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__pick__">— 소속 선택</SelectItem>
+                    {orgOptions.map((o) => (
+                      <SelectItem key={o.id} value={o.id}>
+                        {o.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={busy || !bulkOrgId}
+                  onClick={() => orgAssign.mutate()}
+                >
+                  {orgAssign.isPending && <Loader2 className="size-4 animate-spin" />}
+                  소속 배정
+                </Button>
+                {/* 차수를 고를 수 없는 상황이면 그 이유를 그대로 보여 준다. */}
+                <Select
+                  value={bulkWaveId || "__pick__"}
+                  onValueChange={(v) => setBulkWaveId(v === "__pick__" ? "" : v)}
+                  disabled={!waveAvailable || mixedCompanies}
+                >
+                  <SelectTrigger
+                    className="w-[190px]"
+                    aria-label="일괄 배정할 조사 차수"
+                    title={
+                      !waveAvailable
+                        ? "조사 차수를 불러오지 못했습니다."
+                        : mixedCompanies
+                          ? "한 계열사의 참여자만 선택해 주세요."
+                          : undefined
+                    }
+                  >
+                    <SelectValue
+                      placeholder={mixedCompanies ? "한 계열사만 선택하세요" : "차수 고를 수 없음"}
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__pick__">— 차수 선택</SelectItem>
+                    {waveOptions.map((w) => (
+                      // 마감된 차수에는 새로 배정할 수 없다(서버가 거부한다). 고르지 못하게 막는다.
+                      <SelectItem key={w.id} value={w.id} disabled={w.status === "마감"}>
+                        {w.seq}차 {w.name} · {w.status} · 배정 {w.assignedCount}명
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={busy || !bulkWaveId || mixedCompanies}
+                  onClick={() => waveAssign.mutate()}
+                >
+                  {waveAssign.isPending && <Loader2 className="size-4 animate-spin" />}
+                  차수 배정
+                </Button>
+              </div>
+            )}
+          </div>
+
+          {isLoading ? (
+            <p className="text-sm text-muted-foreground">불러오는 중...</p>
+          ) : rows.length === 0 ? (
+            <EmptyState
+              kind="nothing"
+              title="조건에 맞는 참여자가 없습니다"
+              description={
+                baseRows.length > 0
+                  ? `${selectedOrgId === UNASSIGNED_ORG ? "미소속" : orgPathLabel(units, selectedOrgId)} 기준으로는 0명입니다. 다른 조건에서는 ${baseRows.length}명이 있습니다.`
+                  : "지금 걸린 검색어·상태·태그 조건에 맞는 사람이 없습니다. 조건을 풀거나 명부를 올려 참여자를 등록하세요."
+              }
+              actionLabel="조건 모두 지우기"
+              onAction={() => {
+                selectOrg(null);
+                setSearchText("");
+                patch({
+                  q: undefined,
+                  status: undefined,
+                  tag: undefined,
+                  archived: undefined,
+                  recheck: undefined,
+                });
+              }}
+            />
+          ) : (
+            <>
+              {/* 모바일: 카드 스택 */}
+              <ul className="space-y-3 md:hidden">
+                {rows.map((p) => (
+                  <li
+                    key={p.id}
+                    className={`rounded-xl border bg-card p-4 shadow-sm ${p.archived_at ? "opacity-60" : ""} ${
+                      search.p === p.id ? "ring-2 ring-primary" : ""
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 items-start gap-3">
                         <Checkbox
                           checked={selected.has(p.id)}
                           onCheckedChange={() => toggle(p.id)}
                           aria-label={`${p.name} 선택`}
                         />
-                      </td>
-                      {shownColumns.map((c) => (
-                        <td key={c.key} className={`px-4 ${rowClass}`}>
-                          {cell(c.key, p)}
-                        </td>
-                      ))}
-                      <td className={`px-4 ${rowClass}`}>
-                        <RowMenu
-                          participant={p}
-                          response={responseByParticipant.get(p.id) ?? null}
-                          resetting={resetPassword.isPending}
-                          onDetail={() => openDetail(p.id)}
-                          onEdit={() => setEditing(p)}
-                          onReset={() => resetPassword.mutate(p.id)}
-                          onRemove={() => setRemoving(p)}
-                        />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-      </div>
+                        <div className="min-w-0">
+                          <button
+                            type="button"
+                            onClick={() => openDetail(p.id)}
+                            className="text-left font-semibold hover:underline"
+                          >
+                            {p.name}
+                            <span className="ml-2 text-xs font-normal tabular-nums text-muted-foreground">
+                              {p.emp_no}
+                            </span>
+                          </button>
+                          <p className="mt-1 truncate text-xs text-muted-foreground">
+                            {p.companies?.name} ·{" "}
+                            {p.org_unit_id ? unitNameById.get(p.org_unit_id) : p.org_text}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <StatusBadge status={p.account_status} axis="progress" />
+                        <StatusBadge status={p.account_status} axis="review" />
+                        <BounceBadge participant={p} />
+                      </div>
+                    </div>
+                    <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                      <div>
+                        <dt className="text-muted-foreground">직무</dt>
+                        <dd className="mt-0.5 truncate font-medium">
+                          {responseByParticipant.get(p.id)?.job_name ?? "-"}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">역할단계</dt>
+                        <dd className="mt-0.5 font-medium">{p.role_level ?? "-"}</dd>
+                      </div>
+                    </dl>
+                    <TagChips participant={p} />
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Button size="sm" variant="outline" onClick={() => openDetail(p.id)}>
+                        상세 · 계정
+                      </Button>
+                      <RowMenu
+                        participant={p}
+                        response={responseByParticipant.get(p.id) ?? null}
+                        resetting={resetPassword.isPending}
+                        onDetail={() => openDetail(p.id)}
+                        onEdit={() => setEditing(p)}
+                        onReset={() => resetPassword.mutate(p.id)}
+                        onRemove={() => setRemoving(p)}
+                      />
+                    </div>
+                  </li>
+                ))}
+              </ul>
 
-      {/* 딥링크로 지목된 한 사람 (기획 D4·P6) */}
-      <Sheet open={!!search.p} onOpenChange={(open) => !open && patch({ p: undefined })}>
-        <SheetContent className="w-full overflow-y-auto sm:max-w-md">
-          {detail ? (
-            <ParticipantDetail
-              participant={detail}
-              orgLabel={orgPathLabel(units, detail.org_unit_id)}
-              response={responseByParticipant.get(detail.id) ?? null}
-              resetting={resetPassword.isPending}
-              onEdit={() => setEditing(detail)}
-              onReset={() => resetPassword.mutate(detail.id)}
-              onRemove={() => setRemoving(detail)}
-            />
-          ) : (
-            <>
-              <SheetHeader>
-                <SheetTitle>참여자 상세</SheetTitle>
-                <SheetDescription>지목된 참여자를 확인합니다.</SheetDescription>
-              </SheetHeader>
-              <div className="mt-6">
-                {isLoading ? (
-                  <p className="text-sm text-muted-foreground">불러오는 중...</p>
-                ) : (
-                  <EmptyState
-                    kind="nothing"
-                    title="이 참여자를 찾지 못했습니다"
-                    description="삭제되었거나, 지금 보고 있는 계열사 범위 밖에 있습니다. 상단의 계열사 범위를 전체로 바꾼 뒤 다시 시도해 보세요."
-                    actionLabel="명단으로 돌아가기"
-                    onAction={() => patch({ p: undefined })}
-                  />
-                )}
+              {/* 데스크톱: 표. 500행을 훑어도 머리글을 잃지 않게 표 안에서 스크롤한다 (기획 D6). */}
+              <div className="hidden max-h-[calc(100vh-19rem)] overflow-auto rounded-xl border bg-card shadow-sm md:block">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 z-10 bg-secondary text-left text-xs text-muted-foreground">
+                    <tr>
+                      <th className="w-10 border-b px-4 py-3" />
+                      {shownColumns.map((c) => (
+                        <th key={c.key} className="border-b px-4 py-3 font-medium">
+                          {c.label}
+                        </th>
+                      ))}
+                      <th className="w-14 border-b px-4 py-3 font-medium">관리</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((p) => (
+                      <tr
+                        key={p.id}
+                        className={`border-t ${p.archived_at ? "opacity-60" : ""} ${
+                          search.p === p.id ? "bg-primary-soft" : ""
+                        }`}
+                      >
+                        <td className={`px-4 ${rowClass}`}>
+                          <Checkbox
+                            checked={selected.has(p.id)}
+                            onCheckedChange={() => toggle(p.id)}
+                            aria-label={`${p.name} 선택`}
+                          />
+                        </td>
+                        {shownColumns.map((c) => (
+                          <td key={c.key} className={`px-4 ${rowClass}`}>
+                            {cell(c.key, p)}
+                          </td>
+                        ))}
+                        <td className={`px-4 ${rowClass}`}>
+                          <RowMenu
+                            participant={p}
+                            response={responseByParticipant.get(p.id) ?? null}
+                            resetting={resetPassword.isPending}
+                            onDetail={() => openDetail(p.id)}
+                            onEdit={() => setEditing(p)}
+                            onReset={() => resetPassword.mutate(p.id)}
+                            onRemove={() => setRemoving(p)}
+                          />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </>
           )}
-        </SheetContent>
-      </Sheet>
+        </div>
 
-      {adding && (
-        <AddParticipantDialog
-          companies={companies ?? []}
-          defaultCompanyId={companyId !== "all" ? companyId : ((companies ?? [])[0]?.id ?? "")}
-          onOpenChange={(open) => !open && setAdding(false)}
-        />
-      )}
-      {editing && (
-        <ParticipantFormDialog
-          key={editing.id}
-          open
-          participant={editing}
-          onOpenChange={(open) => !open && setEditing(null)}
-        />
-      )}
-      {removing && (
-        <RemoveDialog
-          key={removing.id}
-          participant={removing}
-          onOpenChange={(open) => !open && setRemoving(null)}
-        />
-      )}
-      {orgMatchReport && (
-        <Dialog open onOpenChange={(open) => !open && setOrgMatchReport(null)}>
-          <DialogContent className="max-h-[85vh] overflow-y-auto">
-            <DialogHeader>
-              <DialogTitle>소속 일괄 매칭 결과</DialogTitle>
-              <DialogDescription>
-                소속 미연결 참여자의 소속 표기를 조직도 이름과 대조했습니다 (공백 제거 후 정확
-                일치).
-              </DialogDescription>
-            </DialogHeader>
-            <p className="text-sm">
-              매칭 <strong>{orgMatchReport.matched}명</strong> · 미매칭{" "}
-              <strong>{orgMatchReport.unmatched}명</strong>
-            </p>
-            {orgMatchReport.unmatchedList.length > 0 && (
+        {/* 딥링크로 지목된 한 사람 (기획 D4·P6) */}
+        <Sheet open={!!search.p} onOpenChange={(open) => !open && patch({ p: undefined })}>
+          <SheetContent className="w-full overflow-y-auto sm:max-w-md">
+            {detail ? (
+              <ParticipantDetail
+                participant={detail}
+                orgLabel={orgPathLabel(units, detail.org_unit_id)}
+                response={responseByParticipant.get(detail.id) ?? null}
+                resetting={resetPassword.isPending}
+                onEdit={() => setEditing(detail)}
+                onReset={() => resetPassword.mutate(detail.id)}
+                onRemove={() => setRemoving(detail)}
+              />
+            ) : (
               <>
-                <ul className="max-h-64 space-y-1 overflow-y-auto rounded-lg border p-3 text-xs">
-                  {orgMatchReport.unmatchedList.map((u) => (
-                    <li key={`${u.emp_no}-${u.name}`}>
-                      <span className="font-medium">{u.name}</span> ({u.emp_no}) · 소속:{" "}
-                      {u.org_text || "(비어 있음)"}
-                    </li>
-                  ))}
-                </ul>
-                <p className="text-xs text-muted-foreground">
-                  미매칭 건은 참여자 수정 화면에서 소속을 직접 선택하거나, 조직도 이름과 소속 표기를
-                  맞춘 뒤 다시 실행하세요.
-                  {orgMatchReport.unmatched > orgMatchReport.unmatchedList.length &&
-                    ` (목록은 ${orgMatchReport.unmatchedList.length}건까지만 표시)`}
-                </p>
+                <SheetHeader>
+                  <SheetTitle>참여자 상세</SheetTitle>
+                  <SheetDescription>지목된 참여자를 확인합니다.</SheetDescription>
+                </SheetHeader>
+                <div className="mt-6">
+                  {isLoading ? (
+                    <p className="text-sm text-muted-foreground">불러오는 중...</p>
+                  ) : (
+                    <EmptyState
+                      kind="nothing"
+                      title="이 참여자를 찾지 못했습니다"
+                      description="삭제되었거나, 지금 보고 있는 계열사 범위 밖에 있습니다. 상단의 계열사 범위를 전체로 바꾼 뒤 다시 시도해 보세요."
+                      actionLabel="명단으로 돌아가기"
+                      onAction={() => patch({ p: undefined })}
+                    />
+                  )}
+                </div>
               </>
             )}
-            <DialogFooter>
-              <Button onClick={() => setOrgMatchReport(null)}>닫기</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      )}
+          </SheetContent>
+        </Sheet>
+
+        {adding && (
+          <AddParticipantDialog
+            companies={companies ?? []}
+            defaultCompanyId={companyId !== "all" ? companyId : ((companies ?? [])[0]?.id ?? "")}
+            onOpenChange={(open) => !open && setAdding(false)}
+          />
+        )}
+        {editing && (
+          <ParticipantFormDialog
+            key={editing.id}
+            open
+            participant={editing}
+            onOpenChange={(open) => !open && setEditing(null)}
+          />
+        )}
+        {removing && (
+          <RemoveDialog
+            key={removing.id}
+            participant={removing}
+            onOpenChange={(open) => !open && setRemoving(null)}
+          />
+        )}
+        {orgMatchReport && (
+          <Dialog open onOpenChange={(open) => !open && setOrgMatchReport(null)}>
+            <DialogContent className="max-h-[85vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>소속 일괄 매칭 결과</DialogTitle>
+                <DialogDescription>
+                  소속 미연결 참여자의 소속 표기를 조직도 이름과 대조했습니다 (공백 제거 후 정확
+                  일치).
+                </DialogDescription>
+              </DialogHeader>
+              <p className="text-sm">
+                매칭 <strong>{orgMatchReport.matched}명</strong> · 미매칭{" "}
+                <strong>{orgMatchReport.unmatched}명</strong>
+              </p>
+              {orgMatchReport.unmatchedList.length > 0 && (
+                <>
+                  <ul className="max-h-64 space-y-1 overflow-y-auto rounded-lg border p-3 text-xs">
+                    {orgMatchReport.unmatchedList.map((u) => (
+                      <li key={`${u.emp_no}-${u.name}`}>
+                        <span className="font-medium">{u.name}</span> ({u.emp_no}) · 소속:{" "}
+                        {u.org_text || "(비어 있음)"}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="text-xs text-muted-foreground">
+                    미매칭 건은 참여자 수정 화면에서 소속을 직접 선택하거나, 조직도 이름과 소속
+                    표기를 맞춘 뒤 다시 실행하세요.
+                    {orgMatchReport.unmatched > orgMatchReport.unmatchedList.length &&
+                      ` (목록은 ${orgMatchReport.unmatchedList.length}건까지만 표시)`}
+                  </p>
+                </>
+              )}
+              <DialogFooter>
+                <Button onClick={() => setOrgMatchReport(null)}>닫기</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        )}
+      </div>
     </div>
   );
 }

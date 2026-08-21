@@ -5,8 +5,6 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
-import { similarity } from "@/components/survey/validation";
-import { normalizeTaskName, taskOverlap } from "./task-match.ts";
 
 /**
  * participants.org_unit_id 는 마이그레이션(20260818090000_v2_deploy.sql)에만 있고
@@ -32,8 +30,6 @@ export const JOB_FIELDS = [
   { key: "definition", label: "정의", required: false },
   { key: "companies", label: "적용회사", required: false },
 ] as const;
-
-export const MAPPING_THRESHOLD = 0.6;
 
 export type RowIssue = { rowNo: number; errors: string[] };
 
@@ -491,6 +487,50 @@ export const deleteOrgUnit = createServerFn({ method: "POST" })
     return { ok: true, message: `「${unit.name}」 조직을 삭제했습니다.` };
   });
 
+/**
+ * 형제 조직들의 정렬값 일괄 갱신 (그리드 ↑/↓ 버튼). renameOrgUnit 반복 호출 대신
+ * 한 번에 저장하고 감사 기록도 1건만 남긴다. 이름·구분은 건드리지 않는다.
+ */
+export const reorderOrgUnits = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        items: z
+          .array(
+            z.object({
+              id: z.string().uuid(),
+              sort: z.number().int().min(-100000).max(100000),
+            }),
+          )
+          .min(1)
+          .max(200),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }): Promise<EditResult> => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    // ponytail: 건별 UPDATE. 상한 200건이라 그대로 두되, 더 커지면 upsert 배치로.
+    for (const item of data.items) {
+      const { error } = await supabaseAdmin
+        .from("org_units")
+        .update({ sort: item.sort })
+        .eq("id", item.id);
+      if (error) throw new Error(error.message);
+    }
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "조직 순서 변경",
+      target_type: "org_units",
+      detail: { items: data.items },
+    });
+    return { ok: true, message: "조직 순서를 저장했습니다." };
+  });
+
 /* ───────────────────────── 직무 카탈로그 ───────────────────────── */
 
 type JobInput = {
@@ -618,7 +658,9 @@ export const uploadJobCatalog = createServerFn({ method: "POST" })
       await untyped(supabaseAdmin)
         .from("job_catalog_versions")
         .insert({
-          label: autoVersionLabel(data.source === "ai_draft" ? "AI 가안 반영 전" : "업로드 교체 전"),
+          label: autoVersionLabel(
+            data.source === "ai_draft" ? "AI 가안 반영 전" : "업로드 교체 전",
+          ),
           note: scoped ? "계열사 범위 교체 전 전체 시점 저장본" : null,
           rows: fullSnapshot,
           created_by: context.userId,
@@ -731,6 +773,238 @@ export const deleteJobCatalogRow = createServerFn({ method: "POST" })
     return { ok: true, message: `「${row.job_name}」 을(를) 삭제했습니다.` };
   });
 
+/* ─────────────── 직군·직렬 이름 일괄 수정 + 표시 순서 (G1) ─────────────── */
+
+/**
+ * confirm=false 면 바꾸지 않고 영향 건수만 돌려준다 — 확인 다이얼로그가
+ * 「응답 n건이 옛 표기로 남습니다」를 보여줄 근거다. 응답·예시는 자동으로 고치지 않는다.
+ */
+export type GroupRenameResult = EditResult & {
+  /** 옛 이름으로 남는 응답 건수. */
+  responses: number;
+  /** (직군만) 옛 직군명으로 연결된 예시 건수. */
+  examples: number;
+  applied: number;
+};
+
+const jobName200 = z.string().trim().min(1).max(200);
+
+export const renameJobGroup = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ from: jobName200, to: jobName200, confirm: z.boolean() }).parse(input),
+  )
+  .handler(async ({ data, context }): Promise<GroupRenameResult> => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const none = { responses: 0, examples: 0, applied: 0 };
+
+    if (data.from === data.to) {
+      return { ok: false, message: "이름이 그대로입니다.", ...none };
+    }
+    const [{ count: rowCount }, { count: taken }] = await Promise.all([
+      supabaseAdmin
+        .from("job_catalog")
+        .select("id", { count: "exact", head: true })
+        .eq("job_group", data.from),
+      supabaseAdmin
+        .from("job_catalog")
+        .select("id", { count: "exact", head: true })
+        .eq("job_group", data.to),
+    ]);
+    if ((rowCount ?? 0) === 0) {
+      return { ok: false, message: `「${data.from}」 직군을 찾을 수 없습니다.`, ...none };
+    }
+    // UNIQUE(직군·직렬·직무) 때문에 이미 있는 직군으로 합치면 저장이 깨질 수 있다.
+    if ((taken ?? 0) > 0) {
+      return { ok: false, message: `「${data.to}」 직군이 이미 있어 합칠 수 없습니다.`, ...none };
+    }
+
+    const [{ count: responses }, { count: examples }] = await Promise.all([
+      supabaseAdmin
+        .from("responses")
+        .select("id", { count: "exact", head: true })
+        .eq("job_group", data.from),
+      untyped(supabaseAdmin)
+        .from("example_library")
+        .select("id", { count: "exact", head: true })
+        .eq("job_group_key", data.from),
+    ]);
+    if (!data.confirm) {
+      return {
+        ok: true,
+        message: "",
+        responses: responses ?? 0,
+        examples: examples ?? 0,
+        applied: 0,
+      };
+    }
+
+    const { error } = await supabaseAdmin
+      .from("job_catalog")
+      .update({ job_group: data.to })
+      .eq("job_group", data.from);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "직군명 일괄 변경",
+      target_type: "job_catalog",
+      detail: { before: data.from, after: data.to, rows: rowCount ?? 0 },
+    });
+    return {
+      ok: true,
+      message: `직군 「${data.from}」 → 「${data.to}」 (${rowCount ?? 0}행) 으로 바꿨습니다.`,
+      responses: responses ?? 0,
+      examples: examples ?? 0,
+      applied: rowCount ?? 0,
+    };
+  });
+
+export const renameJobSeries = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({ group: jobName200, from: jobName200, to: jobName200, confirm: z.boolean() })
+      .parse(input),
+  )
+  .handler(async ({ data, context }): Promise<GroupRenameResult> => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const none = { responses: 0, examples: 0, applied: 0 };
+
+    if (data.from === data.to) {
+      return { ok: false, message: "이름이 그대로입니다.", ...none };
+    }
+    const [{ count: rowCount }, { count: taken }] = await Promise.all([
+      supabaseAdmin
+        .from("job_catalog")
+        .select("id", { count: "exact", head: true })
+        .eq("job_group", data.group)
+        .eq("job_series", data.from),
+      supabaseAdmin
+        .from("job_catalog")
+        .select("id", { count: "exact", head: true })
+        .eq("job_group", data.group)
+        .eq("job_series", data.to),
+    ]);
+    if ((rowCount ?? 0) === 0) {
+      return { ok: false, message: `「${data.from}」 직렬을 찾을 수 없습니다.`, ...none };
+    }
+    if ((taken ?? 0) > 0) {
+      return { ok: false, message: `「${data.to}」 직렬이 이미 있어 합칠 수 없습니다.`, ...none };
+    }
+
+    const { count: responses } = await supabaseAdmin
+      .from("responses")
+      .select("id", { count: "exact", head: true })
+      .eq("job_group", data.group)
+      .eq("job_series", data.from);
+    if (!data.confirm) {
+      return { ok: true, message: "", responses: responses ?? 0, examples: 0, applied: 0 };
+    }
+
+    const { error } = await supabaseAdmin
+      .from("job_catalog")
+      .update({ job_series: data.to })
+      .eq("job_group", data.group)
+      .eq("job_series", data.from);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "직렬명 일괄 변경",
+      target_type: "job_catalog",
+      detail: { group: data.group, before: data.from, after: data.to, rows: rowCount ?? 0 },
+    });
+    return {
+      ok: true,
+      message: `직렬 「${data.from}」 → 「${data.to}」 (${rowCount ?? 0}행) 으로 바꿨습니다.`,
+      responses: responses ?? 0,
+      examples: 0,
+      applied: rowCount ?? 0,
+    };
+  });
+
+/**
+ * 직무분류표 표시 순서 저장 (관리자 화면 전용 정렬값).
+ * group=직군끼리, series=한 직군 안 직렬끼리, job=한 직렬 안 직무 행끼리.
+ */
+export const reorderJobCatalog = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => {
+    const sortValue = z.number().int().min(-100000).max(100000);
+    return z
+      .discriminatedUnion("kind", [
+        z.object({
+          kind: z.literal("group"),
+          items: z
+            .array(z.object({ group: jobName200, sort: sortValue }))
+            .min(1)
+            .max(200),
+        }),
+        z.object({
+          kind: z.literal("series"),
+          group: jobName200,
+          items: z
+            .array(z.object({ series: jobName200, sort: sortValue }))
+            .min(1)
+            .max(200),
+        }),
+        z.object({
+          kind: z.literal("job"),
+          items: z
+            .array(z.object({ id: z.string().uuid(), sort: sortValue }))
+            .min(1)
+            .max(200),
+        }),
+      ])
+      .parse(input);
+  })
+  .handler(async ({ data, context }): Promise<EditResult> => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    // ponytail: 건별 UPDATE. 상한 200건이라 그대로 두되, 더 커지면 upsert 배치로.
+    if (data.kind === "group") {
+      for (const item of data.items) {
+        const { error } = await supabaseAdmin
+          .from("job_catalog")
+          .update({ group_sort: item.sort })
+          .eq("job_group", item.group);
+        if (error) throw new Error(error.message);
+      }
+    } else if (data.kind === "series") {
+      for (const item of data.items) {
+        const { error } = await supabaseAdmin
+          .from("job_catalog")
+          .update({ series_sort: item.sort })
+          .eq("job_group", data.group)
+          .eq("job_series", item.series);
+        if (error) throw new Error(error.message);
+      }
+    } else {
+      for (const item of data.items) {
+        const { error } = await supabaseAdmin
+          .from("job_catalog")
+          .update({ sort: item.sort })
+          .eq("id", item.id);
+        if (error) throw new Error(error.message);
+      }
+    }
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "직무분류 순서 변경",
+      target_type: "job_catalog",
+      detail: data,
+    });
+    return { ok: true, message: "표시 순서를 저장했습니다." };
+  });
+
 /* ─────────────────── 직무분류 버전 관리 (V6) ─────────────────── */
 
 /** "접두어 · 08-18 14:02" 형태의 자동 라벨 (KST 기준). */
@@ -773,15 +1047,21 @@ export const listCatalogVersions = createServerFn({ method: "GET" })
       .limit(100);
     if (error) throw new Error(error.message);
 
-    return ((data ?? []) as { id: string; label: string; note: string | null; rows: unknown; created_at: string }[]).map(
-      (v) => ({
-        id: v.id,
-        label: v.label,
-        note: v.note,
-        createdAt: v.created_at,
-        rowCount: Array.isArray(v.rows) ? v.rows.length : 0,
-      }),
-    );
+    return (
+      (data ?? []) as {
+        id: string;
+        label: string;
+        note: string | null;
+        rows: unknown;
+        created_at: string;
+      }[]
+    ).map((v) => ({
+      id: v.id,
+      label: v.label,
+      note: v.note,
+      createdAt: v.created_at,
+      rowCount: Array.isArray(v.rows) ? v.rows.length : 0,
+    }));
   });
 
 export const saveCatalogVersion = createServerFn({ method: "POST" })
@@ -1098,7 +1378,9 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
     if (data.groups && data.groups.length > 0) {
       const wanted = new Set(data.groups);
       const filtered = groups.filter((g) => wanted.has(g.job_group));
-      failedGroups.push(...data.groups.filter((name) => !filtered.some((g) => g.job_group === name)));
+      failedGroups.push(
+        ...data.groups.filter((name) => !filtered.some((g) => g.job_group === name)),
+      );
       groups = filtered;
     }
 
@@ -1156,7 +1438,10 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
       if (result.status === "fulfilled") {
         details.push(result.value);
       } else {
-        console.error(`[draftJobCatalog] 직군 「${groups[index]!.job_group}」 실패:`, result.reason);
+        console.error(
+          `[draftJobCatalog] 직군 「${groups[index]!.job_group}」 실패:`,
+          result.reason,
+        );
         failedGroups.push(groups[index]!.job_group);
       }
     });
@@ -1180,8 +1465,7 @@ export const draftJobCatalog = createServerFn({ method: "POST" })
     }
     if (rows.length === 0) {
       const firstFailure = settled.find((s) => s.status === "rejected") as
-        | PromiseRejectedResult
-        | undefined;
+        PromiseRejectedResult | undefined;
       throw friendlyAiError(firstFailure?.reason ?? new Error("직무를 받지 못했습니다."));
     }
 
@@ -1449,7 +1733,8 @@ export const draftDutyCharts = createServerFn({ method: "POST" })
           if (details.length === 0) rows.push({ main, detail: "" });
           for (const detail of details) rows.push({ main, detail });
         }
-        if (rows.length === 0) throw new Error("AI 응답 읽어들이기 실패: 업무 항목이 비어 있습니다.");
+        if (rows.length === 0)
+          throw new Error("AI 응답 읽어들이기 실패: 업무 항목이 비어 있습니다.");
         return {
           orgId: org.id,
           orgName: org.name,
@@ -1473,8 +1758,7 @@ export const draftDutyCharts = createServerFn({ method: "POST" })
     });
     if (charts.length === 0) {
       const firstFailure = settled.find((s) => s.status === "rejected") as
-        | PromiseRejectedResult
-        | undefined;
+        PromiseRejectedResult | undefined;
       throw friendlyAiError(
         firstFailure?.reason ?? new Error("업무분장 초안을 받지 못했습니다."),
         "draftDutyCharts",
@@ -1494,136 +1778,6 @@ export const draftDutyCharts = createServerFn({ method: "POST" })
     });
 
     return { charts, failedOrgs, skippedOrgs };
-  });
-
-/* ─────────────────── 기존 응답 ↔ 카탈로그 매핑 제안 ─────────────────── */
-
-export type MappingSuggestion = {
-  responseId: string;
-  participantName: string;
-  current: { job_group: string; job_series: string; job_name: string };
-  suggested: { job_group: string; job_series: string; job_name: string };
-  score: number;
-};
-
-function bestMatch(
-  current: { job_group: string; job_series: string; job_name: string },
-  catalog: { job_group: string; job_series: string; job_name: string }[],
-) {
-  let best: { entry: (typeof catalog)[number]; score: number } | null = null;
-  for (const entry of catalog) {
-    const parts: [string, string, number][] = [
-      [current.job_group, entry.job_group, 0.2],
-      [current.job_series, entry.job_series, 0.3],
-      [current.job_name, entry.job_name, 0.5],
-    ];
-    const used = parts.filter(([a]) => a.trim() !== "");
-    if (used.length === 0) return null;
-    const weight = used.reduce((sum, [, , w]) => sum + w, 0);
-    const score = used.reduce((sum, [a, b, w]) => sum + w * similarity(a, b), 0) / weight;
-    if (!best || score > best.score) best = { entry, score };
-  }
-  return best;
-}
-
-export const suggestResponseMapping = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }): Promise<MappingSuggestion[]> => {
-    const { requireAdmin } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const [{ data: catalog }, { data: responses }] = await Promise.all([
-      supabaseAdmin.from("job_catalog").select("job_group, job_series, job_name"),
-      supabaseAdmin
-        .from("responses")
-        .select("id, job_group, job_series, job_name, participants(name)")
-        .limit(2000),
-    ]);
-    if (!catalog || catalog.length === 0) return [];
-
-    const suggestions: MappingSuggestion[] = [];
-    // ponytail: 응답 × 카탈로그 전수 비교(O(n·m)). 수천 건을 넘으면 인덱싱 필요.
-    for (const response of responses ?? []) {
-      const current = {
-        job_group: response.job_group ?? "",
-        job_series: response.job_series ?? "",
-        job_name: response.job_name ?? "",
-      };
-      const best = bestMatch(current, catalog);
-      if (!best || best.score < MAPPING_THRESHOLD) continue;
-      const suggested = {
-        job_group: best.entry.job_group,
-        job_series: best.entry.job_series,
-        job_name: best.entry.job_name,
-      };
-      if (
-        current.job_group === suggested.job_group &&
-        current.job_series === suggested.job_series &&
-        current.job_name === suggested.job_name
-      ) {
-        continue;
-      }
-      suggestions.push({
-        responseId: response.id,
-        participantName: response.participants?.name ?? "",
-        current,
-        suggested,
-        score: Math.round(best.score * 100) / 100,
-      });
-    }
-
-    return suggestions.sort((a, b) => b.score - a.score).slice(0, 500);
-  });
-
-export const applyResponseMapping = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) =>
-    z
-      .object({
-        items: z
-          .array(
-            z.object({
-              responseId: z.string().uuid(),
-              job_group: z.string().trim().max(200),
-              job_series: z.string().trim().max(200),
-              job_name: z.string().trim().max(200),
-            }),
-          )
-          .min(1)
-          .max(500),
-      })
-      .parse(input),
-  )
-  .handler(async ({ data, context }) => {
-    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const failures: { responseId: string; reason: string }[] = [];
-    let updated = 0;
-    // ponytail: 건별 UPDATE. 500건 상한이라 그대로 두되, 더 커지면 upsert 배치로.
-    for (const item of data.items) {
-      const { error } = await supabaseAdmin
-        .from("responses")
-        .update({
-          job_group: item.job_group,
-          job_series: item.job_series,
-          job_name: item.job_name,
-        })
-        .eq("id", item.responseId);
-      if (error) failures.push({ responseId: item.responseId, reason: error.message });
-      else updated += 1;
-    }
-
-    await writeAudit(supabaseAdmin, {
-      actor_id: context.userId,
-      action: "응답 직무 매핑 적용",
-      target_type: "responses",
-      detail: { updated, failed: failures.length, items: data.items },
-    });
-
-    return { updated, failures };
   });
 
 /* ─────────────── 변경 전 영향 미리보기 (V14-①) ─────────────── */
@@ -1858,8 +2012,7 @@ export const previewImpact = createServerFn({ method: "POST" })
       const base = `현재 직무분류 ${(current ?? []).length}행이 「${version.label}」 버전 ${verRows.length}행으로 교체됩니다.`;
       return {
         count: n,
-        summary:
-          n > 0 ? `${base} 버전에 없는 직무로 제출된 응답 ${n}건이 영향을 받습니다.` : base,
+        summary: n > 0 ? `${base} 버전에 없는 직무로 제출된 응답 ${n}건이 영향을 받습니다.` : base,
         samples,
       };
     }
@@ -2045,9 +2198,11 @@ export const inspectImpact = createServerFn({ method: "POST" })
         .maybeSingle();
       if (!version) return buildAudience("", []);
       const label = String((version as { label?: string }).label ?? "");
-      const verRows = (Array.isArray((version as { rows?: unknown }).rows)
-        ? (version as { rows: unknown[] }).rows
-        : []) as CatalogRowLike[];
+      const verRows = (
+        Array.isArray((version as { rows?: unknown }).rows)
+          ? (version as { rows: unknown[] }).rows
+          : []
+      ) as CatalogRowLike[];
       const verNames = new Set(verRows.map((r) => String(r.job_name ?? "")).filter(Boolean));
       const { data: current } = await supabaseAdmin.from("job_catalog").select("job_name");
       const removed = [
@@ -2219,141 +2374,3 @@ async function raiseRecheck(
   }
   return flagged;
 }
-
-/* ═══════════════ F14. 직무 중복 진단 ═══════════════ */
-
-/** 진단에 넣는 응답 상태 — 아직 작성 중인 응답을 넣으면 결과가 부풀려진다. */
-const DUTY_COUNTED_STATUSES = ["submitted", "approved"];
-
-/** 병합 후보로 올리는 과업 중복률 하한. 작은 쪽 직무를 분모로 써 포함 관계를 잘 잡는다. */
-export const DIAG_OVERLAP_THRESHOLD = 0.5;
-/** 과업이 이만큼 이하면 직무로 세우기에 근거가 얇다 — 과분할 후보. */
-export const DIAG_SMALL_TASKS = 3;
-/** 과업이 이만큼 이상이면 한 직무에 너무 많은 일이 묶여 있다 — 분리 후보. */
-export const DIAG_LARGE_TASKS = 20;
-/** 병합 후보 목록에 담는 최대 쌍 수. */
-export const DIAG_PAIR_LIMIT = 20;
-
-export type JobOverlapPair = {
-  a: string;
-  b: string;
-  /** 작은 쪽 직무의 과업 중 겹치는 비율(%). */
-  overlapPct: number;
-  aTasks: number;
-  bTasks: number;
-  /** 겹치는 과업 이름 (최대 5개). */
-  shared: string[];
-};
-
-export type JobDiagnosis = {
-  jobCount: number;
-  responseCount: number;
-  duplicatePairs: JobOverlapPair[];
-  tooSmall: { jobName: string; taskCount: number; responseCount: number }[];
-  tooLarge: { jobName: string; taskCount: number; responseCount: number }[];
-  thinEvidence: { jobName: string; taskCount: number }[];
-  asOf: string;
-};
-
-/**
- * 직무 중복·과분할 진단 (F14).
- *
- * 승인·제출된 응답의 과업을 직무별로 모아 네 가지를 본다. 어느 것도 자동으로 고치지 않는다 —
- * 직무분류를 바꾸는 일은 관리자가 직접 하고 새 버전으로 저장하는 기존 경로를 따른다.
- *
- * ponytail: 교집합은 정규화 완전일치로만 센다(직무 115개 × 과업 10개면 유사 판정 전수 비교가
- * 65만 회가 된다). 표현이 다른 같은 과업까지 잡아야 하면 과업명 사전을 먼저 만들어야 한다.
- */
-export const diagnoseJobCatalog = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) =>
-    z.object({ companyId: z.string().uuid().nullable().optional() }).parse(input ?? {}),
-  )
-  .handler(async ({ data, context }): Promise<JobDiagnosis> => {
-    const { requireAdmin } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { fetchAll } = await import("@/lib/paginate");
-
-    type Row = { job_name: string | null; response_tasks: { name: string }[] };
-    const rows = await fetchAll<Row>((from, to) => {
-      let q = supabaseAdmin
-        .from("responses")
-        .select("job_name, response_tasks(name)")
-        .in("status", DUTY_COUNTED_STATUSES)
-        .order("id")
-        .range(from, to);
-      if (data.companyId) q = q.eq("company_id", data.companyId);
-      return q;
-    });
-
-    /** 직무명 → { 과업 정규화키 → 원문, 응답 수 } */
-    const byJob = new Map<string, { tasks: Map<string, string>; responses: number }>();
-    for (const row of rows) {
-      const job = (row.job_name ?? "").trim();
-      if (job === "") continue;
-      const bucket = byJob.get(job) ?? { tasks: new Map<string, string>(), responses: 0 };
-      bucket.responses += 1;
-      for (const task of row.response_tasks) {
-        const name = (task.name ?? "").trim();
-        const norm = normalizeTaskName(name);
-        if (norm === "" || bucket.tasks.has(norm)) continue;
-        bucket.tasks.set(norm, name);
-      }
-      byJob.set(job, bucket);
-    }
-
-    const jobs = [...byJob.entries()].map(([jobName, v]) => ({
-      jobName,
-      tasks: v.tasks,
-      responseCount: v.responses,
-    }));
-
-    const duplicatePairs: JobOverlapPair[] = [];
-    for (let i = 0; i < jobs.length; i += 1) {
-      const a = jobs[i]!;
-      if (a.tasks.size === 0) continue;
-      for (let j = i + 1; j < jobs.length; j += 1) {
-        const b = jobs[j]!;
-        if (b.tasks.size === 0) continue;
-        const { ratio, shared } = taskOverlap(a.tasks, b.tasks);
-        if (ratio < DIAG_OVERLAP_THRESHOLD) continue;
-        duplicatePairs.push({
-          a: a.jobName,
-          b: b.jobName,
-          overlapPct: Math.round(ratio * 100),
-          aTasks: a.tasks.size,
-          bTasks: b.tasks.size,
-          shared: shared.slice(0, 5),
-        });
-      }
-    }
-    duplicatePairs.sort((x, y) => y.overlapPct - x.overlapPct);
-
-    return {
-      jobCount: jobs.length,
-      responseCount: rows.length,
-      duplicatePairs: duplicatePairs.slice(0, DIAG_PAIR_LIMIT),
-      tooSmall: jobs
-        .filter((j) => j.tasks.size > 0 && j.tasks.size <= DIAG_SMALL_TASKS)
-        .map((j) => ({
-          jobName: j.jobName,
-          taskCount: j.tasks.size,
-          responseCount: j.responseCount,
-        }))
-        .sort((x, y) => x.taskCount - y.taskCount),
-      tooLarge: jobs
-        .filter((j) => j.tasks.size >= DIAG_LARGE_TASKS)
-        .map((j) => ({
-          jobName: j.jobName,
-          taskCount: j.tasks.size,
-          responseCount: j.responseCount,
-        }))
-        .sort((x, y) => y.taskCount - x.taskCount),
-      thinEvidence: jobs
-        .filter((j) => j.responseCount === 1)
-        .map((j) => ({ jobName: j.jobName, taskCount: j.tasks.size }))
-        .sort((x, y) => x.jobName.localeCompare(y.jobName)),
-      asOf: new Date().toISOString(),
-    };
-  });

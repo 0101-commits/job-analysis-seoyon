@@ -1,19 +1,10 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   Check,
   ChevronLeft,
   ChevronRight,
-  Columns3,
   History,
   Keyboard,
   Pencil,
@@ -45,7 +36,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { EmptyState } from "@/components/EmptyState";
 import { SignalCard } from "@/components/SignalCard";
 import { FieldHint } from "@/components/FieldHint";
-import { ActionBar, DocPane, DocWide, ToolLayer } from "@/components/admin/panes";
+import { ActionBar, DocPane, ToolLayer } from "@/components/admin/panes";
 import type { ActionGate } from "@/components/admin/panes";
 import { AiInspector } from "@/components/admin/AiInspector";
 import { QualityBadge } from "@/components/admin/QualityBadge";
@@ -53,12 +44,10 @@ import { cn } from "@/lib/utils";
 import {
   approveResponse,
   correctField,
-  getJobComparison,
   getResponseDetail,
   getSubmissionSnapshots,
   listReviewQueue,
   rejectResponse,
-  upsertInterview,
 } from "@/lib/review.functions";
 
 /**
@@ -73,7 +62,7 @@ import {
  */
 
 export type QueueRow = Awaited<ReturnType<typeof listReviewQueue>>["rows"][number];
-export type CenterView = "detail" | "diff" | "job";
+export type CenterView = "detail" | "diff";
 /** 판단 화면을 덮는 도구 층. null 이면 층이 닫힌 상태다. */
 export type ToolKey = "ai" | "history" | null;
 
@@ -128,8 +117,6 @@ const STEPS = [
   "5. 스킬·요건",
   "6. 자기평가",
 ];
-
-const LV_GUIDE = "Lv.1 기본·일상 수행 → Lv.2 독립 완결 → Lv.3 복잡 업무·코칭 → Lv.4 방향 제시";
 
 /** K/S/A 코드만 보면 뜻을 모르므로 화면에는 한글을 함께 적는다. */
 const KSAO_LABEL: Record<string, string> = { K: "지식 K", S: "기술 S", A: "태도 A" };
@@ -309,7 +296,7 @@ function RemovedBadge() {
   );
 }
 
-/** 직무 응답 수에 따른 신뢰도 배지 — 1인 응답은 인터뷰 없이는 확정할 수 없다. */
+/** 직무 응답 수에 따른 신뢰도 배지 — 1인 응답은 교차 확인할 표본이 없어 신뢰도가 가장 낮다. */
 function JobCountBadge({ count }: { count: number }) {
   const style =
     count >= 5
@@ -317,7 +304,7 @@ function JobCountBadge({ count }: { count: number }) {
       : count >= 2
         ? "bg-warning/15 text-warning"
         : "bg-destructive/10 text-destructive";
-  const label = count >= 5 ? "정상" : count >= 2 ? "주의" : "인터뷰 필수";
+  const label = count >= 5 ? "정상" : count >= 2 ? "주의" : "확인 필요";
   return (
     <span
       className={cn(
@@ -351,9 +338,6 @@ export function ReviewWorkbench({
   onQueryChange,
   view,
   onViewChange,
-  compareJob,
-  onCompareJobChange,
-  jobNames,
   companyId,
   sort,
   onSortChange,
@@ -370,9 +354,6 @@ export function ReviewWorkbench({
   onQueryChange: (v: string) => void;
   view: CenterView;
   onViewChange: (v: CenterView) => void;
-  compareJob: string | null;
-  onCompareJobChange: (v: string | null) => void;
-  jobNames: string[];
   companyId: string | null;
   sort: string;
   onSortChange: (v: string) => void;
@@ -432,29 +413,11 @@ export function ReviewWorkbench({
         onNavigate={onSelect}
         view={view}
         onViewChange={onViewChange}
-        compareJob={compareJob}
-        onCompareJobChange={onCompareJobChange}
-        jobNames={jobNames}
         companyId={companyId}
         tool={tool}
         onToolChange={onToolChange}
         {...(index >= 0 ? { position: { index, total: rows.length } } : {})}
       />
-    );
-  }
-
-  // 같은 직무 나란히 보기는 넓이가 실제로 필요한 블록이라 읽기 폭 상한을 벗어난다.
-  if (view === "job") {
-    return (
-      <DocWide>
-        <JobComparison
-          jobNames={jobNames}
-          companyId={companyId}
-          job={compareJob}
-          onJobChange={onCompareJobChange}
-          onBack={() => onViewChange("detail")}
-        />
-      </DocWide>
     );
   }
 
@@ -469,7 +432,6 @@ export function ReviewWorkbench({
       onQueryChange={onQueryChange}
       sort={sort}
       onSortChange={onSortChange}
-      {...(jobNames.length > 0 ? { onCompareJobs: () => onViewChange("job") } : {})}
     />
   );
 }
@@ -491,7 +453,6 @@ function QueueTable({
   onQueryChange,
   sort,
   onSortChange,
-  onCompareJobs,
 }: {
   rows: QueueRow[];
   isLoading: boolean;
@@ -502,7 +463,6 @@ function QueueTable({
   onQueryChange: (v: string) => void;
   sort: string;
   onSortChange: (v: string) => void;
-  onCompareJobs?: () => void;
 }) {
   /**
    * 훑기 커서 — 수십 건을 손으로 넘기고 Enter 로 연다.
@@ -610,11 +570,6 @@ function QueueTable({
             미검토 {waits.length}건 · 제출 후 평균 {avgWait}일 대기
           </p>
         )}
-        {onCompareJobs ? (
-          <Button variant="outline" size="sm" onClick={onCompareJobs}>
-            <Columns3 className="size-4" /> 직무별로 나란히 보기
-          </Button>
-        ) : null}
       </div>
 
       {isLoading ? (
@@ -727,9 +682,6 @@ function ResponseWorkspace({
   onNavigate,
   view,
   onViewChange,
-  compareJob,
-  onCompareJobChange,
-  jobNames,
   companyId,
   tool,
   onToolChange,
@@ -742,9 +694,6 @@ function ResponseWorkspace({
   onNavigate: (id: string) => void;
   view: CenterView;
   onViewChange: (v: CenterView) => void;
-  compareJob: string | null;
-  onCompareJobChange: (v: string | null) => void;
-  jobNames: string[];
   companyId: string | null;
   tool: ToolKey;
   onToolChange: (v: ToolKey) => void;
@@ -753,11 +702,6 @@ function ResponseWorkspace({
 }) {
   const queryClient = useQueryClient();
   const [picked, setPicked] = useState<PickedField | null>(null);
-  const [approveOpen, setApproveOpen] = useState(false);
-  // 1인 응답 직무 승인 창에서 그 자리에 남기는 인터뷰 기록
-  const [ivWhen, setIvWhen] = useState("");
-  const [ivWho, setIvWho] = useState("");
-  const [ivMemo, setIvMemo] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectStep, setRejectStep] = useState("4");
   const [rejectComment, setRejectComment] = useState("");
@@ -785,7 +729,6 @@ function ResponseWorkspace({
   function invalidate() {
     void queryClient.invalidateQueries({ queryKey: ["review-detail", responseId] });
     void queryClient.invalidateQueries({ queryKey: ["review-queue"] });
-    void queryClient.invalidateQueries({ queryKey: ["interview-targets"] });
   }
 
   /** 판단이 끝나면 다음 건으로 넘긴다 — 목록으로 돌아가 다시 고르는 일을 없앤다. */
@@ -795,33 +738,13 @@ function ResponseWorkspace({
   }
 
   const approve = useMutation({
-    /** recordInterview 가 있으면 인터뷰 「완료」 기록을 먼저 남긴 뒤 승인한다(1인 응답 직무 게이트). */
-    mutationFn: async (recordInterview?: { when: string; who: string; memo: string }) => {
-      if (recordInterview) {
-        await upsertInterview({
-          data: {
-            responseId,
-            scheduledAt: recordInterview.when || null,
-            interviewer: recordInterview.who.trim() || null,
-            status: "완료",
-            memo: recordInterview.memo.trim() || null,
-          },
-        });
-      }
-      return approveResponse({ data: { responseId } });
-    },
+    mutationFn: () => approveResponse({ data: { responseId } }),
     onSuccess: (result) => {
       if (!result.ok) {
         toast.error(result.reason ?? "승인할 수 없습니다.");
-        if (result.needsInterview) setApproveOpen(true);
-        else setApproveOpen(false);
         invalidate();
         return;
       }
-      setApproveOpen(false);
-      setIvWhen("");
-      setIvWho("");
-      setIvMemo("");
       toast.success(nextId ? "승인했습니다. 다음 건을 엽니다." : "응답이 승인되었습니다.");
       invalidate();
       goNext();
@@ -854,13 +777,7 @@ function ResponseWorkspace({
     if (!data) return;
     const status = data.response.status;
     if (status === "approved" || status === "draft" || approve.isPending) return;
-    // 1인 응답 직무는 인터뷰 「완료」 기록이 있어야 승인된다.
-    const hasInterview = data.interviews.some((iv) => iv.status === "완료");
-    if (data.jobCount <= 1 && !hasInterview) {
-      setApproveOpen(true);
-      return;
-    }
-    approve.mutate(undefined);
+    approve.mutate();
   }, [data, approve]);
 
   /**
@@ -868,7 +785,7 @@ function ResponseWorkspace({
    *
    * 수백 건을 처리하는 화면이라 손이 마우스에 묶이면 안 된다. 단축키를 모르는 사용자도
    * 같은 일을 컨텍스트 바·액션 바 버튼으로 할 수 있고, 입력 중이거나 대화상자가 열려 있으면
-   * 전부 비활성이다. 승인이 막힌 건에서 A 는 승인하지 않고 인터뷰 기록 창을 연다.
+   * 전부 비활성이다.
    */
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -950,8 +867,6 @@ function ResponseWorkspace({
       : () => setPicked({ multiline: false, ...f });
 
   const skillNames = r.response_skills.map((s) => s.name);
-  const interviews = data.interviews;
-  const interviewDone = interviews.some((iv) => iv.status === "완료");
 
   /** 막는 이유를 누르면 근거로 데려간다 — 회색 버튼만 남기지 않는다. */
   function focusEvidence() {
@@ -964,9 +879,6 @@ function ResponseWorkspace({
   const gates: ActionGate[] = [];
   if (r.status === "draft") {
     gates.push({ label: "작성 중 응답", onFocus: focusEvidence });
-  }
-  if (data.jobCount <= 1 && !interviewDone) {
-    gates.push({ label: "인터뷰 기록 없음", onFocus: focusEvidence });
   }
   if (data.aiDraft.any) {
     gates.push({ label: `AI 초안 ${aiDraftCount}건 미확정`, onFocus: () => onToolChange("ai") });
@@ -1016,16 +928,6 @@ function ResponseWorkspace({
                 이전 제출과 비교
               </Button>
             )}
-            <Button
-              variant={view === "job" ? "secondary" : "outline"}
-              size="sm"
-              onClick={() => {
-                if (view !== "job" && r.job_name) onCompareJobChange(r.job_name);
-                onViewChange(view === "job" ? "detail" : "job");
-              }}
-            >
-              <Columns3 className="size-4" /> 같은 직무 비교
-            </Button>
             <span className="mx-1 h-5 w-px bg-border" aria-hidden />
             <Button
               variant={tool === "ai" ? "secondary" : "outline"}
@@ -1068,595 +970,546 @@ function ResponseWorkspace({
             </Button>
           </div>
         </div>
-        {view === "job" ? (
-          <DocWide>
-            <JobComparison
-              jobNames={jobNames}
-              companyId={companyId}
-              job={compareJob ?? r.job_name}
-              onJobChange={onCompareJobChange}
-              onBack={() => onViewChange("detail")}
-            />
-          </DocWide>
-        ) : (
-          <DocPane>
-            {/*
+        <DocPane>
+          {/*
             근거 스트립 — 판단 「전」에 읽는 것이다. 예전에는 우측 레일 위에 쌓여서
             신호가 많은 건일수록 승인 버튼이 화면 밖으로 밀렸다. 읽기 흐름 안으로 옮긴다.
           */}
-            <div id="judge-evidence" className="scroll-mt-[var(--sticky-top)] space-y-2">
-              {data.quality.flags.length > 0 && (
-                <SignalCard
-                  tone={data.quality.grade === "양호" ? "neutral" : "attention"}
-                  signal={`점검에서 확인된 주의 사유가 ${data.quality.flags.length}건 있습니다 (${data.quality.grade} ${data.quality.score}점).`}
-                  evidence={data.quality.flags}
-                  {...(data.quality.checkedAt
-                    ? { asOf: new Date(data.quality.checkedAt).toLocaleDateString("ko-KR") }
-                    : {})}
-                />
-              )}
-
-              {data.jobCount <= 1 && (
-                <SignalCard
-                  tone={interviewDone ? "good" : "attention"}
-                  signal={
-                    interviewDone
-                      ? "1인 응답 직무이며 인터뷰 확인이 끝났습니다."
-                      : "1인 응답 직무여서 인터뷰 확인 없이는 승인할 수 없습니다."
-                  }
-                  evidence={
-                    interviewDone
-                      ? [
-                          `인터뷰 기록 ${interviews.length}건 중 「완료」 기록이 있어 승인 조건을 만족합니다.`,
-                          "인터뷰에서 확인한 내용은 아래 원문의 인터뷰 기록에서 볼 수 있습니다.",
-                        ]
-                      : [
-                          `같은 직무 응답이 ${data.jobCount}건뿐이라 응답만으로는 직무를 확정할 수 없습니다.`,
-                          "승인을 누르면 인터뷰 기록을 남기는 창이 열립니다. 인터뷰 관리 구획에서 미리 남겨 두어도 됩니다.",
-                        ]
-                  }
-                  asOf={new Date().toLocaleDateString("ko-KR")}
-                />
-              )}
-
-              {data.aiDraft.any && (
-                <SignalCard
-                  tone="attention"
-                  signal="확정되지 않은 AI 초안이 남아 승인할 수 없습니다."
-                  evidence={[
-                    `역량 ${data.aiDraft.skills}건${data.aiDraft.requirements ? " · 자격요건 포함" : ""}이 AI 초안 표시 상태입니다.`,
-                    "위 [AI 점검]에서 확정하거나 원문에서 항목을 정정하면 승인 게이트가 풀립니다.",
-                  ]}
-                  asOf={new Date().toLocaleDateString("ko-KR")}
-                />
-              )}
-
-              {r.status === "submitted" && r.submitted_at && daysSince(r.submitted_at) > 5 && (
-                <SignalCard
-                  tone="attention"
-                  signal={`제출 후 ${daysSince(r.submitted_at)}일째 검토를 기다리고 있습니다.`}
-                  evidence={[
-                    `제출일 ${formatDate(r.submitted_at)} 기준 경과일입니다.`,
-                    "5일을 넘기면 참여자가 보완 요청을 받아도 기억이 흐려집니다.",
-                  ]}
-                  asOf={new Date().toLocaleDateString("ko-KR")}
-                />
-              )}
-
-              {r.status === "draft" && (
-                <p className="rounded-xl border bg-secondary p-3 text-sm text-muted-foreground">
-                  작성 중 응답은 승인·반려할 수 없고 열람·정정만 가능합니다. 정정하면 작성자가
-                  화면을 열어 두었던 경우 최신 내용 확인 안내를 받게 됩니다.
-                </p>
-              )}
-            </div>
-            {view === "diff" && prevSnap && (
-              <p className="rounded-xl border border-warning/40 bg-warning/10 p-3 text-sm">
-                {diff ? (
-                  <>
-                    {prevSnap.seq}차 제출({formatDate(prevSnap.created_at)}) 대비 변경분을
-                    표시합니다 — <span className={HL}>노랑</span>=변경, 신규·삭제는 배지로
-                    표시됩니다. 비교 중에는 정정이 잠깁니다.
-                  </>
-                ) : (
-                  "비교 데이터를 불러오는 중..."
-                )}
-              </p>
+          <div id="judge-evidence" className="scroll-mt-[var(--sticky-top)] space-y-2">
+            {data.quality.flags.length > 0 && (
+              <SignalCard
+                tone={data.quality.grade === "양호" ? "neutral" : "attention"}
+                signal={`점검에서 확인된 주의 사유가 ${data.quality.flags.length}건 있습니다 (${data.quality.grade} ${data.quality.score}점).`}
+                evidence={data.quality.flags}
+                {...(data.quality.checkedAt
+                  ? { asOf: new Date(data.quality.checkedAt).toLocaleDateString("ko-KR") }
+                  : {})}
+              />
             )}
 
-            <Section title="기본 정보">
-              <dl className="grid grid-cols-2 gap-3">
-                <Field label="성명">{r.participants?.name ?? "-"}</Field>
-                <Field label="사번">{r.participants?.emp_no ?? "-"}</Field>
-                <Field label="소속">{r.participants?.org_text ?? "-"}</Field>
-                <Field label="계열사">{r.companies?.name ?? "-"}</Field>
-                <Field label="직급">{r.participants?.grade ?? "-"}</Field>
-                <Field label="역할단계" hint="역할단계">
-                  {r.participants?.role_level ?? "-"}
-                </Field>
-                <Field label="제출일">{formatDate(r.submitted_at)}</Field>
-                <Field label="검토일">{formatDate(r.reviewed_at)}</Field>
-              </dl>
-            </Section>
+            {data.jobCount <= 1 && (
+              <SignalCard
+                tone="neutral"
+                signal="이 직무는 응답이 1건입니다."
+                evidence={[
+                  "같은 직무의 다른 응답이 없어 내용을 교차 확인할 수 없습니다.",
+                  "승인은 막지 않습니다 — 내용이 미심쩍으면 반려하거나 정정 후 승인하세요.",
+                ]}
+                asOf={new Date().toLocaleDateString("ko-KR")}
+              />
+            )}
 
-            <Section title="직무">
-              <dl className="grid gap-3 sm:grid-cols-3">
-                <Field label="직군" hint="직군">
-                  <Correctable
-                    value={r.job_group}
-                    highlight={hlR("job_group")}
-                    picked={picked?.field === "job_group"}
-                    onPick={pick({
-                      table: "responses",
-                      id: r.id,
-                      field: "job_group",
-                      label: "직군",
-                      value: r.job_group ?? "",
-                    })}
-                  />
-                </Field>
-                <Field label="직렬" hint="직렬">
-                  <Correctable
-                    value={r.job_series}
-                    highlight={hlR("job_series")}
-                    picked={picked?.field === "job_series"}
-                    onPick={pick({
-                      table: "responses",
-                      id: r.id,
-                      field: "job_series",
-                      label: "직렬",
-                      value: r.job_series ?? "",
-                    })}
-                  />
-                </Field>
-                <Field label="직무명" hint="직무">
-                  <Correctable
-                    value={r.job_name}
-                    highlight={hlR("job_name")}
-                    picked={picked?.field === "job_name"}
-                    onPick={pick({
-                      table: "responses",
-                      id: r.id,
-                      field: "job_name",
-                      label: "직무명",
-                      value: r.job_name ?? "",
-                    })}
-                  />
-                </Field>
-              </dl>
-            </Section>
+            {data.aiDraft.any && (
+              <SignalCard
+                tone="attention"
+                signal="확정되지 않은 AI 초안이 남아 승인할 수 없습니다."
+                evidence={[
+                  `역량 ${data.aiDraft.skills}건${data.aiDraft.requirements ? " · 자격요건 포함" : ""}이 AI 초안 표시 상태입니다.`,
+                  "위 [AI 점검]에서 확정하거나 원문에서 항목을 정정하면 승인 게이트가 풀립니다.",
+                ]}
+                asOf={new Date().toLocaleDateString("ko-KR")}
+              />
+            )}
 
-            <Section title="정의 · 목적">
-              <Field label="직무 정의">
+            {r.status === "submitted" && r.submitted_at && daysSince(r.submitted_at) > 5 && (
+              <SignalCard
+                tone="attention"
+                signal={`제출 후 ${daysSince(r.submitted_at)}일째 검토를 기다리고 있습니다.`}
+                evidence={[
+                  `제출일 ${formatDate(r.submitted_at)} 기준 경과일입니다.`,
+                  "5일을 넘기면 참여자가 보완 요청을 받아도 기억이 흐려집니다.",
+                ]}
+                asOf={new Date().toLocaleDateString("ko-KR")}
+              />
+            )}
+
+            {r.status === "draft" && (
+              <p className="rounded-xl border bg-secondary p-3 text-sm text-muted-foreground">
+                작성 중 응답은 승인·반려할 수 없고 열람·정정만 가능합니다. 정정하면 작성자가 화면을
+                열어 두었던 경우 최신 내용 확인 안내를 받게 됩니다.
+              </p>
+            )}
+          </div>
+          {view === "diff" && prevSnap && (
+            <p className="rounded-xl border border-warning/40 bg-warning/10 p-3 text-sm">
+              {diff ? (
+                <>
+                  {prevSnap.seq}차 제출({formatDate(prevSnap.created_at)}) 대비 변경분을 표시합니다
+                  — <span className={HL}>노랑</span>=변경, 신규·삭제는 배지로 표시됩니다. 비교
+                  중에는 정정이 잠깁니다.
+                </>
+              ) : (
+                "비교 데이터를 불러오는 중..."
+              )}
+            </p>
+          )}
+
+          <Section title="기본 정보">
+            <dl className="grid grid-cols-2 gap-3">
+              <Field label="성명">{r.participants?.name ?? "-"}</Field>
+              <Field label="사번">{r.participants?.emp_no ?? "-"}</Field>
+              <Field label="소속">{r.participants?.org_text ?? "-"}</Field>
+              <Field label="계열사">{r.companies?.name ?? "-"}</Field>
+              <Field label="직급">{r.participants?.grade ?? "-"}</Field>
+              <Field label="역할단계" hint="역할단계">
+                {r.participants?.role_level ?? "-"}
+              </Field>
+              <Field label="제출일">{formatDate(r.submitted_at)}</Field>
+              <Field label="검토일">{formatDate(r.reviewed_at)}</Field>
+            </dl>
+          </Section>
+
+          <Section title="직무">
+            <dl className="grid gap-3 sm:grid-cols-3">
+              <Field label="직군" hint="직군">
                 <Correctable
-                  value={r.definition}
-                  highlight={hlR("definition")}
-                  picked={picked?.field === "definition"}
+                  value={r.job_group}
+                  highlight={hlR("job_group")}
+                  picked={picked?.field === "job_group"}
                   onPick={pick({
                     table: "responses",
                     id: r.id,
-                    field: "definition",
-                    label: "직무 정의",
-                    value: r.definition ?? "",
-                    multiline: true,
+                    field: "job_group",
+                    label: "직군",
+                    value: r.job_group ?? "",
                   })}
                 />
               </Field>
-              <Field label="직무 미션">
+              <Field label="직렬" hint="직렬">
                 <Correctable
-                  value={r.mission}
-                  highlight={hlR("mission")}
-                  picked={picked?.field === "mission"}
+                  value={r.job_series}
+                  highlight={hlR("job_series")}
+                  picked={picked?.field === "job_series"}
                   onPick={pick({
                     table: "responses",
                     id: r.id,
-                    field: "mission",
-                    label: "직무 미션",
-                    value: r.mission ?? "",
-                    multiline: true,
+                    field: "job_series",
+                    label: "직렬",
+                    value: r.job_series ?? "",
                   })}
                 />
               </Field>
-            </Section>
-
-            <Section title={`과업 (${r.response_tasks.length}건)`} hint="과업">
-              {r.response_tasks.length === 0 ? (
-                <p className="text-muted-foreground">등록된 과업이 없습니다.</p>
-              ) : (
-                <ul className="space-y-3">
-                  {r.response_tasks.map((t, i) => {
-                    const removedActs = diff?.activityRemoved.get(t.id) ?? [];
-                    return (
-                      <li key={t.id} className="rounded-lg border p-3">
-                        <div className="flex items-start gap-2">
-                          <span className="mt-0.5 text-xs font-semibold text-muted-foreground">
-                            {i + 1}
-                          </span>
-                          <div className="min-w-0 flex-1">
-                            <Correctable
-                              value={t.name}
-                              highlight={hlT(t.id, "name")}
-                              picked={picked?.id === t.id && picked?.field === "name"}
-                              onPick={pick({
-                                table: "response_tasks",
-                                id: t.id,
-                                field: "name",
-                                label: `과업 ${i + 1} 이름`,
-                                value: t.name ?? "",
-                                multiline: true,
-                              })}
-                            />
-                          </div>
-                          {diff?.tasks.added.has(t.id) && <NewBadge />}
-                        </div>
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                          <span
-                            className={cn(
-                              "inline-flex items-center gap-1 rounded-full px-2 py-0.5",
-                              hlT(t.id, "importance") ? "bg-warning/30" : "bg-secondary",
-                            )}
-                          >
-                            중요도 {t.importance ?? "-"}
-                            <FieldHint term="중요도" />
-                          </span>
-                          <span
-                            className={cn(
-                              "inline-flex items-center gap-1 rounded-full px-2 py-0.5",
-                              hlT(t.id, "authority") ? "bg-warning/30" : "bg-secondary",
-                            )}
-                          >
-                            {t.authority ? AUTHORITY_LABELS[t.authority] : "책임수준 미입력"}
-                            <FieldHint term="책임수준" />
-                          </span>
-                          {t.transferable !== null && (
-                            <span
-                              className={cn(
-                                "inline-flex items-center gap-1 rounded-full px-2 py-0.5",
-                                hlT(t.id, "transferable") ? "bg-warning/30" : "bg-secondary",
-                              )}
-                            >
-                              {t.transferable ? "이관 가능" : "이관 불가"}
-                              <FieldHint term="이관가능" />
-                            </span>
-                          )}
-                          {t.improve_type && (
-                            <span
-                              className={cn(
-                                "rounded-full px-2 py-0.5 text-accent-foreground",
-                                hlT(t.id, "improve_type") ? "bg-warning/30" : "bg-primary-soft",
-                              )}
-                            >
-                              개선: {t.improve_type}
-                            </span>
-                          )}
-                        </div>
-                        {t.improve_note && (
-                          <div className="mt-2 text-xs text-muted-foreground">
-                            <Correctable
-                              value={t.improve_note}
-                              highlight={hlT(t.id, "improve_note")}
-                              picked={picked?.id === t.id && picked?.field === "improve_note"}
-                              onPick={pick({
-                                table: "response_tasks",
-                                id: t.id,
-                                field: "improve_note",
-                                label: `과업 ${i + 1} 개선의견`,
-                                value: t.improve_note ?? "",
-                                multiline: true,
-                              })}
-                            />
-                          </div>
-                        )}
-                        {(t.response_activities.length > 0 || removedActs.length > 0) && (
-                          <ul className="mt-2 space-y-1 border-t pt-2 text-xs">
-                            {t.response_activities.map((a, j) => (
-                              <li key={a.id} className="flex gap-2">
-                                <span className="text-muted-foreground">·</span>
-                                <div className="min-w-0 flex-1">
-                                  <Correctable
-                                    value={a.name}
-                                    highlight={diff?.activityChanged.has(a.id) ?? false}
-                                    picked={picked?.id === a.id}
-                                    onPick={pick({
-                                      table: "response_activities",
-                                      id: a.id,
-                                      field: "name",
-                                      label: `과업 ${i + 1} 세부 활동 ${j + 1}`,
-                                      value: a.name ?? "",
-                                    })}
-                                  />
-                                </div>
-                                {diff?.activityAdded.has(a.id) && <NewBadge />}
-                              </li>
-                            ))}
-                            {removedActs.map((a, j) => (
-                              <li key={`removed-act-${j}`} className="flex items-center gap-2">
-                                <span className="text-muted-foreground">·</span>
-                                <span className="min-w-0 flex-1 text-muted-foreground line-through">
-                                  {norm(a["name"]) || "-"}
-                                </span>
-                                <RemovedBadge />
-                              </li>
-                            ))}
-                          </ul>
-                        )}
-                      </li>
-                    );
+              <Field label="직무명" hint="직무">
+                <Correctable
+                  value={r.job_name}
+                  highlight={hlR("job_name")}
+                  picked={picked?.field === "job_name"}
+                  onPick={pick({
+                    table: "responses",
+                    id: r.id,
+                    field: "job_name",
+                    label: "직무명",
+                    value: r.job_name ?? "",
                   })}
-                </ul>
-              )}
-              {diff && diff.tasks.removed.length > 0 && (
-                <ul className="space-y-2">
-                  {diff.tasks.removed.map((t, i) => (
-                    <li
-                      key={`removed-task-${i}`}
-                      className="flex items-center gap-2 rounded-lg border border-dashed p-3"
-                    >
-                      <span className="min-w-0 flex-1 text-muted-foreground line-through">
-                        {norm(t["name"]) || "-"}
-                      </span>
-                      <RemovedBadge />
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </Section>
+                />
+              </Field>
+            </dl>
+          </Section>
 
-            <Section
-              title={`필요 역량 · 자격요건 (역량 ${r.response_skills.length}건)`}
-              hint="필요 역량"
-            >
-              {r.response_skills.length === 0 ? (
-                <p className="text-muted-foreground">등록된 필요 역량이 없습니다.</p>
-              ) : (
-                <ul className="space-y-2">
-                  {r.response_skills.map((s) => (
-                    <li key={s.id} className="rounded-lg border p-3">
+          <Section title="정의 · 목적">
+            <Field label="직무 정의">
+              <Correctable
+                value={r.definition}
+                highlight={hlR("definition")}
+                picked={picked?.field === "definition"}
+                onPick={pick({
+                  table: "responses",
+                  id: r.id,
+                  field: "definition",
+                  label: "직무 정의",
+                  value: r.definition ?? "",
+                  multiline: true,
+                })}
+              />
+            </Field>
+            <Field label="직무 미션">
+              <Correctable
+                value={r.mission}
+                highlight={hlR("mission")}
+                picked={picked?.field === "mission"}
+                onPick={pick({
+                  table: "responses",
+                  id: r.id,
+                  field: "mission",
+                  label: "직무 미션",
+                  value: r.mission ?? "",
+                  multiline: true,
+                })}
+              />
+            </Field>
+          </Section>
+
+          <Section title={`과업 (${r.response_tasks.length}건)`} hint="과업">
+            {r.response_tasks.length === 0 ? (
+              <p className="text-muted-foreground">등록된 과업이 없습니다.</p>
+            ) : (
+              <ul className="space-y-3">
+                {r.response_tasks.map((t, i) => {
+                  const removedActs = diff?.activityRemoved.get(t.id) ?? [];
+                  return (
+                    <li key={t.id} className="rounded-lg border p-3">
                       <div className="flex items-start gap-2">
-                        <div className="min-w-0 flex-1 font-medium">
+                        <span className="mt-0.5 text-xs font-semibold text-muted-foreground">
+                          {i + 1}
+                        </span>
+                        <div className="min-w-0 flex-1">
                           <Correctable
-                            value={s.name}
-                            highlight={hlS(s.id, "name")}
-                            picked={picked?.id === s.id && picked?.field === "name"}
+                            value={t.name}
+                            highlight={hlT(t.id, "name")}
+                            picked={picked?.id === t.id && picked?.field === "name"}
                             onPick={pick({
-                              table: "response_skills",
-                              id: s.id,
+                              table: "response_tasks",
+                              id: t.id,
                               field: "name",
-                              label: "역량 이름",
-                              value: s.name ?? "",
+                              label: `과업 ${i + 1} 이름`,
+                              value: t.name ?? "",
+                              multiline: true,
                             })}
                           />
                         </div>
-                        {diff?.skills.added.has(s.id) && <NewBadge />}
-                        {s.ai_draft && <AiDraftBadge />}
+                        {diff?.tasks.added.has(t.id) && <NewBadge />}
                       </div>
-                      <div className="mt-1 flex flex-wrap gap-2 text-xs">
-                        {s.ksao && (
+                      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                        <span
+                          className={cn(
+                            "inline-flex items-center gap-1 rounded-full px-2 py-0.5",
+                            hlT(t.id, "importance") ? "bg-warning/30" : "bg-secondary",
+                          )}
+                        >
+                          중요도 {t.importance ?? "-"}
+                          <FieldHint term="중요도" />
+                        </span>
+                        <span
+                          className={cn(
+                            "inline-flex items-center gap-1 rounded-full px-2 py-0.5",
+                            hlT(t.id, "authority") ? "bg-warning/30" : "bg-secondary",
+                          )}
+                        >
+                          {t.authority ? AUTHORITY_LABELS[t.authority] : "책임수준 미입력"}
+                          <FieldHint term="책임수준" />
+                        </span>
+                        {t.transferable !== null && (
                           <span
                             className={cn(
-                              "rounded-full px-2 py-0.5",
-                              hlS(s.id, "ksao") ? "bg-warning/30" : "bg-secondary",
+                              "inline-flex items-center gap-1 rounded-full px-2 py-0.5",
+                              hlT(t.id, "transferable") ? "bg-warning/30" : "bg-secondary",
                             )}
                           >
-                            {ksaoLabel(s.ksao)}
+                            {t.transferable ? "이관 가능" : "이관 불가"}
+                            <FieldHint term="이관가능" />
                           </span>
                         )}
-                        {s.hard_soft && (
+                        {t.improve_type && (
                           <span
                             className={cn(
-                              "rounded-full px-2 py-0.5",
-                              hlS(s.id, "hard_soft") ? "bg-warning/30" : "bg-secondary",
+                              "rounded-full px-2 py-0.5 text-accent-foreground",
+                              hlT(t.id, "improve_type") ? "bg-warning/30" : "bg-primary-soft",
                             )}
                           >
-                            {s.hard_soft}
+                            개선: {t.improve_type}
                           </span>
                         )}
                       </div>
-                      <div className="mt-1 text-xs text-muted-foreground">
+                      {t.improve_note && (
+                        <div className="mt-2 text-xs text-muted-foreground">
+                          <Correctable
+                            value={t.improve_note}
+                            highlight={hlT(t.id, "improve_note")}
+                            picked={picked?.id === t.id && picked?.field === "improve_note"}
+                            onPick={pick({
+                              table: "response_tasks",
+                              id: t.id,
+                              field: "improve_note",
+                              label: `과업 ${i + 1} 개선의견`,
+                              value: t.improve_note ?? "",
+                              multiline: true,
+                            })}
+                          />
+                        </div>
+                      )}
+                      {(t.response_activities.length > 0 || removedActs.length > 0) && (
+                        <ul className="mt-2 space-y-1 border-t pt-2 text-xs">
+                          {t.response_activities.map((a, j) => (
+                            <li key={a.id} className="flex gap-2">
+                              <span className="text-muted-foreground">·</span>
+                              <div className="min-w-0 flex-1">
+                                <Correctable
+                                  value={a.name}
+                                  highlight={diff?.activityChanged.has(a.id) ?? false}
+                                  picked={picked?.id === a.id}
+                                  onPick={pick({
+                                    table: "response_activities",
+                                    id: a.id,
+                                    field: "name",
+                                    label: `과업 ${i + 1} 세부 활동 ${j + 1}`,
+                                    value: a.name ?? "",
+                                  })}
+                                />
+                              </div>
+                              {diff?.activityAdded.has(a.id) && <NewBadge />}
+                            </li>
+                          ))}
+                          {removedActs.map((a, j) => (
+                            <li key={`removed-act-${j}`} className="flex items-center gap-2">
+                              <span className="text-muted-foreground">·</span>
+                              <span className="min-w-0 flex-1 text-muted-foreground line-through">
+                                {norm(a["name"]) || "-"}
+                              </span>
+                              <RemovedBadge />
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {diff && diff.tasks.removed.length > 0 && (
+              <ul className="space-y-2">
+                {diff.tasks.removed.map((t, i) => (
+                  <li
+                    key={`removed-task-${i}`}
+                    className="flex items-center gap-2 rounded-lg border border-dashed p-3"
+                  >
+                    <span className="min-w-0 flex-1 text-muted-foreground line-through">
+                      {norm(t["name"]) || "-"}
+                    </span>
+                    <RemovedBadge />
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Section>
+
+          <Section
+            title={`필요 역량 · 자격요건 (역량 ${r.response_skills.length}건)`}
+            hint="필요 역량"
+          >
+            {r.response_skills.length === 0 ? (
+              <p className="text-muted-foreground">등록된 필요 역량이 없습니다.</p>
+            ) : (
+              <ul className="space-y-2">
+                {r.response_skills.map((s) => (
+                  <li key={s.id} className="rounded-lg border p-3">
+                    <div className="flex items-start gap-2">
+                      <div className="min-w-0 flex-1 font-medium">
                         <Correctable
-                          value={s.description}
-                          highlight={hlS(s.id, "description")}
-                          picked={picked?.id === s.id && picked?.field === "description"}
+                          value={s.name}
+                          highlight={hlS(s.id, "name")}
+                          picked={picked?.id === s.id && picked?.field === "name"}
                           onPick={pick({
                             table: "response_skills",
                             id: s.id,
-                            field: "description",
-                            label: `역량 설명(${s.name})`,
-                            value: s.description ?? "",
-                            multiline: true,
+                            field: "name",
+                            label: "역량 이름",
+                            value: s.name ?? "",
                           })}
                         />
                       </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {diff && diff.skills.removed.length > 0 && (
-                <ul className="space-y-2">
-                  {diff.skills.removed.map((s, i) => (
-                    <li
-                      key={`removed-skill-${i}`}
-                      className="flex items-center gap-2 rounded-lg border border-dashed p-3"
-                    >
-                      <span className="min-w-0 flex-1 text-muted-foreground line-through">
-                        {norm(s["name"]) || "-"}
-                      </span>
-                      <RemovedBadge />
-                    </li>
-                  ))}
-                </ul>
-              )}
-
-              <div className="rounded-lg border p-3">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs font-semibold text-muted-foreground">자격요건</p>
-                  {req?.ai_draft && <AiDraftBadge />}
-                </div>
-                {req ? (
-                  <dl className="mt-2 grid gap-3 sm:grid-cols-2">
-                    <Field label="학력">
-                      <span className={cn(hlQ("education") && HL)}>{req.education ?? "-"}</span>
-                    </Field>
-                    <Field label="숙련 기간">
-                      <Correctable
-                        value={req.proficiency}
-                        highlight={hlQ("proficiency")}
-                        picked={picked?.field === "proficiency"}
-                        onPick={pick({
-                          table: "response_requirements",
-                          id: req.id,
-                          field: "proficiency",
-                          label: "숙련 기간",
-                          value: req.proficiency ?? "",
-                        })}
-                      />
-                    </Field>
-                    <Field label="필수 전공">
-                      <Correctable
-                        value={req.majors_required}
-                        highlight={hlQ("majors_required")}
-                        picked={picked?.field === "majors_required"}
-                        onPick={pick({
-                          table: "response_requirements",
-                          id: req.id,
-                          field: "majors_required",
-                          label: "필수 전공",
-                          value: req.majors_required ?? "",
-                        })}
-                      />
-                    </Field>
-                    <Field label="우대 전공">
-                      <Correctable
-                        value={req.majors_preferred}
-                        highlight={hlQ("majors_preferred")}
-                        picked={picked?.field === "majors_preferred"}
-                        onPick={pick({
-                          table: "response_requirements",
-                          id: req.id,
-                          field: "majors_preferred",
-                          label: "우대 전공",
-                          value: req.majors_preferred ?? "",
-                        })}
-                      />
-                    </Field>
-                    <Field label="자격증">
-                      <span className={cn(hlQ("licenses") && HL)}>
-                        {licenses.length === 0
-                          ? "-"
-                          : licenses
-                              .map((l) => [l.name, l.grade, l.kind].filter(Boolean).join(" "))
-                              .join(", ")}
-                      </span>
-                    </Field>
-                    <Field label="어학">
-                      <span className={cn(hlQ("languages") && HL)}>
-                        {languages.length === 0
-                          ? "-"
-                          : languages
-                              .map((l) => [l.language, l.level].filter(Boolean).join(" "))
-                              .join(", ")}
-                      </span>
-                    </Field>
-                    <div className="sm:col-span-2">
-                      <Field label="교육 이수">
-                        <Correctable
-                          value={req.trainings}
-                          highlight={hlQ("trainings")}
-                          picked={picked?.field === "trainings"}
-                          onPick={pick({
-                            table: "response_requirements",
-                            id: req.id,
-                            field: "trainings",
-                            label: "교육 이수",
-                            value: req.trainings ?? "",
-                            multiline: true,
-                          })}
-                        />
-                      </Field>
+                      {diff?.skills.added.has(s.id) && <NewBadge />}
+                      {s.ai_draft && <AiDraftBadge />}
                     </div>
-                  </dl>
-                ) : (
-                  <p className="mt-2 text-muted-foreground">작성된 자격요건이 없습니다.</p>
-                )}
-              </div>
-            </Section>
-
-            <Section title="자기평가">
-              <dl className="grid gap-3 sm:grid-cols-2">
-                <Field label="업무 포괄 정도">
-                  <span className={cn(hlR("coverage_pct") && HL)}>
-                    {r.coverage_pct ? `${r.coverage_pct}%` : "-"}
-                  </span>
-                </Field>
-                <Field label="온보딩 완료">
-                  <span className={cn(hlR("onboarding_done") && HL)}>
-                    {r.onboarding_done ? "예" : "아니오"}
-                  </span>
-                </Field>
-                <div className="sm:col-span-2">
-                  <Field label="누락된 업무">
-                    <Correctable
-                      value={r.missed_note}
-                      highlight={hlR("missed_note")}
-                      picked={picked?.field === "missed_note"}
-                      onPick={pick({
-                        table: "responses",
-                        id: r.id,
-                        field: "missed_note",
-                        label: "누락된 업무",
-                        value: r.missed_note ?? "",
-                        multiline: true,
-                      })}
-                    />
-                  </Field>
-                </div>
-                <div className="sm:col-span-2">
-                  <Field label="업무 애로사항">
-                    <Correctable
-                      value={r.pain_note}
-                      highlight={hlR("pain_note")}
-                      picked={picked?.field === "pain_note"}
-                      onPick={pick({
-                        table: "responses",
-                        id: r.id,
-                        field: "pain_note",
-                        label: "업무 애로사항",
-                        value: r.pain_note ?? "",
-                        multiline: true,
-                      })}
-                    />
-                  </Field>
-                </div>
-              </dl>
-            </Section>
-
-            {interviews.length > 0 && (
-              <Section title="인터뷰 기록">
-                <ul className="space-y-2">
-                  {interviews.map((iv) => (
-                    <li key={iv.id} className="rounded-lg border p-3">
-                      <p className="text-xs text-muted-foreground">
-                        {iv.status} ·{" "}
-                        {iv.scheduled_at
-                          ? new Date(iv.scheduled_at).toLocaleString("ko-KR")
-                          : "일정 미정"}{" "}
-                        · {iv.interviewer || "담당 미지정"}
-                      </p>
-                      {iv.memo ? (
-                        <p className="mt-1 whitespace-pre-wrap">{iv.memo}</p>
-                      ) : (
-                        <p className="mt-1 text-muted-foreground">남긴 내용이 없습니다.</p>
+                    <div className="mt-1 flex flex-wrap gap-2 text-xs">
+                      {s.ksao && (
+                        <span
+                          className={cn(
+                            "rounded-full px-2 py-0.5",
+                            hlS(s.id, "ksao") ? "bg-warning/30" : "bg-secondary",
+                          )}
+                        >
+                          {ksaoLabel(s.ksao)}
+                        </span>
                       )}
-                    </li>
-                  ))}
-                </ul>
-                <p className="text-xs text-muted-foreground">
-                  인터뷰에서 확인한 내용은 그대로 보관되어 직무기술서 작성에서 근거로 함께 읽힙니다.
-                </p>
-              </Section>
+                      {s.hard_soft && (
+                        <span
+                          className={cn(
+                            "rounded-full px-2 py-0.5",
+                            hlS(s.id, "hard_soft") ? "bg-warning/30" : "bg-secondary",
+                          )}
+                        >
+                          {s.hard_soft}
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      <Correctable
+                        value={s.description}
+                        highlight={hlS(s.id, "description")}
+                        picked={picked?.id === s.id && picked?.field === "description"}
+                        onPick={pick({
+                          table: "response_skills",
+                          id: s.id,
+                          field: "description",
+                          label: `역량 설명(${s.name})`,
+                          value: s.description ?? "",
+                          multiline: true,
+                        })}
+                      />
+                    </div>
+                  </li>
+                ))}
+              </ul>
             )}
-          </DocPane>
-        )}
+            {diff && diff.skills.removed.length > 0 && (
+              <ul className="space-y-2">
+                {diff.skills.removed.map((s, i) => (
+                  <li
+                    key={`removed-skill-${i}`}
+                    className="flex items-center gap-2 rounded-lg border border-dashed p-3"
+                  >
+                    <span className="min-w-0 flex-1 text-muted-foreground line-through">
+                      {norm(s["name"]) || "-"}
+                    </span>
+                    <RemovedBadge />
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <div className="rounded-lg border p-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold text-muted-foreground">자격요건</p>
+                {req?.ai_draft && <AiDraftBadge />}
+              </div>
+              {req ? (
+                <dl className="mt-2 grid gap-3 sm:grid-cols-2">
+                  <Field label="학력">
+                    <span className={cn(hlQ("education") && HL)}>{req.education ?? "-"}</span>
+                  </Field>
+                  <Field label="숙련 기간">
+                    <Correctable
+                      value={req.proficiency}
+                      highlight={hlQ("proficiency")}
+                      picked={picked?.field === "proficiency"}
+                      onPick={pick({
+                        table: "response_requirements",
+                        id: req.id,
+                        field: "proficiency",
+                        label: "숙련 기간",
+                        value: req.proficiency ?? "",
+                      })}
+                    />
+                  </Field>
+                  <Field label="필수 전공">
+                    <Correctable
+                      value={req.majors_required}
+                      highlight={hlQ("majors_required")}
+                      picked={picked?.field === "majors_required"}
+                      onPick={pick({
+                        table: "response_requirements",
+                        id: req.id,
+                        field: "majors_required",
+                        label: "필수 전공",
+                        value: req.majors_required ?? "",
+                      })}
+                    />
+                  </Field>
+                  <Field label="우대 전공">
+                    <Correctable
+                      value={req.majors_preferred}
+                      highlight={hlQ("majors_preferred")}
+                      picked={picked?.field === "majors_preferred"}
+                      onPick={pick({
+                        table: "response_requirements",
+                        id: req.id,
+                        field: "majors_preferred",
+                        label: "우대 전공",
+                        value: req.majors_preferred ?? "",
+                      })}
+                    />
+                  </Field>
+                  <Field label="자격증">
+                    <span className={cn(hlQ("licenses") && HL)}>
+                      {licenses.length === 0
+                        ? "-"
+                        : licenses
+                            .map((l) => [l.name, l.grade, l.kind].filter(Boolean).join(" "))
+                            .join(", ")}
+                    </span>
+                  </Field>
+                  <Field label="어학">
+                    <span className={cn(hlQ("languages") && HL)}>
+                      {languages.length === 0
+                        ? "-"
+                        : languages
+                            .map((l) => [l.language, l.level].filter(Boolean).join(" "))
+                            .join(", ")}
+                    </span>
+                  </Field>
+                  <div className="sm:col-span-2">
+                    <Field label="교육 이수">
+                      <Correctable
+                        value={req.trainings}
+                        highlight={hlQ("trainings")}
+                        picked={picked?.field === "trainings"}
+                        onPick={pick({
+                          table: "response_requirements",
+                          id: req.id,
+                          field: "trainings",
+                          label: "교육 이수",
+                          value: req.trainings ?? "",
+                          multiline: true,
+                        })}
+                      />
+                    </Field>
+                  </div>
+                </dl>
+              ) : (
+                <p className="mt-2 text-muted-foreground">작성된 자격요건이 없습니다.</p>
+              )}
+            </div>
+          </Section>
+
+          <Section title="자기평가">
+            <dl className="grid gap-3 sm:grid-cols-2">
+              <Field label="업무 포괄 정도">
+                <span className={cn(hlR("coverage_pct") && HL)}>
+                  {r.coverage_pct ? `${r.coverage_pct}%` : "-"}
+                </span>
+              </Field>
+              <Field label="온보딩 완료">
+                <span className={cn(hlR("onboarding_done") && HL)}>
+                  {r.onboarding_done ? "예" : "아니오"}
+                </span>
+              </Field>
+              <div className="sm:col-span-2">
+                <Field label="누락된 업무">
+                  <Correctable
+                    value={r.missed_note}
+                    highlight={hlR("missed_note")}
+                    picked={picked?.field === "missed_note"}
+                    onPick={pick({
+                      table: "responses",
+                      id: r.id,
+                      field: "missed_note",
+                      label: "누락된 업무",
+                      value: r.missed_note ?? "",
+                      multiline: true,
+                    })}
+                  />
+                </Field>
+              </div>
+              <div className="sm:col-span-2">
+                <Field label="업무 애로사항">
+                  <Correctable
+                    value={r.pain_note}
+                    highlight={hlR("pain_note")}
+                    picked={picked?.field === "pain_note"}
+                    onPick={pick({
+                      table: "responses",
+                      id: r.id,
+                      field: "pain_note",
+                      label: "업무 애로사항",
+                      value: r.pain_note ?? "",
+                      multiline: true,
+                    })}
+                  />
+                </Field>
+              </div>
+            </dl>
+          </Section>
+        </DocPane>
 
         <ActionBar
           className="-mx-4 sm:-mx-6"
@@ -1738,62 +1591,6 @@ function ResponseWorkspace({
             />
           )}
         </ToolLayer>
-
-        <Dialog open={approveOpen} onOpenChange={setApproveOpen}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>인터뷰 확인 후 승인</DialogTitle>
-              <DialogDescription>
-                「{r.job_name ?? "직무 미입력"}」은 응답이 {data.jobCount}건뿐입니다. 후속 인터뷰로
-                내용을 확인하고 그 기록을 남긴 경우에만 승인할 수 있습니다. 아래에 인터뷰 내용을
-                적으면 「완료」 기록으로 남기고 바로 승인합니다.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-3">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="space-y-1.5">
-                  <Label htmlFor="iv-when">인터뷰 일시 (선택)</Label>
-                  <Input
-                    id="iv-when"
-                    type="datetime-local"
-                    value={ivWhen}
-                    onChange={(e) => setIvWhen(e.target.value)}
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="iv-who">담당 (선택)</Label>
-                  <Input
-                    id="iv-who"
-                    value={ivWho}
-                    onChange={(e) => setIvWho(e.target.value)}
-                    placeholder="인터뷰를 진행한 사람"
-                  />
-                </div>
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="iv-memo">인터뷰에서 확인한 내용 (필수)</Label>
-                <Textarea
-                  id="iv-memo"
-                  rows={5}
-                  value={ivMemo}
-                  onChange={(e) => setIvMemo(e.target.value)}
-                  placeholder="응답에서 확인·보완한 내용을 적어 주세요. 이 기록이 승인 근거로 남고 직무기술서 작성에서 함께 읽힙니다."
-                />
-              </div>
-            </div>
-            <DialogFooter>
-              <Button variant="ghost" onClick={() => setApproveOpen(false)}>
-                취소
-              </Button>
-              <Button
-                disabled={!ivMemo.trim() || approve.isPending}
-                onClick={() => approve.mutate({ when: ivWhen, who: ivWho, memo: ivMemo })}
-              >
-                인터뷰 기록 후 승인
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
 
         <Dialog open={rejectOpen} onOpenChange={setRejectOpen}>
           <DialogContent>
@@ -2034,131 +1831,6 @@ function CorrectionPanel({
           <X className="size-4" /> 취소
         </Button>
       </div>
-    </div>
-  );
-}
-
-/* ── 중앙 보조 뷰: 같은 직무 나란히 보기 ───────────────────── */
-
-function JobComparison({
-  jobNames,
-  companyId,
-  job,
-  onJobChange,
-  onBack,
-}: {
-  jobNames: string[];
-  companyId: string | null;
-  job: string | null;
-  onJobChange: (v: string | null) => void;
-  onBack: () => void;
-}) {
-  const selected = job ?? "";
-  const { data, isFetching } = useQuery({
-    queryKey: ["job-comparison", selected, companyId],
-    queryFn: () => getJobComparison({ data: { jobName: selected, companyId } }),
-    enabled: selected.length > 0,
-  });
-
-  const options = useMemo(
-    () => (selected && !jobNames.includes(selected) ? [selected, ...jobNames] : jobNames),
-    [jobNames, selected],
-  );
-
-  return (
-    <div className="space-y-4">
-      <div className="rounded-xl border border-primary/30 bg-primary-soft p-3 text-sm text-accent-foreground">
-        <p className="font-semibold">역할단계 참조표</p>
-        <p className="mt-1">{LV_GUIDE}</p>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="min-w-0 flex-1 sm:max-w-sm">
-          <Select value={selected} onValueChange={onJobChange}>
-            <SelectTrigger aria-label="비교할 직무 선택">
-              <SelectValue placeholder="비교할 직무를 선택하세요" />
-            </SelectTrigger>
-            <SelectContent>
-              {options.map((name) => (
-                <SelectItem key={name} value={name}>
-                  {name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <Button variant="outline" size="sm" onClick={onBack}>
-          원문으로
-        </Button>
-      </div>
-
-      {!selected ? (
-        <EmptyState
-          kind="nothing"
-          title="비교할 직무를 고르세요"
-          description="직무를 선택하면 같은 직무를 맡은 응답자들의 과업·필요 역량을 나란히 놓고 볼 수 있습니다."
-        />
-      ) : isFetching || !data ? (
-        <p className="text-sm text-muted-foreground">불러오는 중...</p>
-      ) : data.columns.length === 0 ? (
-        <EmptyState
-          kind="nothing"
-          title="비교할 응답이 없습니다"
-          description={`「${selected}」에는 제출·승인된 응답이 없습니다. 다른 직무를 선택하거나 참여자 진행 상황을 확인해 보세요.`}
-        />
-      ) : (
-        <div className="flex gap-4 overflow-x-auto pb-2">
-          {data.columns.map((c) => (
-            <div key={c.id} className="w-[280px] shrink-0 rounded-xl border bg-card p-4 shadow-sm">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="font-semibold">{c.participants?.name ?? "-"}</p>
-                  <p className="truncate text-xs text-muted-foreground">
-                    {c.participants?.org_text ?? "-"}
-                  </p>
-                </div>
-                <span className="shrink-0 rounded-full bg-secondary px-2 py-0.5 text-[11px] font-semibold">
-                  {c.participants?.role_level ?? "미지정"}
-                </span>
-              </div>
-
-              <p className="mt-3 text-xs font-semibold text-muted-foreground">
-                과업 {c.response_tasks.length}건
-              </p>
-              <ul className="mt-2 space-y-2">
-                {c.response_tasks.map((t) => (
-                  <li key={t.id} className="rounded-lg border p-2 text-xs">
-                    <span className="block min-w-0">{t.name}</span>
-                    <div className="mt-1.5 flex flex-wrap gap-1">
-                      <span className="rounded-full bg-secondary px-1.5 py-0.5">
-                        중요도 {t.importance ?? "-"}
-                      </span>
-                      <span className="rounded-full bg-secondary px-1.5 py-0.5">
-                        {t.authority ? AUTHORITY_LABELS[t.authority] : "미입력"}
-                      </span>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-
-              <p className="mt-3 text-xs font-semibold text-muted-foreground">
-                필요 역량 {c.response_skills.length}건
-              </p>
-              <ul className="mt-2 space-y-1 text-xs">
-                {c.response_skills.map((s) => (
-                  <li key={s.id} className="flex gap-1.5">
-                    <span className="text-muted-foreground">·</span>
-                    <span className="min-w-0 flex-1">
-                      {s.name}
-                      {s.ksao ? ` (${ksaoLabel(s.ksao)})` : ""}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

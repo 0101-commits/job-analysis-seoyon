@@ -213,7 +213,7 @@ async function jobCounts(
   admin: SupabaseClient<Database>,
   companyId: string | null,
 ): Promise<Record<string, number>> {
-  // 1인 응답 직무 판정(승인 게이트)에 쓰이므로 1000행 상한에 잘리면 안 된다. 전량 조회한다.
+  // 1인 응답 직무 표시(신뢰도 배지)에 쓰이므로 1000행 상한에 잘리면 안 된다. 전량 조회한다.
   const rows = await fetchAll<{ job_name: string | null }>((from, to) => {
     let q = admin
       .from("responses")
@@ -292,7 +292,6 @@ export const listReviewQueue = createServerFn({ method: "POST" })
 
     return {
       rows: withQuality,
-      jobCounts: counts,
       /** 아직 점검하지 않은 건수 — 화면에서 "점검 실행" 을 권할 근거. */
       unchecked,
     };
@@ -330,21 +329,12 @@ export const getResponseDetail = createServerFn({ method: "POST" })
     const counts = await jobCounts(supabaseAdmin, row.company_id);
     const aiDraftSkills = row.response_skills.filter((s) => s.ai_draft).length;
 
-    // F7 — 인터뷰 기록은 승인 게이트의 근거이면서 응답을 보완한 내용이기도 하므로
-    // 상세 화면에 원문과 함께 놓는다.
-    const { data: interviews } = await supabaseAdmin
-      .from("interviews")
-      .select("*")
-      .eq("response_id", data.responseId)
-      .order("created_at", { ascending: false });
-
     return {
       response: {
         ...row,
         response_tasks: tasks,
         review_comments: comments,
       },
-      interviews: interviews ?? [],
       quality: {
         score: row.quality_score,
         grade: qualityGrade(row.quality_score),
@@ -407,9 +397,7 @@ interface ApprovalRow {
   status: string;
 }
 
-type GateResult =
-  | { ok: true; jobCount: number }
-  | { ok: false; needsInterview: boolean; reason: string; jobCount: number };
+type GateResult = { ok: true; jobCount: number } | { ok: false; reason: string; jobCount: number };
 
 /**
  * 승인 게이트 — 개별 승인과 일괄 승인이 반드시 같은 판정을 쓴다.
@@ -417,7 +405,6 @@ type GateResult =
  *
  * ① 확정되지 않은 AI 초안이 남아 있으면 막는다.
  * ② 내용 없는 제출(과업 0건)은 막는다.
- * ③ 1인 응답 직무는 인터뷰 「완료」 기록이 있어야 통과한다.
  */
 async function approvalGate(
   admin: SupabaseClient<Database>,
@@ -439,7 +426,6 @@ async function approvalGate(
   if ((draftSkills ?? 0) > 0 || req?.ai_draft) {
     return {
       ok: false,
-      needsInterview: false,
       jobCount,
       reason:
         "확정되지 않은 AI 초안 항목이 남아 있습니다. 응답자 확인 또는 정정 후 승인할 수 있습니다.",
@@ -453,27 +439,9 @@ async function approvalGate(
   if ((taskCount ?? 0) === 0) {
     return {
       ok: false,
-      needsInterview: false,
       jobCount,
       reason: "과업이 하나도 없는 제출입니다. 반려해 다시 작성받아야 합니다.",
     };
-  }
-
-  if (jobCount <= 1) {
-    const { count: done } = await admin
-      .from("interviews")
-      .select("id", { count: "exact", head: true })
-      .eq("response_id", row.id)
-      .eq("status", "완료");
-    if ((done ?? 0) === 0) {
-      return {
-        ok: false,
-        needsInterview: true,
-        jobCount,
-        reason:
-          "1인 응답 직무는 후속 인터뷰 확인 후 확정할 수 있습니다. 인터뷰 관리에서 「완료」 기록을 남기면 승인할 수 있습니다.",
-      };
-    }
   }
 
   return { ok: true, jobCount };
@@ -504,11 +472,11 @@ export const approveResponse = createServerFn({ method: "POST" })
     const counts = await jobCounts(supabaseAdmin, row.company_id);
     const gate = await approvalGate(supabaseAdmin, row, counts);
     if (!gate.ok) {
-      return { ok: false as const, needsInterview: gate.needsInterview, reason: gate.reason };
+      return { ok: false as const, reason: gate.reason };
     }
     await markApproved(supabaseAdmin, row, context.userId, gate.jobCount, false);
 
-    return { ok: true as const, needsInterview: false, reason: null };
+    return { ok: true as const, reason: null };
   });
 
 /** 승인 확정 — 개별 승인과 일괄 승인이 같은 기록(상태·참여자 상태·감사 이력)을 남긴다. */
@@ -821,57 +789,6 @@ export const handleInfoRequest = createServerFn({ method: "POST" })
     return { ok: true, applied };
   });
 
-export const getJobComparison = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) =>
-    z
-      .object({
-        jobName: z.string().trim().min(1).max(120),
-        companyId: z.string().uuid().nullable().optional(),
-      })
-      .parse(input),
-  )
-  .handler(async ({ data, context }) => {
-    const { requireAdmin } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    let q = supabaseAdmin
-      .from("responses")
-      .select(
-        "id, job_name, status, definition, mission, participants(name, emp_no, org_text, grade, role_level), response_tasks(id, seq, name, importance, authority, is_key, transferable), response_skills(id, name, ksao, hard_soft, description)",
-      )
-      .eq("job_name", data.jobName)
-      .in("status", COUNTED_STATUSES);
-    if (data.companyId) q = q.eq("company_id", data.companyId);
-
-    const { data: rows, error } = await q;
-    if (error) throw new Error(error.message);
-
-    const { data: settings } = await supabaseAdmin
-      .from("system_settings")
-      .select("role_levels")
-      .maybeSingle();
-    const order = settings?.role_levels ?? [];
-    const rank = (level: string | null) => {
-      const i = level ? order.indexOf(level) : -1;
-      return i === -1 ? order.length : i;
-    };
-
-    const columns = (rows ?? [])
-      .map((r) => ({
-        ...r,
-        response_tasks: [...r.response_tasks].sort((a, b) => a.seq - b.seq),
-      }))
-      .sort((a, b) => {
-        const d =
-          rank(a.participants?.role_level ?? null) - rank(b.participants?.role_level ?? null);
-        return d !== 0 ? d : (a.participants?.name ?? "").localeCompare(b.participants?.name ?? "");
-      });
-
-    return { jobName: data.jobName, roleLevels: order, columns };
-  });
-
 /* ── F16 점검 실행 · 일괄 승인 ───────────────────────────────── */
 
 /** 자식 테이블 전량 조회. id 를 100개씩 끊어 넘긴다(긴 in() 주소로 요청이 깨지는 것을 피함). */
@@ -1119,193 +1036,4 @@ export const bulkApproveResponses = createServerFn({ method: "POST" })
     }
 
     return { approved, skipped };
-  });
-
-/* ── F7 인터뷰 관리 ─────────────────────────────────────────── */
-
-type InterviewRow = Database["public"]["Tables"]["interviews"]["Row"];
-
-/** 응답 수가 적어 응답만으로 직무를 확정할 수 없는 대상. 1명은 인터뷰 필수, 2~4명은 심층 검토. */
-export const listInterviewTargets = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) =>
-    z.object({ companyId: z.string().uuid().nullable().optional() }).parse(input ?? {}),
-  )
-  .handler(async ({ data, context }) => {
-    const { requireAdmin } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const companyId = data.companyId ?? null;
-    const counts = await jobCounts(supabaseAdmin, companyId);
-
-    type TargetRow = {
-      id: string;
-      job_name: string | null;
-      status: string;
-      submitted_at: string | null;
-      companies: { name: string } | null;
-      participants: { name: string; emp_no: string; org_text: string | null } | null;
-    };
-    const rows = await fetchAll<TargetRow>((from, to) => {
-      let q = supabaseAdmin
-        .from("responses")
-        .select(
-          "id, job_name, status, submitted_at, companies(name), participants(name, emp_no, org_text)",
-        )
-        .in("status", COUNTED_STATUSES)
-        .order("id")
-        .range(from, to);
-      if (companyId) q = q.eq("company_id", companyId);
-      return q;
-    });
-
-    const targets = rows.filter((r) => {
-      const count = r.job_name ? (counts[r.job_name] ?? 0) : 0;
-      return count > 0 && count <= 4;
-    });
-
-    const interviews = await fetchChunked<InterviewRow>(
-      targets.map((t) => t.id),
-      (slice, from, to) =>
-        supabaseAdmin
-          .from("interviews")
-          .select("*")
-          .in("response_id", slice)
-          .order("created_at", { ascending: false })
-          .range(from, to),
-    );
-    const byResponse = new Map<string, InterviewRow[]>();
-    for (const iv of interviews) {
-      const list = byResponse.get(iv.response_id) ?? [];
-      list.push(iv);
-      byResponse.set(iv.response_id, list);
-    }
-
-    const list = targets
-      .map((r) => {
-        const jobCount = r.job_name ? (counts[r.job_name] ?? 0) : 0;
-        const records = byResponse.get(r.id) ?? [];
-        return {
-          responseId: r.id,
-          jobName: r.job_name,
-          jobCount,
-          kind: (jobCount <= 1 ? "인터뷰 필수" : "심층 검토") as "인터뷰 필수" | "심층 검토",
-          responseStatus: r.status,
-          submittedAt: r.submitted_at,
-          companyName: r.companies?.name ?? null,
-          participantName: r.participants?.name ?? null,
-          empNo: r.participants?.emp_no ?? null,
-          orgText: r.participants?.org_text ?? null,
-          interviews: records,
-          done: records.some((iv) => iv.status === "완료"),
-        };
-      })
-      .sort((a, b) => {
-        // 아직 확인이 안 끝난 건, 응답 수가 적은 직무부터 위로 올린다.
-        if (a.done !== b.done) return a.done ? 1 : -1;
-        if (a.jobCount !== b.jobCount) return a.jobCount - b.jobCount;
-        return (a.jobName ?? "").localeCompare(b.jobName ?? "");
-      });
-
-    return {
-      rows: list,
-      required: list.filter((r) => r.kind === "인터뷰 필수").length,
-      pending: list.filter((r) => r.kind === "인터뷰 필수" && !r.done).length,
-    };
-  });
-
-/** 인터뷰 일정·담당·상태·메모 기록. id 를 주면 그 기록을 고치고, 없으면 새로 남긴다. */
-export const upsertInterview = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) =>
-    z
-      .object({
-        id: z.string().uuid().optional(),
-        responseId: z.string().uuid(),
-        scheduledAt: z.string().min(1).nullable().optional(),
-        interviewer: z.string().trim().max(120).nullable().optional(),
-        status: z.enum(["예정", "완료", "취소"]),
-        memo: z.string().trim().max(8000).nullable().optional(),
-      })
-      .parse(input),
-  )
-  .handler(async ({ data, context }) => {
-    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const { data: response } = await supabaseAdmin
-      .from("responses")
-      .select("id, participant_id, job_name")
-      .eq("id", data.responseId)
-      .maybeSingle();
-    if (!response) throw new Error("응답을 찾을 수 없습니다.");
-
-    const scheduledAt = data.scheduledAt ? new Date(data.scheduledAt) : null;
-    if (scheduledAt && Number.isNaN(scheduledAt.getTime())) {
-      throw new Error("인터뷰 일시를 다시 확인해 주세요.");
-    }
-
-    const patch = {
-      response_id: data.responseId,
-      participant_id: response.participant_id,
-      scheduled_at: scheduledAt ? scheduledAt.toISOString() : null,
-      interviewer: data.interviewer?.trim() || null,
-      status: data.status,
-      memo: data.memo?.trim() || null,
-    };
-
-    let id = data.id ?? null;
-    if (id) {
-      const { error } = await supabaseAdmin.from("interviews").update(patch).eq("id", id);
-      if (error) throw new Error(error.message);
-    } else {
-      const { data: inserted, error } = await supabaseAdmin
-        .from("interviews")
-        .insert({ ...patch, created_by: context.userId })
-        .select("id")
-        .single();
-      if (error) throw new Error(error.message);
-      id = inserted.id;
-    }
-
-    await writeAudit(supabaseAdmin, {
-      actor_id: context.userId,
-      action: data.id ? "인터뷰 기록 수정" : "인터뷰 기록 추가",
-      target_type: "interview",
-      target_id: id,
-      detail: { response_id: data.responseId, job_name: response.job_name, status: data.status },
-    });
-
-    return { ok: true, id };
-  });
-
-export const deleteInterview = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => z.object({ id: z.string().uuid() }).parse(input))
-  .handler(async ({ data, context }) => {
-    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
-    await requireAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const { data: row } = await supabaseAdmin
-      .from("interviews")
-      .select("id, response_id")
-      .eq("id", data.id)
-      .maybeSingle();
-    if (!row) throw new Error("인터뷰 기록을 찾을 수 없습니다.");
-
-    const { error } = await supabaseAdmin.from("interviews").delete().eq("id", data.id);
-    if (error) throw new Error(error.message);
-
-    await writeAudit(supabaseAdmin, {
-      actor_id: context.userId,
-      action: "인터뷰 기록 삭제",
-      target_type: "interview",
-      target_id: data.id,
-      detail: { response_id: row.response_id },
-    });
-
-    return { ok: true };
   });

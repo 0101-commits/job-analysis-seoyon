@@ -5,11 +5,13 @@ import { toast } from "sonner";
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Download,
   History,
   MoreHorizontal,
+  Pencil,
   Plus,
-  Sparkles,
   Upload,
   Wand2,
   X,
@@ -60,7 +62,6 @@ import { SignalCard } from "@/components/SignalCard";
 import { EmptyState } from "@/components/EmptyState";
 import { usePersistedState } from "@/hooks/use-persisted-ui";
 import { OrgGrid, type OrgRollup } from "@/components/admin/OrgGrid";
-import { JobDiagnosisPanel } from "@/components/admin/JobDiagnosisPanel";
 import {
   ImpactCountBadge,
   ImpactInspector,
@@ -77,7 +78,6 @@ import { similarity } from "@/components/survey/validation";
 import {
   JOB_FIELDS,
   ORG_FIELDS,
-  applyResponseMapping,
   createOrgUnit,
   deleteCatalogVersion,
   deleteJobCatalogRow,
@@ -92,10 +92,13 @@ import {
   listDutyCharts,
   moveOrgUnit,
   previewImpact,
+  renameJobGroup,
+  renameJobSeries,
   renameOrgUnit,
+  reorderJobCatalog,
+  reorderOrgUnits,
   restoreCatalogVersion,
   saveCatalogVersion,
-  suggestResponseMapping,
   uploadDutyChart,
   uploadJobCatalog,
   uploadOrgUnits,
@@ -108,7 +111,6 @@ import {
   type ImpactKind,
   type ImpactPreview,
   type JobDraftRow,
-  type MappingSuggestion,
   type UploadReport,
 } from "@/lib/master.functions";
 
@@ -1177,12 +1179,18 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
                 }
                 onRename={handleRename}
                 onMove={handleMove}
+                onReorder={(items) =>
+                  edit.mutate(async () =>
+                    reorderOrgUnits({ data: { items }, headers: await authHeaders() }),
+                  )
+                }
                 onCreate={handleCreate}
                 onDelete={handleDelete}
               />
               <p className="text-xs text-muted-foreground">
-                조직명이 놓인 열이 그 조직의 레벨입니다. ⋯ 메뉴의 들여쓰기는 바로 위 조직의 하위로,
-                내어쓰기는 한 단계 위로 옮깁니다. 인원은 하위 조직을 합산한 수치입니다.
+                조직명이 놓인 열이 그 조직의 레벨입니다. ↑↓ 는 같은 상위 안에서 순서를 바꾸고, ⋯
+                메뉴의 들여쓰기는 바로 위 조직의 하위로, 내어쓰기는 한 단계 위로 옮깁니다. 인원은
+                하위 조직을 합산한 수치입니다.
               </p>
             </div>
           )}
@@ -1238,6 +1246,9 @@ type JobRow = {
   job_name: string;
   definition: string | null;
   company_ids: string[];
+  group_sort: number;
+  series_sort: number;
+  sort: number;
 };
 
 type JobEdit = {
@@ -1335,13 +1346,16 @@ function JobRowEditor({
   );
 }
 
+/** 직군·직렬 헤더의 이름 수정 대상. */
+type HeaderRename =
+  { kind: "group"; from: string } | { kind: "series"; group: string; from: string };
+
 function JobCatalogList({
   highlightJobId,
   audience,
   audienceLoading,
   notifyOnSave,
   onEditingChange,
-  onRenamed,
 }: {
   highlightJobId: string | null;
   audience: ReturnType<typeof useImpactAudience>["data"];
@@ -1349,12 +1363,13 @@ function JobCatalogList({
   notifyOnSave: boolean;
   /** 편집 중인 행을 위 탭으로 올려 인스펙터가 같은 대상을 보게 한다. */
   onEditingChange: (editing: JobEdit | null) => void;
-  /** 직군·직렬·직무명이 바뀐 저장이 끝나면 부른다 — 옛 이름 응답의 재연결 안내용. */
-  onRenamed: (next: CatalogRowNext, affectedCount: number) => void;
 }) {
   const queryClient = useQueryClient();
   const [editing, setEditingState] = useState<JobEdit | null>(null);
   const [openGroups, setOpenGroups] = useState<string[]>([]);
+  const [renaming, setRenaming] = useState<HeaderRename | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const gate = makeImpactGate(setPending);
   // 행에 적용 계열사 이름을 보여 주기 위한 이름표.
@@ -1371,7 +1386,9 @@ function JobCatalogList({
     queryFn: async () => {
       const { data, error } = await supabase
         .from("job_catalog")
-        .select("id, job_group, job_series, job_name, definition, company_ids")
+        .select(
+          "id, job_group, job_series, job_name, definition, company_ids, group_sort, series_sort, sort",
+        )
         .order("job_group")
         .order("job_series")
         .order("job_name");
@@ -1441,22 +1458,17 @@ function JobCatalogList({
           },
           headers,
         });
-        if (result.ok && values.id) {
-          if (affected) {
-            await scheduleImpactNotice(
-              {
-                kind: "catalog_row_update",
-                id: values.id,
-                label: next.job_name,
-                field: "job_name",
-                note: `직무 「${next.job_name}」 의 분류 정보가 바뀌었습니다`,
-              },
-              affected,
-            );
-          }
-          if (classificationChanged) {
-            onRenamed(next, affected?.total ?? audience?.total ?? 0);
-          }
+        if (result.ok && values.id && affected) {
+          await scheduleImpactNotice(
+            {
+              kind: "catalog_row_update",
+              id: values.id,
+              label: next.job_name,
+              field: "job_name",
+              note: `직무 「${next.job_name}」 의 분류 정보가 바뀌었습니다`,
+            },
+            affected,
+          );
         }
         return result;
       });
@@ -1474,7 +1486,7 @@ function JobCatalogList({
     });
   }
 
-  // 직군 → 직렬 → 행 으로 묶는다. 쿼리에서 이미 정렬돼 오므로 삽입 순서를 그대로 쓴다.
+  // 직군 → 직렬 → 행 으로 묶고, 저장된 표시 순서(group_sort/series_sort/sort)→이름 순으로 정렬한다.
   const grouped = useMemo(() => {
     const byGroup = new Map<string, Map<string, JobRow[]>>();
     for (const row of rows ?? []) {
@@ -1484,8 +1496,213 @@ function JobCatalogList({
       series.set(row.job_series, list);
       byGroup.set(row.job_group, series);
     }
-    return [...byGroup.entries()];
+    // 같은 묶음 안에서 정렬값이 갈릴 수 있어(업로드 기본값 0 등) 최솟값을 묶음의 순서로 쓴다.
+    const minSort = (lists: JobRow[][], key: "group_sort" | "series_sort") =>
+      Math.min(...lists.flat().map((r) => r[key]));
+    const entries = [...byGroup.entries()].map(([group, seriesMap]) => {
+      const seriesEntries = [...seriesMap.entries()];
+      for (const [, list] of seriesEntries) {
+        list.sort((a, b) => a.sort - b.sort || a.job_name.localeCompare(b.job_name, "ko"));
+      }
+      seriesEntries.sort(
+        (a, b) =>
+          minSort([a[1]], "series_sort") - minSort([b[1]], "series_sort") ||
+          a[0].localeCompare(b[0], "ko"),
+      );
+      return [group, new Map(seriesEntries)] as [string, Map<string, JobRow[]>];
+    });
+    entries.sort(
+      (a, b) =>
+        minSort([...a[1].values()], "group_sort") - minSort([...b[1].values()], "group_sort") ||
+        a[0].localeCompare(b[0], "ko"),
+    );
+    return entries;
   }, [rows]);
+
+  function invalidateCatalogList() {
+    void queryClient.invalidateQueries({ queryKey: ["master-job-catalog"] });
+    void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+  }
+
+  /**
+   * 직군·직렬 이름 일괄 수정. 먼저 confirm=false 로 영향 건수만 받아
+   * 「응답 n건이 옛 표기로 남습니다」를 확인받은 뒤 실제로 바꾼다. 응답 재연결은 하지 않는다.
+   */
+  async function submitHeaderRename() {
+    if (!renaming || renameBusy) return;
+    const to = renameValue.trim();
+    if (to === "" || to === renaming.from) {
+      setRenaming(null);
+      return;
+    }
+    setRenameBusy(true);
+    try {
+      const headers = await authHeaders();
+      const call = (confirm: boolean) =>
+        renaming.kind === "group"
+          ? renameJobGroup({ data: { from: renaming.from, to, confirm }, headers })
+          : renameJobSeries({
+              data: { group: renaming.group, from: renaming.from, to, confirm },
+              headers,
+            });
+      const previewed = await call(false);
+      if (!previewed.ok) {
+        toast.error(previewed.message);
+        return;
+      }
+      if (previewed.responses + previewed.examples > 0) {
+        const parts = [`응답 ${previewed.responses}건`];
+        if (previewed.examples > 0) parts.push(`예시 ${previewed.examples}건`);
+        const label = renaming.kind === "group" ? "직군" : "직렬";
+        if (
+          !window.confirm(
+            `${label} 「${renaming.from}」 → 「${to}」 로 바꾸면 ${parts.join(" · ")}이 옛 표기로 남습니다. 계속할까요?`,
+          )
+        ) {
+          return;
+        }
+      }
+      const result = await call(true);
+      if (!result.ok) {
+        toast.error(result.message);
+        return;
+      }
+      toast.success(result.message);
+      // 펼쳐 둔 직군 이름도 새 이름으로 바꿔 펼침 상태를 잃지 않는다.
+      if (renaming.kind === "group") {
+        setOpenGroups((prev) => prev.map((g) => (g === renaming.from ? to : g)));
+      }
+      setRenaming(null);
+      invalidateCatalogList();
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setRenameBusy(false);
+    }
+  }
+
+  /** names 배열에서 index↔index+dir 을 맞바꾸고 표시 순서(0,1,2…)를 통째로 저장한다. */
+  function swapped<T>(list: T[], index: number, dir: -1 | 1): T[] | null {
+    const target = index + dir;
+    if (target < 0 || target >= list.length) return null;
+    const next = [...list];
+    [next[index], next[target]] = [next[target]!, next[index]!];
+    return next;
+  }
+
+  function moveGroup(index: number, dir: -1 | 1) {
+    const order = swapped(
+      grouped.map(([group]) => group),
+      index,
+      dir,
+    );
+    if (!order) return;
+    edit.mutate(async () =>
+      reorderJobCatalog({
+        data: { kind: "group", items: order.map((group, i) => ({ group, sort: i })) },
+        headers: await authHeaders(),
+      }),
+    );
+  }
+
+  function moveSeries(group: string, seriesNames: string[], index: number, dir: -1 | 1) {
+    const order = swapped(seriesNames, index, dir);
+    if (!order) return;
+    edit.mutate(async () =>
+      reorderJobCatalog({
+        data: { kind: "series", group, items: order.map((series, i) => ({ series, sort: i })) },
+        headers: await authHeaders(),
+      }),
+    );
+  }
+
+  function moveJob(list: JobRow[], index: number, dir: -1 | 1) {
+    const order = swapped(list, index, dir);
+    if (!order) return;
+    edit.mutate(async () =>
+      reorderJobCatalog({
+        data: { kind: "job", items: order.map((row, i) => ({ id: row.id, sort: i })) },
+        headers: await authHeaders(),
+      }),
+    );
+  }
+
+  /** 직군·직렬 헤더 공용 이름 수정 칸. */
+  const renameEditor = (
+    <div className="flex flex-1 items-center gap-2 py-1">
+      <Input
+        autoFocus
+        className="h-8 w-56 text-sm"
+        value={renameValue}
+        aria-label="새 이름"
+        disabled={renameBusy}
+        onChange={(e) => setRenameValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") void submitHeaderRename();
+          if (e.key === "Escape") setRenaming(null);
+        }}
+      />
+      <Button
+        size="sm"
+        className="h-7"
+        disabled={renameBusy || renameValue.trim() === ""}
+        onClick={() => void submitHeaderRename()}
+      >
+        {renameBusy ? "저장 중..." : "저장"}
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-7"
+        aria-label="이름 수정 취소"
+        onClick={() => setRenaming(null)}
+      >
+        <X className="size-4" />
+      </Button>
+    </div>
+  );
+
+  /** 헤더 옆 공용 컨트롤 — 이름 수정 · ↑ · ↓. */
+  const headerButtons = (opts: {
+    label: string;
+    onRename: () => void;
+    onMove: (dir: -1 | 1) => void;
+    first: boolean;
+    last: boolean;
+  }) => (
+    <div className="flex shrink-0 items-center gap-0.5">
+      <Button
+        variant="ghost"
+        size="icon"
+        className="size-7"
+        aria-label={`${opts.label} 이름 수정`}
+        disabled={edit.isPending || renameBusy}
+        onClick={opts.onRename}
+      >
+        <Pencil className="size-3.5" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="size-7"
+        aria-label={`${opts.label} 위로 이동`}
+        disabled={edit.isPending || opts.first}
+        onClick={() => opts.onMove(-1)}
+      >
+        <ChevronUp className="size-4" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="size-7"
+        aria-label={`${opts.label} 아래로 이동`}
+        disabled={edit.isPending || opts.last}
+        onClick={() => opts.onMove(1)}
+      >
+        <ChevronDown className="size-4" />
+      </Button>
+    </div>
+  );
 
   return (
     <div className="space-y-3 rounded-xl border bg-card p-4">
@@ -1526,21 +1743,56 @@ function JobCatalogList({
           value={openGroups}
           onValueChange={setOpenGroups}
         >
-          {grouped.map(([group, seriesMap]) => {
+          {grouped.map(([group, seriesMap], groupIndex) => {
             const count = [...seriesMap.values()].reduce((sum, list) => sum + list.length, 0);
+            const seriesNames = [...seriesMap.keys()];
             return (
               <AccordionItem key={group} value={group}>
-                <AccordionTrigger className="text-sm">
-                  {group}
-                  <span className="ml-2 text-xs font-normal text-muted-foreground">
-                    직렬 {seriesMap.size} · 직무 {count}
-                  </span>
-                </AccordionTrigger>
+                <div className="flex items-center gap-1">
+                  {renaming?.kind === "group" && renaming.from === group ? (
+                    renameEditor
+                  ) : (
+                    <AccordionTrigger className="flex-1 text-sm">
+                      {group}
+                      <span className="ml-2 text-xs font-normal text-muted-foreground">
+                        직렬 {seriesMap.size} · 직무 {count}
+                      </span>
+                    </AccordionTrigger>
+                  )}
+                  {headerButtons({
+                    label: `${group} 직군`,
+                    onRename: () => {
+                      setRenaming({ kind: "group", from: group });
+                      setRenameValue(group);
+                    },
+                    onMove: (dir) => moveGroup(groupIndex, dir),
+                    first: groupIndex === 0,
+                    last: groupIndex === grouped.length - 1,
+                  })}
+                </div>
                 <AccordionContent className="space-y-3">
-                  {[...seriesMap.entries()].map(([series, list]) => (
+                  {[...seriesMap.entries()].map(([series, list], seriesIndex) => (
                     <div key={series} className="space-y-1">
-                      <p className="text-xs font-medium text-primary">{series}</p>
-                      {list.map((row) =>
+                      <div className="flex items-center gap-1">
+                        {renaming?.kind === "series" &&
+                        renaming.group === group &&
+                        renaming.from === series ? (
+                          renameEditor
+                        ) : (
+                          <p className="flex-1 text-xs font-medium text-primary">{series}</p>
+                        )}
+                        {headerButtons({
+                          label: `${series} 직렬`,
+                          onRename: () => {
+                            setRenaming({ kind: "series", group, from: series });
+                            setRenameValue(series);
+                          },
+                          onMove: (dir) => moveSeries(group, seriesNames, seriesIndex, dir),
+                          first: seriesIndex === 0,
+                          last: seriesIndex === seriesNames.length - 1,
+                        })}
+                      </div>
+                      {list.map((row, rowIndex) =>
                         editing?.id === row.id ? (
                           <JobRowEditor
                             key={row.id}
@@ -1572,6 +1824,26 @@ function JobCatalogList({
                                     .join(" · ")
                                 : "공통"}
                             </span>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-7"
+                              aria-label={`${row.job_name} 위로 이동`}
+                              disabled={edit.isPending || rowIndex === 0}
+                              onClick={() => moveJob(list, rowIndex, -1)}
+                            >
+                              <ChevronUp className="size-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-7"
+                              aria-label={`${row.job_name} 아래로 이동`}
+                              disabled={edit.isPending || rowIndex === list.length - 1}
+                              onClick={() => moveJob(list, rowIndex, 1)}
+                            >
+                              <ChevronDown className="size-4" />
+                            </Button>
                             <Button
                               size="sm"
                               variant="ghost"
@@ -1627,98 +1899,6 @@ function JobCatalogList({
       )}
 
       <ImpactConfirmDialog pending={pending} onClose={() => setPending(null)} />
-    </div>
-  );
-}
-
-/**
- * 직군·직렬·직무명 변경 직후의 재연결 안내 (W2). 옛 이름으로 제출된 응답을 새 이름에 맞추는
- * 흐름을 그 자리에서 잇는다 — 기존 suggestResponseMapping / applyResponseMapping 을 해당 직무로
- * 한정해 재사용하고, 전수 실행은 아래 「기존 응답 연결 제안」 구획에 그대로 남긴다.
- */
-function JobRemapHint({
-  hint,
-  onDone,
-  onClose,
-}: {
-  hint: { next: CatalogRowNext; count: number };
-  /** 적용까지 끝났을 때 — 부모가 재조회하고 안내를 닫는다. */
-  onDone: () => void;
-  onClose: () => void;
-}) {
-  const [items, setItems] = useState<MappingSuggestion[] | null>(null);
-
-  const suggest = useMutation({
-    mutationFn: async () => suggestResponseMapping({ headers: await authHeaders() }),
-    onSuccess: (all) => {
-      // 이 직무로 제안된 것만 남긴다 — 전수 재정렬은 아래 구획의 몫이다.
-      const filtered = all.filter(
-        (s) =>
-          s.suggested.job_group === hint.next.job_group &&
-          s.suggested.job_series === hint.next.job_series &&
-          s.suggested.job_name === hint.next.job_name,
-      );
-      setItems(filtered);
-      if (filtered.length === 0) {
-        toast.info(
-          "이 직무로 맞출 응답 제안이 없습니다. 유사도가 낮으면 「기존 응답 연결 제안」에서 직접 확인하세요.",
-        );
-      }
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-
-  const apply = useMutation({
-    mutationFn: async () => {
-      const payload = (items ?? []).map((s) => ({ responseId: s.responseId, ...s.suggested }));
-      if (payload.length === 0) throw new Error("적용할 제안이 없습니다.");
-      return applyResponseMapping({ data: { items: payload }, headers: await authHeaders() });
-    },
-    onSuccess: (result) => {
-      toast.success(`${result.updated}건의 응답 직무를 새 이름에 맞췄습니다.`);
-      onDone();
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-
-  const busy = suggest.isPending || apply.isPending;
-  const label = `${hint.next.job_group} / ${hint.next.job_series} / ${hint.next.job_name}`;
-
-  return (
-    <div className="space-y-2 rounded-xl border border-primary/40 bg-primary/5 p-3 text-sm">
-      <div className="flex flex-wrap items-center gap-2">
-        <p className="flex-1">
-          기존 응답 {hint.count}건이 옛 이름을 갖고 있습니다 — 새 이름 「{label}」 에 맞출 수
-          있습니다.
-        </p>
-        {items === null && (
-          <Button size="sm" disabled={busy} onClick={() => suggest.mutate()}>
-            {suggest.isPending ? "확인 중..." : "응답 이름 맞추기"}
-          </Button>
-        )}
-        <Button size="sm" variant="ghost" aria-label="안내 닫기" onClick={onClose}>
-          <X className="size-4" />
-        </Button>
-      </div>
-      {items !== null && items.length > 0 && (
-        <>
-          <ul className="max-h-40 space-y-0.5 overflow-y-auto text-xs text-muted-foreground">
-            {items.slice(0, 8).map((s) => (
-              <li key={s.responseId}>
-                {s.participantName || "-"} ·{" "}
-                {[s.current.job_group, s.current.job_series, s.current.job_name]
-                  .filter(Boolean)
-                  .join(" / ") || "-"}{" "}
-                → {label}
-              </li>
-            ))}
-            {items.length > 8 && <li>외 {items.length - 8}건</li>}
-          </ul>
-          <Button size="sm" disabled={busy} onClick={() => apply.mutate()}>
-            {apply.isPending ? "적용 중..." : `제안 ${items.length}건 적용`}
-          </Button>
-        </>
-      )}
     </div>
   );
 }
@@ -2165,12 +2345,7 @@ function JobDraftPanel({ onApplied }: { onApplied: () => void }) {
 
 function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
   const queryClient = useQueryClient();
-  const { companyId } = useCompanyScope();
-  const [suggestions, setSuggestions] = useState<MappingSuggestion[] | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editingJob, setEditingJob] = useState<JobEdit | null>(null);
-  // 직군·직렬·직무명이 바뀐 직후, 옛 이름 응답의 재연결을 권하는 안내.
-  const [remapHint, setRemapHint] = useState<{ next: CatalogRowNext; count: number } | null>(null);
   const [notifyOnSave, setNotifyOnSave] = usePersistedState("master-notify-on-save", true);
 
   // 요약 스트립용. 목록과 같은 키라 요청은 한 번만 나간다.
@@ -2179,7 +2354,9 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("job_catalog")
-        .select("id, job_group, job_series, job_name, definition, company_ids")
+        .select(
+          "id, job_group, job_series, job_name, definition, company_ids, group_sort, series_sort, sort",
+        )
         .order("job_group")
         .order("job_series")
         .order("job_name");
@@ -2202,35 +2379,7 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
 
   const { data: audience, isFetching: audienceLoading } = useImpactAudience(impactTarget);
 
-  const suggest = useMutation({
-    mutationFn: async () => suggestResponseMapping({ headers: await authHeaders() }),
-    onSuccess: (items) => {
-      setSuggestions(items);
-      setSelected(new Set(items.map((i) => i.responseId)));
-      if (items.length === 0) toast.info("연결을 제안할 응답이 없습니다.");
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-
-  const apply = useMutation({
-    mutationFn: async () => {
-      const items = (suggestions ?? [])
-        .filter((s) => selected.has(s.responseId))
-        .map((s) => ({ responseId: s.responseId, ...s.suggested }));
-      if (items.length === 0) throw new Error("적용할 항목을 선택하세요.");
-      return applyResponseMapping({ data: { items }, headers: await authHeaders() });
-    },
-    onSuccess: (result) => {
-      toast.success(`${result.updated}건의 응답 직무를 갱신했습니다.`);
-      setSuggestions(null);
-      setSelected(new Set());
-      void queryClient.invalidateQueries({ queryKey: ["master-status"] });
-    },
-    onError: (err) => toast.error(errorMessage(err)),
-  });
-
   const invalidateCatalog = () => {
-    setSuggestions(null);
     void queryClient.invalidateQueries({ queryKey: ["master-job-catalog"] });
     void queryClient.invalidateQueries({ queryKey: ["master-status"] });
     void queryClient.invalidateQueries({ queryKey: ["catalog-versions"] });
@@ -2248,9 +2397,7 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
     { id: "job-list", label: "직무분류표", count: catalogRows?.length ?? 0 },
     { id: "job-draft", label: "AI 가안" },
     { id: "job-upload", label: "파일로 올리기" },
-    { id: "job-diagnosis", label: "중복·과분할 진단" },
     { id: "job-versions", label: "버전 관리" },
-    { id: "job-mapping", label: "응답 연결 제안" },
   ];
 
   return (
@@ -2290,17 +2437,6 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
 
       <SectionNav sections={sections} />
 
-      {remapHint && (
-        <JobRemapHint
-          hint={remapHint}
-          onDone={() => {
-            setRemapHint(null);
-            void queryClient.invalidateQueries({ queryKey: ["master-status"] });
-          }}
-          onClose={() => setRemapHint(null)}
-        />
-      )}
-
       <CollapsibleSection
         storageKey="master-job"
         id="job-list"
@@ -2313,9 +2449,6 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
           audienceLoading={audienceLoading}
           notifyOnSave={notifyOnSave}
           onEditingChange={setEditingJob}
-          onRenamed={(next, count) => {
-            if (count > 0) setRemapHint({ next, count });
-          }}
         />
       </CollapsibleSection>
 
@@ -2361,118 +2494,12 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
 
       <CollapsibleSection
         storageKey="master-job"
-        id="job-diagnosis"
-        title="중복·과분할 진단"
-        subtitle="응답에 적힌 과업을 근거로 합칠 직무·나눌 직무 후보를 찾습니다. 자동으로 바꾸지 않습니다."
-        defaultCollapsed
-      >
-        <JobDiagnosisPanel companyId={companyId === "all" ? null : companyId} />
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        storageKey="master-job"
         id="job-versions"
         title="버전 관리"
         subtitle="교체·복원 전 저장본을 만들고 서로 비교합니다."
         defaultCollapsed
       >
         <CatalogVersionPanel />
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        storageKey="master-job"
-        id="job-mapping"
-        title="기존 응답 연결 제안"
-        subtitle="자유 입력된 직군·직렬·직무를 직무분류표 항목과 대조합니다."
-        defaultCollapsed
-      >
-      <div className="space-y-3 rounded-xl border bg-card p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <p className="text-sm font-medium">기존 응답 연결 제안</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              응답자가 자유 입력한 직군·직렬·직무를 직무분류표 항목과 대조해 유사도 60% 이상만
-              제안합니다. 적용회사 열은 세미콜론(;)으로 복수 지정합니다.
-            </p>
-          </div>
-          <Button size="sm" disabled={suggest.isPending} onClick={() => suggest.mutate()}>
-            <Sparkles className="size-4" />
-            제안 받기
-          </Button>
-        </div>
-
-        {suggestions && suggestions.length > 0 && (
-          <>
-            <div className="overflow-x-auto rounded-lg border">
-              <table className="w-full min-w-[640px] text-xs">
-                <thead className="bg-secondary text-left text-muted-foreground">
-                  <tr>
-                    <th className="w-10 px-3 py-2" />
-                    <th className="px-3 py-2 font-medium">응답자</th>
-                    <th className="px-3 py-2 font-medium">현재 표기</th>
-                    <th className="px-3 py-2 font-medium">직무분류표 제안</th>
-                    <th className="px-3 py-2 font-medium">유사도</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {suggestions.map((s) => (
-                    <tr key={s.responseId} className="border-t">
-                      <td className="px-3 py-2">
-                        <Checkbox
-                          checked={selected.has(s.responseId)}
-                          aria-label={`${s.participantName} 제안 선택`}
-                          onCheckedChange={(checked) =>
-                            setSelected((prev) => {
-                              const next = new Set(prev);
-                              if (checked === true) next.add(s.responseId);
-                              else next.delete(s.responseId);
-                              return next;
-                            })
-                          }
-                        />
-                      </td>
-                      <td className="px-3 py-2 font-medium">{s.participantName || "-"}</td>
-                      <td className="px-3 py-2 text-muted-foreground">
-                        {[s.current.job_group, s.current.job_series, s.current.job_name]
-                          .filter(Boolean)
-                          .join(" / ") || "-"}
-                      </td>
-                      <td className="px-3 py-2">
-                        {[s.suggested.job_group, s.suggested.job_series, s.suggested.job_name].join(
-                          " / ",
-                        )}
-                      </td>
-                      <td className="px-3 py-2">{Math.round(s.score * 100)}%</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() =>
-                  setSelected((prev) =>
-                    prev.size === suggestions.length
-                      ? new Set()
-                      : new Set(suggestions.map((s) => s.responseId)),
-                  )
-                }
-              >
-                {selected.size === suggestions.length ? "전체 해제" : "전체 선택"}
-              </Button>
-              <Button
-                size="sm"
-                disabled={apply.isPending || selected.size === 0}
-                onClick={() => apply.mutate()}
-              >
-                선택 {selected.size}건 적용
-              </Button>
-            </div>
-          </>
-        )}
-      </div>
       </CollapsibleSection>
 
       <StatusLine kind="job" />

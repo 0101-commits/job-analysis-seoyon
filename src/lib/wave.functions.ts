@@ -24,10 +24,6 @@ const dateStr = z
   .regex(/^\d{4}-\d{2}-\d{2}$/, "날짜 형식이 올바르지 않습니다.")
   .nullable();
 
-function normalizeReminderDays(days: number[]) {
-  return [...new Set(days)].sort((a, b) => b - a);
-}
-
 export type Wave = {
   id: string;
   seq: number;
@@ -35,7 +31,6 @@ export type Wave = {
   kind: string;
   deadline: string | null;
   status: string;
-  reminderDays: number[];
   note: string | null;
   /** 차수가 속한 계열사 (v5 전사 모드). seq 는 계열사 안에서만 유일하다. */
   companyId: string;
@@ -69,7 +64,7 @@ export const listWaves = createServerFn({ method: "GET" })
 
     let waveQuery = supabaseAdmin
       .from("survey_waves")
-      .select("id, seq, name, kind, deadline, status, reminder_days, note, company_id, archived_at")
+      .select("id, seq, name, kind, deadline, status, note, company_id, archived_at")
       .order("seq");
     if (data.companyId) waveQuery = waveQuery.eq("company_id", data.companyId);
     if (!data.includeArchived) waveQuery = waveQuery.is("archived_at", null);
@@ -133,7 +128,6 @@ export const listWaves = createServerFn({ method: "GET" })
       kind: w.kind,
       deadline: w.deadline,
       status: w.status,
-      reminderDays: w.reminder_days ?? [],
       note: w.note,
       companyId: w.company_id,
       companyName: companyName.get(w.company_id) ?? "",
@@ -187,7 +181,6 @@ export const createWave = createServerFn({ method: "POST" })
         name: z.string().trim().min(1).max(60),
         kind: z.enum(KINDS),
         deadline: dateStr.optional(),
-        reminderDays: z.array(z.number().int().min(0).max(60)).max(10).optional(),
       })
       .parse(input),
   )
@@ -214,7 +207,6 @@ export const createWave = createServerFn({ method: "POST" })
         name: data.name,
         kind: data.kind,
         deadline: data.deadline ?? null,
-        ...(data.reminderDays ? { reminder_days: normalizeReminderDays(data.reminderDays) } : {}),
       })
       .select("id")
       .single();
@@ -239,7 +231,6 @@ export const updateWave = createServerFn({ method: "POST" })
         name: z.string().trim().min(1).max(60).optional(),
         kind: z.enum(KINDS).optional(),
         deadline: dateStr.optional(),
-        reminderDays: z.array(z.number().int().min(0).max(60)).max(10).optional(),
         note: z.string().trim().max(300).nullable().optional(),
         // '마감' 전환은 closeWave 전용 — 되돌릴 수 없는 행동이라 별도 확인 절차로 분리한다.
         status: z.enum(["준비", "진행"]).optional(),
@@ -264,9 +255,6 @@ export const updateWave = createServerFn({ method: "POST" })
     if (data.name !== undefined) patch["name"] = data.name;
     if (data.kind !== undefined) patch["kind"] = data.kind;
     if (data.deadline !== undefined) patch["deadline"] = data.deadline;
-    if (data.reminderDays !== undefined) {
-      patch["reminder_days"] = normalizeReminderDays(data.reminderDays);
-    }
     if (data.note !== undefined) patch["note"] = data.note;
     if (data.status !== undefined) patch["status"] = data.status;
     if (Object.keys(patch).length === 0) return { ok: true };
@@ -495,9 +483,9 @@ export const waveDeleteImpact = createServerFn({ method: "GET" })
   });
 
 /**
- * 차수 완전 삭제 (v5). 보관된 차수만 지울 수 있다 — 목록에서 바로 지우는 실수를 막는
- * 2단계 장치(보관 → 삭제)를 서버에서도 지킨다. FK 는 SET NULL 이라 참여자·응답·발송
- * 데이터는 남지만 차수 귀속이 풀린다.
+ * 차수 삭제. v6부터 보관 여부와 무관하게 바로 지울 수 있다 — 실수 방지는 UI 의
+ * 영향 규모(waveDeleteImpact) 확인 다이얼로그가 맡는다. FK 는 SET NULL 이라
+ * 참여자·응답·발송 데이터는 남지만 차수 귀속이 풀린다.
  */
 export const deleteWave = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -509,12 +497,11 @@ export const deleteWave = createServerFn({ method: "POST" })
 
     const { data: existing, error: findErr } = await supabaseAdmin
       .from("survey_waves")
-      .select("name, seq, company_id, archived_at")
+      .select("name, seq, company_id")
       .eq("id", data.id)
       .maybeSingle();
     if (findErr) throw new Error(findErr.message);
     if (!existing) throw new Error("차수를 찾을 수 없습니다.");
-    if (!existing.archived_at) throw new Error("보관된 차수만 삭제할 수 있습니다.");
 
     const { error } = await supabaseAdmin.from("survey_waves").delete().eq("id", data.id);
     if (error) throw new Error(error.message);
@@ -537,11 +524,12 @@ export type WaveDeadline = {
   name: string;
   kind: string;
   deadline: string;
-  reminderDays: number[];
 };
 
 /**
- * 마감이 지정된, 아직 마감되지 않은 차수의 마감·리마인더 목록.
+ * 마감이 지정된, 아직 마감되지 않은 차수의 마감 목록.
+ * 며칠 전에 독려할지는 계열사 설정(D-n)만 쓴다 — 차수 reminder_days 는 v6에서
+ * 폐지됐다(컬럼만 잔존).
  *
  * mailer.server.ts 의 `runReminders` 는 지금 survey_settings(계열사 단위 마감)만 순회한다.
  * 차수별 마감도 독려 대상이 되려면 그 함수가 이 헬퍼도 함께 돌며, 대상을 회사 전체가 아니라
@@ -554,7 +542,7 @@ export async function listWaveDeadlinesForReminders(
 ): Promise<WaveDeadline[]> {
   const { data, error } = await admin
     .from("survey_waves")
-    .select("id, company_id, name, kind, deadline, reminder_days")
+    .select("id, company_id, name, kind, deadline")
     .neq("status", "마감")
     // 보관된 차수는 발송 대상에서 빠진다 (v5)
     .is("archived_at", null)
@@ -567,7 +555,6 @@ export async function listWaveDeadlinesForReminders(
       name: string;
       kind: string;
       deadline: string | null;
-      reminder_days: number[] | null;
     }[]
   )
     .filter((w): w is typeof w & { deadline: string } => w.deadline !== null)
@@ -577,6 +564,5 @@ export async function listWaveDeadlinesForReminders(
       name: w.name,
       kind: w.kind,
       deadline: w.deadline,
-      reminderDays: w.reminder_days ?? [],
     }));
 }

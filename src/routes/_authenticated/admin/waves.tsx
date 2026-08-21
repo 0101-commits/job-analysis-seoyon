@@ -2,7 +2,7 @@ import { useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ArrowLeft, Lock, Plus, RotateCw } from "lucide-react";
+import { ArrowLeft, Lock, MoreHorizontal, Plus, RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -15,6 +15,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Select,
   SelectContent,
@@ -93,13 +99,12 @@ const KIND_HINT: Record<Kind, string> = {
   신규입사: "1차 이후 입사한 인원만 받는 조사입니다.",
 };
 
-type Draft = { name: string; kind: Kind; deadline: string; reminderDays: string; note: string };
+type Draft = { name: string; kind: Kind; deadline: string; note: string };
 
 const EMPTY_DRAFT: Draft = {
   name: "",
   kind: "보완",
   deadline: "",
-  reminderDays: "7, 3, 1",
   note: "",
 };
 
@@ -116,17 +121,6 @@ function errorMessage(err: unknown) {
 
 function origin() {
   return typeof window === "undefined" ? undefined : window.location.origin;
-}
-
-/** 「7, 3, 1」·「D-7 D-3」처럼 섞어 써도 받는다. settings.tsx 의 같은 규칙과 맞춘다. */
-function parseReminderDays(text: string) {
-  const days = text
-    .split(/[,\s]+/)
-    .map((v) => v.trim())
-    .filter(Boolean)
-    .map((v) => Number(v.replace(/^D-/i, "")));
-  if (days.some((d) => !Number.isInteger(d) || d < 0 || d > 60)) return null;
-  return days;
 }
 
 function formatDate(value: string | null) {
@@ -231,7 +225,6 @@ function WavesPage() {
       name: w.name,
       kind: w.kind as Kind,
       deadline: w.deadline ?? "",
-      reminderDays: w.reminderDays.join(", "),
       note: w.note ?? "",
     });
     setDialogOpen(true);
@@ -239,10 +232,6 @@ function WavesPage() {
 
   const saveMutation = useMutation({
     mutationFn: async () => {
-      const days = parseReminderDays(draft.reminderDays);
-      if (days === null) {
-        throw new Error("독려 안내 일자는 0~60 사이 숫자를 쉼표로 구분해 입력해 주세요.");
-      }
       if (!draft.name.trim()) throw new Error("차수 이름을 입력해 주세요.");
       const headers = await authHeaders();
       if (editing) {
@@ -252,7 +241,6 @@ function WavesPage() {
             name: draft.name.trim(),
             kind: draft.kind,
             deadline: draft.deadline || null,
-            reminderDays: days,
             note: draft.note.trim() || null,
           },
           headers,
@@ -266,7 +254,6 @@ function WavesPage() {
           name: draft.name.trim(),
           kind: draft.kind,
           deadline: draft.deadline || null,
-          reminderDays: days,
         },
         headers,
       });
@@ -327,13 +314,13 @@ function WavesPage() {
     }
   }
 
-  /** 완전 삭제 확인 — 영향 규모(배정·응답·발송)를 먼저 세어 보여 준다. */
+  /** 삭제 확인 — 영향 규모(배정·응답·발송)를 먼저 세어 보여 준다 (v6: 보관 없이도 삭제). */
   async function confirmDelete(w: Wave) {
     try {
       const impact = await waveDeleteImpact({ data: { id: w.id }, headers: await authHeaders() });
       if (
         window.confirm(
-          `「${w.name}」 차수를 완전히 삭제할까요?\n배정 참여자 ${impact.participants}명 · 응답 ${impact.responses}건 · 발송 기록 ${impact.mailBatches}건의 차수 연결이 해제됩니다(데이터 자체는 남습니다). 이 차수가 어느 발송·제출의 기준이었는지 기록은 사라집니다.`,
+          `「${w.name}」 차수를 삭제할까요?\n배정 참여자 ${impact.participants}명 · 응답 ${impact.responses}건 · 발송 기록 ${impact.mailBatches}건의 차수 연결이 해제됩니다. 데이터 자체는 남지만 이 차수 기록은 사라집니다. 숨기기만 하려면 보관을 쓰세요.`,
         )
       ) {
         deleteMutation.mutate(w.id);
@@ -396,6 +383,7 @@ function WavesPage() {
           }}
           onArchive={() => confirmArchive(selected)}
           onUnarchive={() => unarchiveMutation.mutate(selected.id)}
+          onDelete={() => void confirmDelete(selected)}
           onSaved={invalidate}
         />
       ) : (
@@ -432,26 +420,33 @@ function WavesPage() {
           ) : (
           <div className="overflow-x-auto rounded-xl border bg-card">
             <div className={scoped ? "min-w-[880px]" : "min-w-[990px]"}>
-              <div
-                className={`grid ${gridCols} gap-2 border-b bg-secondary px-4 py-2.5 text-xs font-medium text-muted-foreground`}
-              >
-                <span>차수</span>
-                {!scoped ? <span>계열사</span> : null}
-                <span>이름</span>
-                <span>종류</span>
-                <span>마감</span>
-                <span>상태</span>
-                <span>배정 → 제출</span>
-                <span>최근 발송</span>
+              <div className="flex items-center border-b bg-secondary">
+                <div
+                  className={`grid ${gridCols} flex-1 gap-2 px-4 py-2.5 text-xs font-medium text-muted-foreground`}
+                >
+                  <span>차수</span>
+                  {!scoped ? <span>계열사</span> : null}
+                  <span>이름</span>
+                  <span>종류</span>
+                  <span>마감</span>
+                  <span>상태</span>
+                  <span>배정 → 제출</span>
+                  <span>최근 발송</span>
+                </div>
+                {/* 행 끝 ⋯메뉴 자리와 폭을 맞추는 빈 칸 */}
+                <span className="w-10 shrink-0" />
               </div>
               {rows.map((w) => {
                 const dday = ddayLabel(w.deadline);
                 return (
-                  <button
+                  <div
                     key={w.id}
+                    className="flex items-center border-b last:border-b-0 hover:bg-secondary/40"
+                  >
+                  <button
                     type="button"
                     onClick={() => openDetail(w.id)}
-                    className={`grid w-full ${gridCols} items-center gap-2 border-b px-4 py-3 text-left text-sm last:border-b-0 hover:bg-secondary/40`}
+                    className={`grid ${gridCols} min-w-0 flex-1 items-center gap-2 px-4 py-3 text-left text-sm`}
                   >
                     <span className="tabular-nums text-muted-foreground">{w.seq}</span>
                     {!scoped ? <span className="truncate text-xs">{w.companyName}</span> : null}
@@ -503,6 +498,29 @@ function WavesPage() {
                       {formatDateTime(w.lastSentAt) ?? "발송 없음"}
                     </span>
                   </button>
+                  {/* v6: 보관 없이도 바로 삭제할 수 있다 — 확인 다이얼로그가 영향 규모를 보여 준다. */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="mr-1 size-8 shrink-0"
+                        aria-label={`「${w.name}」 차수 메뉴`}
+                      >
+                        <MoreHorizontal className="size-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        className="text-destructive"
+                        disabled={deleteMutation.isPending}
+                        onClick={() => void confirmDelete(w)}
+                      >
+                        삭제
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  </div>
                 );
               })}
             </div>
@@ -636,15 +654,6 @@ function WavesPage() {
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="wave-reminder">독려 안내 일자 (D-N, 쉼표로 구분)</Label>
-              <Input
-                id="wave-reminder"
-                value={draft.reminderDays}
-                onChange={(e) => setDraft((d) => ({ ...d, reminderDays: e.target.value }))}
-                placeholder="7, 3, 1"
-              />
-            </div>
-            <div className="space-y-1.5">
               <Label htmlFor="wave-note">메모 (선택)</Label>
               <Textarea
                 id="wave-note"
@@ -681,6 +690,7 @@ function WaveDetail({
   onClose,
   onArchive,
   onUnarchive,
+  onDelete,
   onSaved,
 }: {
   wave: Wave;
@@ -690,26 +700,21 @@ function WaveDetail({
   onClose: () => void;
   onArchive: () => void;
   onUnarchive: () => void;
+  onDelete: () => void;
   onSaved: () => void;
 }) {
   const closed = wave.status === "마감";
   const archived = !!wave.archivedAt;
   const [deadline, setDeadline] = useState(wave.deadline ?? "");
-  const [reminderText, setReminderText] = useState(wave.reminderDays.join(", "));
 
   const scheduleMutation = useMutation({
-    mutationFn: async () => {
-      const days = parseReminderDays(reminderText);
-      if (days === null) {
-        throw new Error("독려 안내 일자는 0~60 사이 숫자를 쉼표로 구분해 입력해 주세요.");
-      }
-      return updateWave({
-        data: { id: wave.id, deadline: deadline || null, reminderDays: days },
+    mutationFn: async () =>
+      updateWave({
+        data: { id: wave.id, deadline: deadline || null },
         headers: await authHeaders(),
-      });
-    },
+      }),
     onSuccess: () => {
-      toast.success("마감·독려 일정을 저장했습니다.");
+      toast.success("마감일을 저장했습니다.");
       onSaved();
     },
     onError: (err) => toast.error(errorMessage(err)),
@@ -774,6 +779,9 @@ function WaveDetail({
               </Button>
             </>
           )}
+          <Button size="sm" variant="ghost" className="text-destructive" onClick={onDelete}>
+            삭제
+          </Button>
         </div>
       </div>
 
@@ -820,14 +828,14 @@ function WaveDetail({
         <MailBatchHistory waveId={wave.id} />
       </section>
 
-      {/* ④ 마감·독려 */}
+      {/* ④ 마감 — 독려 일정(D-n)은 v6부터 계열사 설정에서만 정한다. */}
       <section className="rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-        <h2 className="text-base font-semibold">마감 · 독려</h2>
+        <h2 className="text-base font-semibold">마감</h2>
         <p className="mt-1 text-xs text-muted-foreground">
-          이 차수의 일정이 계열사 기본값보다 우선합니다. 독려 안내 일자를 비우면 계열사 설정을
-          따릅니다.
+          이 차수의 마감일이 계열사 기본값보다 우선합니다. 독려를 며칠 전에 보낼지는 계열사
+          설정을 따릅니다.
         </p>
-        <div className="mt-3 grid gap-3 sm:grid-cols-[200px_minmax(0,1fr)_auto]">
+        <div className="mt-3 grid gap-3 sm:grid-cols-[200px_auto]">
           <div className="space-y-1.5">
             <Label htmlFor="detail-deadline">제출 마감</Label>
             <Input
@@ -838,22 +846,12 @@ function WaveDetail({
               disabled={closed || archived}
             />
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="detail-reminder">독려 안내 일자 (D-N, 쉼표로 구분)</Label>
-            <Input
-              id="detail-reminder"
-              value={reminderText}
-              onChange={(e) => setReminderText(e.target.value)}
-              placeholder="7, 3, 1"
-              disabled={closed || archived}
-            />
-          </div>
           <div className="flex items-end">
             <Button
               onClick={() => scheduleMutation.mutate()}
               disabled={closed || archived || scheduleMutation.isPending}
             >
-              {scheduleMutation.isPending ? "저장 중..." : "일정 저장"}
+              {scheduleMutation.isPending ? "저장 중..." : "마감일 저장"}
             </Button>
           </div>
         </div>
@@ -862,7 +860,7 @@ function WaveDetail({
           <p className="text-sm font-medium">독려 안내 수동 실행</p>
           <p className="mt-1 text-xs text-muted-foreground">
             계열사 설정에 저장된 독려 안내 템플릿과 대상 조건으로 즉시 발송합니다. 계열사 단위로
-            돌며, 이 차수 배정자 중 차수 일정이 있는 사람에게는 차수 일정이 우선 적용됩니다.
+            돌며, 이 차수 배정자는 이 차수의 마감일 기준으로 판정됩니다.
           </p>
           <Button
             variant="outline"

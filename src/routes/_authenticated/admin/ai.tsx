@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/select";
 import { EmptyState } from "@/components/EmptyState";
 import { SectionNav } from "@/components/SectionNav";
+import { ScreenAlert } from "@/components/admin/ScreenAlert";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { JobDescriptionEditor } from "@/components/admin/JobDescriptionEditor";
@@ -143,6 +144,7 @@ function AiPage() {
           직무기술서 초안을 만들어 다듬고, 전 응답을 훑어 손봐야 할 건을 찾습니다. 한 건을 고치는
           일은 각 행의 [검토 화면 열기]에서 합니다.
         </p>
+        <ScreenAlert screen="ai" className="mt-3" />
       </div>
 
       {/* 1. AI 서버 연결 상태 */}
@@ -274,7 +276,7 @@ function whenShort(at: string | null) {
  * 기준값은 설정 화면(운영 기본 → 판정 기준)에서 바꿀 수 있다.
  */
 function JobCountBadge({ count, ok, caution }: { count: number; ok: number; caution: number }) {
-  const label = count >= ok ? "정상" : count >= caution ? "심층검토" : "인터뷰 필수";
+  const label = count >= ok ? "정상" : count >= caution ? "심층검토" : "확인 필요";
   const style =
     count >= ok
       ? "bg-success/15 text-success"

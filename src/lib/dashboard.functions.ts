@@ -522,3 +522,185 @@ export const getDashboardSignals = createServerFn({ method: "GET" })
       recheckResponses,
     };
   });
+
+/* ───────────────── 화면별 경고 묶음 (v6 G4 — 메뉴 배지·상단 경고) ───────────────── */
+
+/**
+ * 「확인할 일」을 대시보드 카드 대신 각 화면 상단 경고와 메뉴 배지로 보낸다.
+ * 화면(ScreenAlert)과 메뉴(AdminShell)가 같은 쿼리를 공유하므로 여기서 한 번만 센다.
+ * count 가 0인 항목은 아예 돌려주지 않는다 — 받는 쪽은 "있으면 그린다"만 하면 된다.
+ */
+export type ScreenSignalItem = {
+  key: string;
+  label: string;
+  count: number;
+  href: string;
+  /** critical 은 발송 실패처럼 방치하면 사람이 조사에서 빠지는 것. 나머지는 attention. */
+  tone: "attention" | "critical";
+};
+
+export type ScreenSignals = {
+  asOf: string;
+  review: ScreenSignalItem[];
+  ai: ScreenSignalItem[];
+  mail: ScreenSignalItem[];
+  participants: ScreenSignalItem[];
+};
+
+/** 아직 작성을 시작하지 않은 계정 상태 — index.tsx 의 NOT_STARTED 와 같은 정의. */
+const SIGNAL_NOT_STARTED = ["미발송", "초대발송", "미접속"];
+
+export const screenSignals = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<ScreenSignals> => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const admin = untyped(supabaseAdmin);
+
+    const [
+      people,
+      settings,
+      submitted,
+      draftSkills,
+      draftRequirements,
+      failed,
+      inquiries,
+      rechecks,
+    ] = await Promise.all([
+      fetchAll<{
+        company_id: string;
+        account_status: string;
+        invited_at: string | null;
+        last_seen_at: string | null;
+        mail_bounced_at: string | null;
+      }>((from, to) =>
+        admin
+          .from("participants")
+          .select("company_id, account_status, invited_at, last_seen_at, mail_bounced_at")
+          .eq("role", "respondent")
+          .is("archived_at", null)
+          .order("id")
+          .range(from, to),
+      ),
+      admin.from("survey_settings").select("company_id, stale_days"),
+      // 검토 적체·AI 게이트의 모수 — 제출 상태 응답만.
+      fetchAll<{
+        id: string;
+        submitted_at: string | null;
+        participants: { company_id: string } | null;
+      }>(async (from, to) => {
+        const { data, error } = await admin
+          .from("responses")
+          .select("id, submitted_at, participants(company_id)")
+          .eq("status", "submitted")
+          .order("id")
+          .range(from, to);
+        // to-one 관계는 런타임에 객체로 오지만 untyped 추론은 배열로 본다.
+        return {
+          data: (data ?? []) as unknown as {
+            id: string;
+            submitted_at: string | null;
+            participants: { company_id: string } | null;
+          }[],
+          error,
+        };
+      }),
+      fetchAll<{ response_id: string }>((from, to) =>
+        admin
+          .from("response_skills")
+          .select("response_id")
+          .eq("ai_draft", true)
+          .order("response_id")
+          .range(from, to),
+      ),
+      fetchAll<{ response_id: string }>((from, to) =>
+        admin
+          .from("response_requirements")
+          .select("response_id")
+          .eq("ai_draft", true)
+          .order("response_id")
+          .range(from, to),
+      ),
+      admin.from("mail_logs").select("id", { count: "exact", head: true }).eq("status", "실패"),
+      admin.from("inquiries").select("id", { count: "exact", head: true }).eq("status", "접수"),
+      admin
+        .from("responses")
+        .select("id", { count: "exact", head: true })
+        .eq("recheck_required", true),
+    ]);
+
+    const staleDaysBy = new Map(
+      ((settings.data ?? []) as { company_id: string; stale_days: number | null }[]).map((s) => [
+        s.company_id,
+        s.stale_days ?? 7,
+      ]),
+    );
+    const now = Date.now();
+    const daysOld = (value: string | null) =>
+      value === null ? null : Math.floor((now - new Date(value).getTime()) / 86_400_000);
+
+    // ⑴ 미착수 정체 — 안내는 받았는데 기준일 이상 움직임이 없는 사람.
+    const stalledNotStarted = people.filter((p) => {
+      if (!SIGNAL_NOT_STARTED.includes(p.account_status)) return false;
+      const elapsed = daysOld(p.last_seen_at ?? p.invited_at);
+      return elapsed !== null && elapsed >= (staleDaysBy.get(p.company_id) ?? 7);
+    }).length;
+
+    // ⑵ 메일 반송 — 주소를 고치기 전에는 어떤 안내도 닿지 않는다.
+    const bounced = people.filter((p) => p.mail_bounced_at !== null).length;
+
+    // ⑶ 검토 적체 — 제출 후 그 계열사 기준일이 지나도록 판정이 없는 응답.
+    const backlog = submitted.filter((r) => {
+      const elapsed = daysOld(r.submitted_at);
+      const limit = staleDaysBy.get(r.participants?.company_id ?? "") ?? 7;
+      return elapsed !== null && elapsed >= limit;
+    }).length;
+
+    // ⑷ 미확정 AI 제안 — 승인 게이트에 걸린 제출 응답만 (approveResponse 게이트 1과 같은 판정).
+    const submittedIds = new Set(submitted.map((r) => r.id));
+    const aiBlocked = new Set<string>();
+    for (const row of [...draftSkills, ...draftRequirements]) {
+      if (submittedIds.has(row.response_id)) aiBlocked.add(row.response_id);
+    }
+
+    const item = (
+      key: string,
+      label: string,
+      count: number,
+      href: string,
+      tone: ScreenSignalItem["tone"] = "attention",
+    ): ScreenSignalItem[] => (count > 0 ? [{ key, label, count, href, tone }] : []);
+
+    return {
+      asOf: new Date().toISOString(),
+      review: [
+        ...item("backlog", "기준일을 넘긴 검토 대기", backlog, "/admin/review?status=submitted"),
+        ...item(
+          "inquiry",
+          "답변을 기다리는 문의",
+          inquiries.count ?? 0,
+          "/admin/review?tab=inquiry",
+        ),
+      ],
+      ai: [...item("aiDraft", "승인을 막고 있는 미확정 AI 제안", aiBlocked.size, "/admin/ai")],
+      mail: [
+        ...item("failed", "발송 실패", failed.count ?? 0, "/admin/mail?tab=history", "critical"),
+        ...item("bounced", "메일 반송 참여자", bounced, "/admin/participants"),
+      ],
+      participants: [
+        ...item(
+          "stalled",
+          "안내 후 움직임이 없는 미착수",
+          stalledNotStarted,
+          "/admin/participants?status=초대발송,미접속",
+        ),
+        ...item(
+          "recheck",
+          "변경 재확인 대기",
+          rechecks.count ?? 0,
+          "/admin/participants?recheck=1",
+        ),
+      ],
+    };
+  });

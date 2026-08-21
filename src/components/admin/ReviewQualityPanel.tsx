@@ -79,7 +79,6 @@ export function ReviewQualityPanel({
         toast.error("승인된 건이 없습니다. 아래 사유를 확인하세요.");
       }
       void queryClient.invalidateQueries({ queryKey: ["review-queue"] });
-      void queryClient.invalidateQueries({ queryKey: ["interview-targets"] });
     },
     onError: (err) => toast.error(`일괄 승인에 실패했습니다: ${errorMessage(err)}`),
   });

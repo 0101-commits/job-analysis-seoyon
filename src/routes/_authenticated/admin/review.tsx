@@ -26,7 +26,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { SectionNav, CollapsibleSection } from "@/components/SectionNav";
 import { ReviewWorkbench, type CenterView, type ToolKey } from "@/components/admin/ReviewWorkbench";
 import { ReviewQualityPanel } from "@/components/admin/ReviewQualityPanel";
-import { InterviewPanel } from "@/components/admin/InterviewPanel";
+import { ScreenAlert } from "@/components/admin/ScreenAlert";
 import { InquiryInbox, inquiryAlerts, useInquiries } from "@/components/admin/InquiryInbox";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { pickLens, type LensSearch } from "@/lib/lens-search";
@@ -42,8 +42,7 @@ import { infoFieldLabel } from "@/lib/survey.data";
  *   ?response=<응답 id>            그 응답을 연 상태로 렌더 (딥링크 수신 규약)
  *   &status=submitted|draft|rejected|approved|all   검토 대기 목록 상태 필터 (기본 submitted)
  *   &q=<직무명 검색어>
- *   &view=detail|diff|job          가운데 패널: 원문 / 이전 제출과 비교 / 같은 직무 비교
- *   &job=<직무명>                  view=job 일 때 비교 대상 직무
+ *   &view=detail|diff              가운데 패널: 원문 / 이전 제출과 비교
  *   &req=요청|처리완료|반려|all    정보 수정 요청 구획 상태 필터 (기본 요청)
  *   &sort=risk|submitted           검토 대기 목록 정렬 (기본 risk = 주의 필요한 순)
  *   &tool=ai|history               판단 화면을 덮는 도구 층 (없으면 닫힌 상태)
@@ -52,7 +51,7 @@ import { infoFieldLabel } from "@/lib/survey.data";
  */
 
 const QUEUE_STATUSES = ["submitted", "draft", "rejected", "approved", "all"] as const;
-const VIEWS = ["detail", "diff", "job"] as const;
+const VIEWS = ["detail", "diff"] as const;
 const REQ_STATUSES = ["요청", "처리완료", "반려", "all"] as const;
 const SORTS = ["risk", "submitted"] as const;
 const TOOLS = ["ai", "history"] as const;
@@ -69,7 +68,6 @@ interface ReviewSearch extends LensSearch {
   status?: QueueStatus;
   q?: string;
   view?: CenterView;
-  job?: string;
   req?: ReqStatus;
   sort?: QueueSort;
   tool?: Tool;
@@ -97,8 +95,6 @@ export const Route = createFileRoute("/_authenticated/admin/review")({
     if (typeof q === "string" && q.trim().length > 0) out.q = q;
     const view = pick(search["view"], VIEWS);
     if (view) out.view = view;
-    const job = search["job"];
-    if (typeof job === "string" && job.length > 0) out.job = job;
     const req = pick(search["req"], REQ_STATUSES);
     if (req) out.req = req;
     const sort = pick(search["sort"], SORTS);
@@ -173,7 +169,6 @@ function ReviewPage() {
   });
 
   const rows = data?.rows ?? [];
-  const jobNames = Object.keys(data?.jobCounts ?? {}).sort((a, b) => a.localeCompare(b));
   const attention = rows.filter((r) => r.grade === "주의").length;
 
   const { data: infoData, isLoading: infoLoading } = useQuery({
@@ -202,6 +197,7 @@ function ReviewPage() {
           <p className="mt-1 text-sm text-muted-foreground">
             제출된 업무조사를 한 건씩 판단합니다. 지금 조건에 맞는 응답 {rows.length}건.
           </p>
+          <ScreenAlert screen="review" className="mt-3" />
         </div>
       )}
 
@@ -210,7 +206,6 @@ function ReviewPage() {
           sections={[
             { id: "workbench", label: "검토 대기", count: rows.length },
             { id: "quality", label: "점검 결과", count: attention },
-            { id: "interviews", label: "인터뷰 관리" },
             {
               id: "inquiries",
               label: inquiry.heavy.length > 0 ? "문의함 (주의)" : "문의함",
@@ -233,9 +228,6 @@ function ReviewPage() {
           onQueryChange={(v) => setSearch({ q: v }, true)}
           view={view}
           onViewChange={(v) => setSearch({ view: v === "detail" ? undefined : v })}
-          compareJob={search.job ?? null}
-          onCompareJobChange={(v) => setSearch({ job: v ?? undefined })}
-          jobNames={jobNames}
           companyId={scope}
           sort={sort}
           onSortChange={(v) => setSearch({ sort: v === "risk" ? undefined : (v as QueueSort) })}
@@ -265,16 +257,6 @@ function ReviewPage() {
               companyId={scope}
               onSelect={(id) => setSearch({ response: id })}
             />
-          </CollapsibleSection>
-
-          <CollapsibleSection
-            storageKey="review-page"
-            id="interviews"
-            title="인터뷰 관리"
-            subtitle="응답자가 1명인 직무는 인터뷰 기록이 있어야 승인됩니다. 2~4명인 직무는 심층 검토 대상입니다."
-            defaultCollapsed
-          >
-            <InterviewPanel companyId={scope} onSelect={(id) => setSearch({ response: id })} />
           </CollapsibleSection>
 
           {/*

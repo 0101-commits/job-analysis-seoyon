@@ -15,6 +15,12 @@ import { applyLensPatch, pickLens } from "@/lib/lens-search";
  * 데이터는 화면이 넘긴다. 이 컴포넌트는 트리를 그리고 고르는 일만 한다.
  */
 
+/**
+ * 「미소속」 렌즈 값 — `?org=none`. 조직도에 연결되지 않은 참여자만 본다는 뜻이다.
+ * 실제 조직 id 와 절대 겹치지 않는 예약어로, 참여자 명부와 히트맵 링크가 함께 쓴다.
+ */
+export const UNASSIGNED_ORG = "none";
+
 export type OrgUnitNode = {
   id: string;
   name: string;
@@ -166,6 +172,7 @@ export function OrgTreeFilter({
   counts,
   className,
   title = "소속",
+  allowUnassigned = false,
 }: {
   units: OrgUnitNode[];
   selectedId: string | null;
@@ -174,6 +181,8 @@ export function OrgTreeFilter({
   counts?: Record<string, number>;
   className?: string;
   title?: string;
+  /** 트리 아래에 「미소속」 항목을 붙인다(?org=none). 참여자 명부에서만 켠다. */
+  allowUnassigned?: boolean;
 }) {
   const tree = useMemo(() => buildTree(units), [units]);
 
@@ -212,6 +221,23 @@ export function OrgTreeFilter({
               onSelect={onSelect}
             />
           ))}
+          {allowUnassigned ? (
+            <li className="mt-1 border-t pt-1">
+              <button
+                type="button"
+                onClick={() => onSelect(selectedId === UNASSIGNED_ORG ? null : UNASSIGNED_ORG)}
+                className={cn(
+                  "w-full rounded-md px-2 py-1.5 text-left text-sm transition-colors",
+                  selectedId === UNASSIGNED_ORG
+                    ? "bg-primary-soft font-semibold text-accent-foreground"
+                    : "text-muted-foreground hover:bg-secondary",
+                )}
+              >
+                미소속
+                <span className="ml-1 text-xs font-normal">— 조직도에 연결되지 않은 참여자</span>
+              </button>
+            </li>
+          ) : null}
         </ul>
       )}
     </div>

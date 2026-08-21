@@ -27,7 +27,8 @@ import {
 } from "@/components/ui/select";
 import { useCompanyScope } from "@/components/CompanyContext";
 import { CommandPalette } from "@/components/admin/CommandPalette";
-import { orgPathLabel, useOrgLens } from "@/components/admin/OrgTreeFilter";
+import { orgPathLabel, useOrgLens, UNASSIGNED_ORG } from "@/components/admin/OrgTreeFilter";
+import { useScreenSignals, type AlertScreen } from "@/components/admin/ScreenAlert";
 import { listActiveCompanies } from "@/lib/companies";
 import { applyLensPatch } from "@/lib/lens-search";
 import { cn } from "@/lib/utils";
@@ -37,8 +38,8 @@ type NavItem = {
   label: string;
   icon: typeof Users;
   exact?: boolean;
-  /** 검토 대기 건수를 배지로 붙인다. */
-  badge?: "review";
+  /** 그 화면 몫의 경고 건수(screenSignals)를 배지로 붙인다. */
+  badge?: AlertScreen;
 };
 
 type NavGroup = {
@@ -59,7 +60,7 @@ const NAV: NavGroup[] = [
     label: "1 · 준비",
     items: [
       { to: "/admin/master", label: "조직·직무 기준정보", icon: Database },
-      { to: "/admin/participants", label: "참여자 명부", icon: Users },
+      { to: "/admin/participants", label: "참여자 명부", icon: Users, badge: "participants" },
       { to: "/admin/waves", label: "차수 관리", icon: Layers },
       { to: "/admin/settings", label: "조사 설정", icon: Settings },
     ],
@@ -67,7 +68,7 @@ const NAV: NavGroup[] = [
   {
     label: "2 · 수집",
     items: [
-      { to: "/admin/mail", label: "메일 템플릿", icon: Mail },
+      { to: "/admin/mail", label: "메일 템플릿", icon: Mail, badge: "mail" },
       { to: "/admin/review", label: "응답 검토", icon: ClipboardCheck, badge: "review" },
     ],
   },
@@ -78,7 +79,7 @@ const NAV: NavGroup[] = [
 ];
 
 /** AI 점검은 응답 검토 화면으로 흡수되는 중이다. 그때까지 들어갈 길만 남겨 둔다. */
-const AI_TOOLS: NavItem = { to: "/admin/ai", label: "AI 일괄 점검", icon: Sparkles };
+const AI_TOOLS: NavItem = { to: "/admin/ai", label: "AI 일괄 점검", icon: Sparkles, badge: "ai" };
 
 /** 전역 찾기의 화면 이동 목록 — 메뉴와 어긋나지 않도록 NAV 에서 뽑는다. */
 const FLAT_SCREENS = [...NAV.flatMap((g) => g.items), AI_TOOLS].map((i) => ({
@@ -114,19 +115,10 @@ export function AdminShell({ children }: { children: ReactNode }) {
     enabled: Boolean(selectedOrgId),
   });
 
-  const { data: reviewWaiting } = useQuery({
-    queryKey: ["review-waiting-count", companyId],
-    queryFn: async () => {
-      let query = supabase
-        .from("responses")
-        .select("id", { count: "exact", head: true })
-        .eq("status", "submitted");
-      if (companyId !== "all") query = query.eq("company_id", companyId);
-      const { count, error } = await query;
-      if (error) throw error;
-      return count ?? 0;
-    },
-  });
+  // 메뉴 배지 — 각 화면 상단 경고(ScreenAlert)와 같은 쿼리를 공유한다 (v6 G4).
+  const { data: screenAlerts } = useScreenSignals();
+  const badgeCount = (screen: AlertScreen) =>
+    (screenAlerts?.[screen] ?? []).reduce((sum, item) => sum + item.count, 0);
 
   async function handleSignOut() {
     await queryClient.cancelQueries();
@@ -153,7 +145,11 @@ export function AdminShell({ children }: { children: ReactNode }) {
     });
   }
 
-  const lensLabel = selectedOrgId ? orgPathLabel(orgUnits ?? [], selectedOrgId) : null;
+  const lensLabel = selectedOrgId
+    ? selectedOrgId === UNASSIGNED_ORG
+      ? "미소속"
+      : orgPathLabel(orgUnits ?? [], selectedOrgId)
+    : null;
 
   /*
    * 헤더 높이가 97px·93px 로 하드코딩되어 여섯 곳에 퍼져 있으면, 헤더 구성(배지 추가 등)이
@@ -173,7 +169,7 @@ export function AdminShell({ children }: { children: ReactNode }) {
 
   function NavLink({ item }: { item: NavItem }) {
     const active = item.exact ? pathname === item.to : pathname.startsWith(item.to);
-    const badge = item.badge === "review" ? reviewWaiting : undefined;
+    const badge = item.badge ? badgeCount(item.badge) : 0;
     return (
       <Link
         to={item.to as never}
@@ -187,11 +183,12 @@ export function AdminShell({ children }: { children: ReactNode }) {
       >
         <item.icon className="size-4 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{item.label}</span>
-        {badge ? (
+        {badge > 0 ? (
           <span
-            className="shrink-0 rounded-full bg-warning/20 px-1.5 py-0.5 text-xs font-semibold tabular-nums text-warning"
-            title={`검토 대기 ${badge}건`}
+            className="inline-flex shrink-0 items-center gap-1 rounded-full bg-destructive/10 px-1.5 py-0.5 text-xs font-semibold tabular-nums text-destructive"
+            title={`확인할 경고 ${badge}건`}
           >
+            <span className="size-1.5 rounded-full bg-destructive" aria-hidden />
             {badge}
           </span>
         ) : null}
@@ -222,7 +219,16 @@ export function AdminShell({ children }: { children: ReactNode }) {
           )}
         >
           <AI_TOOLS.icon className="size-3.5 shrink-0" />
-          {AI_TOOLS.label}
+          <span className="min-w-0 flex-1 truncate">{AI_TOOLS.label}</span>
+          {badgeCount("ai") > 0 ? (
+            <span
+              className="inline-flex shrink-0 items-center gap-1 rounded-full bg-destructive/10 px-1.5 py-0.5 text-xs font-semibold tabular-nums text-destructive"
+              title={`확인할 경고 ${badgeCount("ai")}건`}
+            >
+              <span className="size-1.5 rounded-full bg-destructive" aria-hidden />
+              {badgeCount("ai")}
+            </span>
+          ) : null}
         </Link>
       </div>
     </nav>

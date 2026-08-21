@@ -16,6 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { ScreenAlert } from "@/components/admin/ScreenAlert";
 import { MailPreviewGallery, useMailApprovals } from "@/components/admin/MailPreviewGallery";
 import { MailHealthCard } from "@/components/admin/MailHealthCard";
 import { MailBatchHistory, MailSendPanel } from "@/components/admin/MailSendPanel";
@@ -138,6 +139,8 @@ function MailPage() {
 
   return (
     <div className="space-y-6">
+      {/* 이 화면 몫의 경고 — 발송 실패·메일 반송 (v6 G4) */}
+      <ScreenAlert screen="mail" />
       <div>
         <h1 className="text-xl font-bold sm:text-2xl">메일 템플릿</h1>
         <p className="mt-1 text-sm text-muted-foreground">
