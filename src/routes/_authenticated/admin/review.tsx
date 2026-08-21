@@ -29,6 +29,7 @@ import { ReviewQualityPanel } from "@/components/admin/ReviewQualityPanel";
 import { InterviewPanel } from "@/components/admin/InterviewPanel";
 import { InquiryInbox, inquiryAlerts, useInquiries } from "@/components/admin/InquiryInbox";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { handleInfoRequest, listInfoRequests, listReviewQueue } from "@/lib/review.functions";
 import { infoFieldLabel } from "@/lib/survey.data";
 
@@ -47,6 +48,7 @@ import { infoFieldLabel } from "@/lib/survey.data";
  *   &sort=risk|submitted           검토 대기 목록 정렬 (기본 risk = 주의 필요한 순)
  *   &tool=ai|history               판단 화면을 덮는 도구 층 (없으면 닫힌 상태)
  *   ?tab=inquiry                   문의함 구획을 펼친 상태로 열고 그 위치로 이동 (진행 현황 딥링크 수신)
+ *   &co=<계열사 id> &org=<소속 id>  계열사·소속 렌즈 (기획 v2 P2) — 모든 관리 화면이 공유한다
  */
 
 const QUEUE_STATUSES = ["submitted", "draft", "rejected", "approved", "all"] as const;
@@ -62,7 +64,7 @@ type QueueSort = (typeof SORTS)[number];
 type Tool = (typeof TOOLS)[number];
 type Tab = (typeof TABS)[number];
 
-interface ReviewSearch {
+interface ReviewSearch extends LensSearch {
   response?: string;
   status?: QueueStatus;
   q?: string;
@@ -86,7 +88,7 @@ function pick<T extends string>(value: unknown, allowed: readonly T[]): T | unde
 
 export const Route = createFileRoute("/_authenticated/admin/review")({
   validateSearch: (search: Record<string, unknown>): ReviewSearch => {
-    const out: ReviewSearch = {};
+    const out: ReviewSearch = { ...pickLens(search) };
     const response = search["response"];
     if (typeof response === "string" && response.length > 0) out.response = response;
     const status = pick(search["status"], QUEUE_STATUSES);

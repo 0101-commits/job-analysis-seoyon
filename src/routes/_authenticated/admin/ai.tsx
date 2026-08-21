@@ -16,6 +16,7 @@ import {
 import { EmptyState } from "@/components/EmptyState";
 import { SectionNav } from "@/components/SectionNav";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import {
   aiProxyStatus,
   applyMerge,
@@ -35,6 +36,8 @@ import { draftDutyCharts, draftJobCatalog } from "@/lib/master.functions";
  * 목록의 각 행은 그 응답의 검토 화면(`/admin/review?response=<id>`)으로 곧장 들어간다(P6).
  */
 export const Route = createFileRoute("/_authenticated/admin/ai")({
+  /** `?co=` `?org=` — 계열사·소속 렌즈 (기획 v2 P2). 다른 화면과 값을 주고받을 때 필요하다. */
+  validateSearch: (search: Record<string, unknown>): LensSearch => pickLens(search),
   head: () => ({
     meta: [
       { title: "AI 일괄 점검 | 서연 그룹 업무조사" },
@@ -360,8 +363,8 @@ function AiLedgerPanel() {
                       disabled={retryCatalog.isPending}
                       onClick={() => retryCatalog.mutate(f.retry!.value)}
                     >
-                      {retryCatalog.isPending && <Loader2 className="size-4 animate-spin" />}
-                      이 직군만 다시 생성
+                      {retryCatalog.isPending && <Loader2 className="size-4 animate-spin" />}이
+                      직군만 다시 생성
                     </Button>
                   )}
                   {f.retry?.kind === "dutyChart" && (
@@ -371,12 +374,14 @@ function AiLedgerPanel() {
                       disabled={retryDuty.isPending}
                       onClick={() => retryDuty.mutate(f.retry!.value)}
                     >
-                      {retryDuty.isPending && <Loader2 className="size-4 animate-spin" />}
-                      이 조직만 다시 생성
+                      {retryDuty.isPending && <Loader2 className="size-4 animate-spin" />}이 조직만
+                      다시 생성
                     </Button>
                   )}
                 </div>
-                <p className="mt-2 text-destructive">{f.errorMessage ?? "사유가 남아 있지 않습니다."}</p>
+                <p className="mt-2 text-destructive">
+                  {f.errorMessage ?? "사유가 남아 있지 않습니다."}
+                </p>
               </li>
             ))}
           </ul>

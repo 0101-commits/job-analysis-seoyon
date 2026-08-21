@@ -16,6 +16,7 @@ import {
   useOrgLens,
 } from "@/components/admin/OrgTreeFilter";
 import { WaveFilter, useWaveLens, type WaveOption } from "@/components/admin/WaveFilter";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import {
   checkIntegrity,
   getDashboardSignals,
@@ -29,6 +30,8 @@ import {
 import { listWaves, type Wave } from "@/lib/wave.functions";
 
 export const Route = createFileRoute("/_authenticated/admin/")({
+  /** `?co=` `?org=` — 계열사·소속 렌즈 (기획 v2 P2). 다른 화면과 값을 주고받을 때 필요하다. */
+  validateSearch: (search: Record<string, unknown>): LensSearch => pickLens(search),
   head: () => ({
     meta: [
       { title: "진행 현황 | 서연 그룹 업무조사" },

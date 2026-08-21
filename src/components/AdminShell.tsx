@@ -29,6 +29,7 @@ import { useCompanyScope } from "@/components/CompanyContext";
 import { CommandPalette } from "@/components/admin/CommandPalette";
 import { OpsEvidenceBar } from "@/components/admin/OpsEvidenceBar";
 import { orgPathLabel, useOrgLens } from "@/components/admin/OrgTreeFilter";
+import { applyLensPatch } from "@/lib/lens-search";
 import { cn } from "@/lib/utils";
 
 type NavItem = {
@@ -91,7 +92,7 @@ export function AdminShell({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { companyId, setCompanyId } = useCompanyScope();
+  const { companyId } = useCompanyScope();
   const { selectedOrgId, setSelectedOrgId } = useOrgLens();
 
   const { data: companies } = useQuery({
@@ -143,10 +144,19 @@ export function AdminShell({ children }: { children: ReactNode }) {
   /**
    * 계열사를 바꾸면 소속 렌즈는 반드시 풀어야 한다. 다른 계열사의 조직을 그대로 물고 있으면
    * 목록이 이유 없이 텅 비어 보인다 — 침묵 실패(기획 P8).
+   *
+   * 두 값 다 URL 렌즈이므로 한 번의 navigate 로 함께 바꾼다 — 따로 바꾸면 두 번째 호출이
+   * 첫 번째가 아직 반영되지 않은 이전 URL 위에 얹혀 하나가 씹힐 수 있고, 히스토리도 두 건이 된다.
    */
   function handleCompanyChange(next: string) {
-    if (next !== companyId) setSelectedOrgId(null);
-    setCompanyId(next);
+    void navigate({
+      to: ".",
+      search: (prev: Record<string, unknown>) =>
+        applyLensPatch(prev, {
+          co: next === "all" ? null : next,
+          ...(next !== companyId ? { org: null } : {}),
+        }),
+    });
   }
 
   const lensLabel = selectedOrgId ? orgPathLabel(orgUnits ?? [], selectedOrgId) : null;

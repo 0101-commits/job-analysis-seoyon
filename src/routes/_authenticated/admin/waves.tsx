@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/select";
 import { EmptyState } from "@/components/EmptyState";
 import { useCompanyScope } from "@/components/CompanyContext";
+import { pickLens, type LensSearch } from "@/lib/lens-search";
 import { supabase } from "@/integrations/supabase/client";
 import {
   closeWave,
@@ -46,6 +47,8 @@ import {
  */
 
 export const Route = createFileRoute("/_authenticated/admin/waves")({
+  /** `?co=` `?org=` — 계열사·소속 렌즈 (기획 v2 P2). 다른 화면과 값을 주고받을 때 필요하다. */
+  validateSearch: (search: Record<string, unknown>): LensSearch => pickLens(search),
   head: () => ({
     meta: [
       { title: "차수 관리 | 서연 그룹 업무조사" },

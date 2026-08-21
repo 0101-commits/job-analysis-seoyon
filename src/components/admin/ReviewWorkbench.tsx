@@ -375,6 +375,22 @@ export function ReviewWorkbench({
   const prevId = index > 0 ? (rows[index - 1]?.id ?? null) : null;
   const nextId = index >= 0 ? (rows[index + 1]?.id ?? null) : null;
 
+  /**
+   * 돌아올 자리를 잃지 않는다.
+   *
+   * 훑다가 한 건을 열고 판단한 뒤 목록으로 오면, 스무 번째 행을 다시 찾아 내려가야 했다.
+   * 판단으로 들어가는 순간의 스크롤 위치를 기억해 두고 돌아올 때 그 자리로 되돌린다.
+   */
+  const scanScrollRef = useRef(0);
+  useEffect(() => {
+    if (selectedId) {
+      scanScrollRef.current = window.scrollY;
+      window.scrollTo({ top: 0 });
+    } else if (scanScrollRef.current > 0) {
+      window.scrollTo({ top: scanScrollRef.current });
+    }
+  }, [selectedId]);
+
   // J/K 이동 — 단축키를 모르는 사용자도 [이전]·[다음] 버튼으로 같은 일을 할 수 있다(P12).
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -480,6 +496,59 @@ function QueueTable({
   onSortChange: (v: string) => void;
   onCompareJobs?: () => void;
 }) {
+  /**
+   * 훑기 커서 — 수십 건을 손으로 넘기고 Enter 로 연다.
+   *
+   * 마우스로만 고르게 하면 한 건 열 때마다 손이 키보드를 떠난다. 커서는 표 안의 실제 포커스라
+   * 화면 낭독기도 같은 행을 읽는다. 단축키를 모르는 사용자는 그대로 행을 누르면 된다.
+   */
+  const [cursor, setCursor] = useState(0);
+  const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // 조건이 바뀌면 목록이 갈리므로 커서를 처음으로 되돌린다.
+  useEffect(() => {
+    setCursor(0);
+  }, [status, sort, query]);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName;
+      const typing =
+        tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable;
+      if (document.querySelector('[role="dialog"]')) return;
+      if (e.key === "/" && !typing) {
+        e.preventDefault();
+        searchRef.current?.focus();
+        return;
+      }
+      if (typing) return;
+      if (rows.length === 0) return;
+      const key = e.key.toLowerCase();
+      const step =
+        key === "j" || e.key === "ArrowDown" ? 1 : key === "k" || e.key === "ArrowUp" ? -1 : 0;
+      if (step !== 0) {
+        e.preventDefault();
+        setCursor((c) => {
+          const next = Math.min(rows.length - 1, Math.max(0, c + step));
+          rowRefs.current[next]?.focus();
+          return next;
+        });
+        return;
+      }
+      if (e.key === "Enter") {
+        const row = rows[Math.min(cursor, rows.length - 1)];
+        if (!row) return;
+        e.preventDefault();
+        onSelect(row.id);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [rows, cursor, onSelect]);
+
   // 검토 적체 — 지금 목록 안 미검토 건의 평균 대기일 (V15-4)
   const waits = rows
     .filter((r) => r.status === "submitted" && r.submitted_at)
@@ -520,9 +589,10 @@ function QueueTable({
         <div className="relative min-w-[200px] flex-1">
           <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
+            ref={searchRef}
             value={query}
             onChange={(e) => onQueryChange(e.target.value)}
-            placeholder="직무명 검색"
+            placeholder="직무명 검색 (/)"
             aria-label="직무명 검색"
             className="pl-9"
           />
@@ -565,7 +635,7 @@ function QueueTable({
           </div>
 
           <ul>
-            {rows.map((r) => {
+            {rows.map((r, i) => {
               const late =
                 r.status === "submitted" && r.submitted_at ? daysSince(r.submitted_at) : null;
               const attention = r.grade === "주의";
@@ -573,10 +643,16 @@ function QueueTable({
                 <li key={r.id} className="border-b last:border-b-0">
                   <button
                     type="button"
+                    ref={(el) => {
+                      rowRefs.current[i] = el;
+                    }}
                     onClick={() => onSelect(r.id)}
-                    title={r.flags[0] ?? "판단 화면을 엽니다"}
+                    onFocus={() => setCursor(i)}
+                    aria-current={i === cursor}
+                    title={r.flags[0] ?? "판단 화면을 엽니다 (Enter)"}
                     className={cn(
-                      "grid w-full min-h-[var(--row-h)] items-center gap-3 px-4 py-1.5 text-left transition-colors hover:bg-secondary",
+                      "grid min-h-[var(--row-h)] w-full items-center gap-3 px-4 py-1.5 text-left transition-colors hover:bg-secondary focus-visible:bg-primary-soft focus-visible:outline-none",
+                      i === cursor && "bg-primary-soft/60",
                       cols,
                     )}
                   >
@@ -627,7 +703,7 @@ function QueueTable({
 
       <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
         <Keyboard className="size-3.5 shrink-0" aria-hidden />
-        행을 누르면 판단 화면이 열립니다. 판단 화면에서 J 다음 · K 이전 건 · Esc 목록으로.
+        J·K(또는 ↑↓) 커서 이동 · Enter 열기 · / 검색. 판단 화면에서는 A 승인 · R 반려 · Esc 목록.
       </p>
     </div>
   );
@@ -777,12 +853,14 @@ function ResponseWorkspace({
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable)
         return;
       if (document.querySelector('[role="dialog"]')) return;
+      // 정정 팝오버가 열려 있으면 그쪽 조작이 우선이다 (Esc 는 팝오버가 먼저 먹는다).
+      if (document.querySelector("[data-radix-popper-content-wrapper]")) return;
       const key = e.key.toLowerCase();
       if (e.key === "Escape") {
-        if (tool !== null) {
-          e.preventDefault();
-          onToolChange(null);
-        }
+        e.preventDefault();
+        // 층이 열려 있으면 층만 닫고, 아니면 목록으로 돌아간다.
+        if (tool !== null) onToolChange(null);
+        else onClose();
         return;
       }
       if (key === "i") {
@@ -791,6 +869,8 @@ function ResponseWorkspace({
         return;
       }
       if (key === "d") {
+        // 시점 저장본이 없으면 비교할 것이 없다 — 켜 봐야 빈 상태가 URL 에만 남는다.
+        if (!prevSnap) return;
         e.preventDefault();
         onViewChange(view === "diff" ? "detail" : "diff");
         return;
@@ -807,7 +887,7 @@ function ResponseWorkspace({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [tool, view, onToolChange, onViewChange]);
+  }, [tool, view, prevSnap, onToolChange, onViewChange, onClose]);
 
   if (isLoading || !data) {
     return <p className="text-sm text-muted-foreground">불러오는 중...</p>;
