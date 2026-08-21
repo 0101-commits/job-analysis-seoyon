@@ -30,10 +30,14 @@ import { listActiveCompanies } from "@/lib/companies";
 import { supabase } from "@/integrations/supabase/client";
 import { triggerReminders } from "@/lib/admin.functions";
 import {
+  archiveWave,
   closeWave,
   createWave,
+  deleteWave,
   listWaves,
+  unarchiveWave,
   updateWave,
+  waveDeleteImpact,
   waveStats,
   type Wave,
 } from "@/lib/wave.functions";
@@ -165,6 +169,9 @@ function WavesPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Wave | null>(null);
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
+  /** 전사 모드에서 새 차수를 만들 때 고르는 계열사 (렌즈가 특정 계열사면 그 값이 고정). */
+  const [draftCompanyId, setDraftCompanyId] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
 
   const scoped = companyId !== "all";
 
@@ -173,26 +180,31 @@ function WavesPage() {
     queryFn: () => listActiveCompanies(),
   });
 
+  // 참여자 명부의 ["survey-waves", ...] 캐시(보관 제외)와 모양이 달라 키를 따로 쓴다.
   const {
     data: waves,
     isLoading,
     error,
     refetch,
   } = useQuery({
-    queryKey: ["survey-waves", companyId],
-    queryFn: async () => listWaves({ data: { companyId }, headers: await authHeaders() }),
-    enabled: scoped,
+    queryKey: ["survey-waves-admin", companyId],
+    queryFn: async () =>
+      listWaves({
+        data: { companyId: scoped ? companyId : null, includeArchived: true },
+        headers: await authHeaders(),
+      }),
   });
 
   const { data: stats } = useQuery({
     queryKey: ["survey-wave-stats", companyId],
-    queryFn: async () => waveStats({ data: { companyId }, headers: await authHeaders() }),
-    enabled: scoped,
+    queryFn: async () =>
+      waveStats({ data: { companyId: scoped ? companyId : null }, headers: await authHeaders() }),
   });
 
   function invalidate() {
-    void queryClient.invalidateQueries({ queryKey: ["survey-waves", companyId] });
-    void queryClient.invalidateQueries({ queryKey: ["survey-wave-stats", companyId] });
+    void queryClient.invalidateQueries({ queryKey: ["survey-waves-admin"] });
+    void queryClient.invalidateQueries({ queryKey: ["survey-waves"] });
+    void queryClient.invalidateQueries({ queryKey: ["survey-wave-stats"] });
   }
 
   /** 목록 ↔ 상세 전환. 상세는 ?wave= 로 남겨 새로고침·딥링크에도 같은 화면이 나온다. */
@@ -210,6 +222,7 @@ function WavesPage() {
   function openCreate() {
     setEditing(null);
     setDraft(EMPTY_DRAFT);
+    setDraftCompanyId("");
     setDialogOpen(true);
   }
   function openEdit(w: Wave) {
@@ -245,9 +258,11 @@ function WavesPage() {
           headers,
         });
       }
+      const createCompanyId = scoped ? companyId : draftCompanyId;
+      if (!createCompanyId) throw new Error("계열사를 선택해 주세요.");
       return createWave({
         data: {
-          companyId,
+          companyId: createCompanyId,
           name: draft.name.trim(),
           kind: draft.kind,
           deadline: draft.deadline || null,
@@ -273,8 +288,69 @@ function WavesPage() {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
-  const rows = waves ?? [];
-  const selected = scoped && search.wave ? (rows.find((w) => w.id === search.wave) ?? null) : null;
+  const archiveMutation = useMutation({
+    mutationFn: async (id: string) => archiveWave({ data: { id }, headers: await authHeaders() }),
+    onSuccess: () => {
+      toast.success("차수를 보관했습니다. 보관 목록에서 언제든 되돌릴 수 있습니다.");
+      invalidate();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const unarchiveMutation = useMutation({
+    mutationFn: async (id: string) =>
+      unarchiveWave({ data: { id }, headers: await authHeaders() }),
+    onSuccess: () => {
+      toast.success("보관을 해제했습니다.");
+      invalidate();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (id: string) => deleteWave({ data: { id }, headers: await authHeaders() }),
+    onSuccess: () => {
+      toast.success("차수를 삭제했습니다.");
+      openDetail(null);
+      invalidate();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  function confirmArchive(w: Wave) {
+    if (
+      window.confirm(
+        `「${w.name}」 차수를 보관할까요?\n보관된 차수는 목록에서 숨겨지고 발송·배정 대상에서 빠집니다. 언제든 되돌릴 수 있습니다.`,
+      )
+    ) {
+      archiveMutation.mutate(w.id);
+    }
+  }
+
+  /** 완전 삭제 확인 — 영향 규모(배정·응답·발송)를 먼저 세어 보여 준다. */
+  async function confirmDelete(w: Wave) {
+    try {
+      const impact = await waveDeleteImpact({ data: { id: w.id }, headers: await authHeaders() });
+      if (
+        window.confirm(
+          `「${w.name}」 차수를 완전히 삭제할까요?\n배정 참여자 ${impact.participants}명 · 응답 ${impact.responses}건 · 발송 기록 ${impact.mailBatches}건의 차수 연결이 해제됩니다(데이터 자체는 남습니다). 이 차수가 어느 발송·제출의 기준이었는지 기록은 사라집니다.`,
+        )
+      ) {
+        deleteMutation.mutate(w.id);
+      }
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  }
+
+  const allRows = waves ?? [];
+  const rows = allRows.filter((w) => !w.archivedAt);
+  const archivedRows = allRows.filter((w) => w.archivedAt);
+  const selected = search.wave ? (allRows.find((w) => w.id === search.wave) ?? null) : null;
+  // 전사 모드에서는 계열사 열이 하나 더 붙는다. seq 는 계열사 안에서만 유일해 이 열이 구분자다.
+  const gridCols = scoped
+    ? "grid-cols-[52px_minmax(160px,1fr)_88px_150px_72px_150px_140px]"
+    : "grid-cols-[52px_130px_minmax(160px,1fr)_88px_150px_72px_150px_140px]";
 
   return (
     <div className="space-y-6">
@@ -285,28 +361,14 @@ function WavesPage() {
             차수를 골라 대상 확인 → 발송 → 이력 → 마감·독려를 한 흐름으로 처리합니다.
           </p>
         </div>
-        {scoped && !selected ? (
+        {!selected ? (
           <Button onClick={openCreate}>
             <Plus className="mr-1.5 size-4" /> 새 차수
           </Button>
         ) : null}
       </div>
 
-      {!scoped ? (
-        <EmptyState
-          kind="blocked"
-          title="계열사를 선택하세요"
-          description="차수는 계열사마다 따로 관리합니다. 위 상단에서 계열사를 선택한 뒤 다시 열어 주세요."
-        >
-          <div className="flex flex-wrap justify-center gap-2">
-            {companies?.map((c) => (
-              <Button key={c.id} size="sm" variant="outline" onClick={() => setCompanyId(c.id)}>
-                {c.name}
-              </Button>
-            ))}
-          </div>
-        </EmptyState>
-      ) : error ? (
+      {error ? (
         <EmptyState
           kind="blocked"
           title="차수를 불러오지 못했습니다"
@@ -320,7 +382,7 @@ function WavesPage() {
         <WaveDetail
           key={selected.id}
           wave={selected}
-          companyId={companyId}
+          companyId={selected.companyId}
           onBack={() => openDetail(null)}
           onEdit={() => openEdit(selected)}
           onClose={() => {
@@ -332,27 +394,49 @@ function WavesPage() {
               closeMutation.mutate(selected.id);
             }
           }}
+          onArchive={() => confirmArchive(selected)}
+          onUnarchive={() => unarchiveMutation.mutate(selected.id)}
           onSaved={invalidate}
-        />
-      ) : rows.length === 0 ? (
-        <EmptyState
-          kind="nothing"
-          title="아직 차수가 없습니다"
-          description="구조 변경을 적용하면 계열사마다 '1차 조사' 차수가 자동으로 만들어집니다. 그 뒤에 보완·신규입사 차수를 추가하세요."
         />
       ) : (
         <div className="space-y-3">
-          {stats ? (
-            <p className="text-xs text-muted-foreground">
-              총 {stats.total}개 차수 · 준비 {stats.preparing} · 진행 {stats.active} · 마감{" "}
-              {stats.closed}
-              {stats.nextDeadline ? ` · 다음 마감 ${formatDate(stats.nextDeadline)}` : ""}
-            </p>
-          ) : null}
+          <div className="flex flex-wrap items-center gap-3">
+            {/* 계열사 렌즈 — 다른 화면과 같은 ?co= 를 갱신한다. 전체면 전사 목록. */}
+            <Select value={companyId} onValueChange={(v) => setCompanyId(v)}>
+              <SelectTrigger className="w-[200px]" aria-label="계열사 필터">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">전체 계열사</SelectItem>
+                {companies?.map((c) => (
+                  <SelectItem key={c.id} value={c.id}>
+                    {c.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {stats ? (
+              <p className="text-xs text-muted-foreground">
+                총 {stats.total}개 차수 · 준비 {stats.preparing} · 진행 {stats.active} · 마감{" "}
+                {stats.closed}
+                {stats.nextDeadline ? ` · 다음 마감 ${formatDate(stats.nextDeadline)}` : ""}
+              </p>
+            ) : null}
+          </div>
+          {rows.length === 0 ? (
+            <EmptyState
+              kind="nothing"
+              title="아직 차수가 없습니다"
+              description="구조 변경을 적용하면 계열사마다 '1차 조사' 차수가 자동으로 만들어집니다. 그 뒤에 보완·신규입사 차수를 추가하세요."
+            />
+          ) : (
           <div className="overflow-x-auto rounded-xl border bg-card">
-            <div className="min-w-[880px]">
-              <div className="grid grid-cols-[52px_minmax(160px,1fr)_88px_150px_72px_150px_140px] gap-2 border-b bg-secondary px-4 py-2.5 text-xs font-medium text-muted-foreground">
+            <div className={scoped ? "min-w-[880px]" : "min-w-[990px]"}>
+              <div
+                className={`grid ${gridCols} gap-2 border-b bg-secondary px-4 py-2.5 text-xs font-medium text-muted-foreground`}
+              >
                 <span>차수</span>
+                {!scoped ? <span>계열사</span> : null}
                 <span>이름</span>
                 <span>종류</span>
                 <span>마감</span>
@@ -367,9 +451,10 @@ function WavesPage() {
                     key={w.id}
                     type="button"
                     onClick={() => openDetail(w.id)}
-                    className="grid w-full grid-cols-[52px_minmax(160px,1fr)_88px_150px_72px_150px_140px] items-center gap-2 border-b px-4 py-3 text-left text-sm last:border-b-0 hover:bg-secondary/40"
+                    className={`grid w-full ${gridCols} items-center gap-2 border-b px-4 py-3 text-left text-sm last:border-b-0 hover:bg-secondary/40`}
                   >
                     <span className="tabular-nums text-muted-foreground">{w.seq}</span>
+                    {!scoped ? <span className="truncate text-xs">{w.companyName}</span> : null}
                     <span className="min-w-0">
                       <span className="block truncate font-medium">{w.name}</span>
                       {w.note ? (
@@ -422,9 +507,65 @@ function WavesPage() {
               })}
             </div>
           </div>
-          <p className="text-xs text-muted-foreground">
-            행을 누르면 그 차수의 대상·발송·이력·마감을 한 화면에서 처리합니다.
-          </p>
+          )}
+          {rows.length > 0 ? (
+            <p className="text-xs text-muted-foreground">
+              행을 누르면 그 차수의 대상·발송·이력·마감을 한 화면에서 처리합니다.
+            </p>
+          ) : null}
+
+          {/* 보관함 — 목록에서 숨긴 차수. 완전 삭제는 여기서만 노출한다(2단계 유도). */}
+          {archivedRows.length > 0 ? (
+            <div className="space-y-2 pt-2">
+              <Button variant="ghost" size="sm" onClick={() => setShowArchived((v) => !v)}>
+                보관된 차수 {archivedRows.length}건 {showArchived ? "접기" : "보기"}
+              </Button>
+              {showArchived ? (
+                <div className="rounded-xl border bg-card opacity-75">
+                  {archivedRows.map((w) => (
+                    <div
+                      key={w.id}
+                      className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3 text-sm last:border-b-0"
+                    >
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 text-left"
+                        onClick={() => openDetail(w.id)}
+                      >
+                        <span className="font-medium">
+                          {w.seq}차 · {w.name}
+                        </span>
+                        <span className="ml-2 text-xs text-muted-foreground">
+                          {!scoped ? `${w.companyName} · ` : ""}
+                          {w.kind} · {w.status} · 배정 {w.assignedCount}명 · 보관{" "}
+                          {formatDateTime(w.archivedAt) ?? ""}
+                        </span>
+                      </button>
+                      <div className="flex gap-1.5">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={unarchiveMutation.isPending}
+                          onClick={() => unarchiveMutation.mutate(w.id)}
+                        >
+                          보관 해제
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="text-destructive"
+                          disabled={deleteMutation.isPending}
+                          onClick={() => void confirmDelete(w)}
+                        >
+                          완전 삭제
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       )}
 
@@ -438,6 +579,24 @@ function WavesPage() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
+            {/* 전사 모드에서는 렌즈가 계열사를 정해 주지 않으므로 여기서 고른다. */}
+            {!editing && !scoped ? (
+              <div className="space-y-1.5">
+                <Label htmlFor="wave-company">계열사</Label>
+                <Select value={draftCompanyId} onValueChange={setDraftCompanyId}>
+                  <SelectTrigger id="wave-company">
+                    <SelectValue placeholder="계열사를 선택하세요" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {companies?.map((c) => (
+                      <SelectItem key={c.id} value={c.id}>
+                        {c.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
             <div className="space-y-1.5">
               <Label htmlFor="wave-name">이름</Label>
               <Input
@@ -520,6 +679,8 @@ function WaveDetail({
   onBack,
   onEdit,
   onClose,
+  onArchive,
+  onUnarchive,
   onSaved,
 }: {
   wave: Wave;
@@ -527,9 +688,12 @@ function WaveDetail({
   onBack: () => void;
   onEdit: () => void;
   onClose: () => void;
+  onArchive: () => void;
+  onUnarchive: () => void;
   onSaved: () => void;
 }) {
   const closed = wave.status === "마감";
+  const archived = !!wave.archivedAt;
   const [deadline, setDeadline] = useState(wave.deadline ?? "");
   const [reminderText, setReminderText] = useState(wave.reminderDays.join(", "));
 
@@ -579,23 +743,38 @@ function WaveDetail({
               <span className="ml-2 text-sm font-normal text-muted-foreground">{wave.kind}</span>
             </p>
             <p className="text-xs text-muted-foreground">
+              {wave.companyName ? `${wave.companyName} · ` : ""}
               {wave.status}
+              {archived ? " · 보관됨" : ""}
               {wave.deadline ? ` · 마감 ${formatDate(wave.deadline)}` : " · 마감 미설정"}
               {dday && !closed ? ` (${dday})` : ""}
               {wave.note ? ` · ${wave.note}` : ""}
             </p>
           </div>
         </div>
-        {!closed && (
-          <div className="flex gap-1.5">
-            <Button size="sm" variant="ghost" onClick={onEdit}>
-              수정
+        <div className="flex gap-1.5">
+          {archived ? (
+            <Button size="sm" variant="outline" onClick={onUnarchive}>
+              보관 해제
             </Button>
-            <Button size="sm" variant="ghost" onClick={onClose}>
-              <Lock className="mr-1 size-3.5" /> 마감
-            </Button>
-          </div>
-        )}
+          ) : (
+            <>
+              {!closed && (
+                <>
+                  <Button size="sm" variant="ghost" onClick={onEdit}>
+                    수정
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={onClose}>
+                    <Lock className="mr-1 size-3.5" /> 마감
+                  </Button>
+                </>
+              )}
+              <Button size="sm" variant="ghost" onClick={onArchive}>
+                보관
+              </Button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* ① 대상 */}
@@ -611,16 +790,22 @@ function WaveDetail({
               {statusLine || "아직 이 차수에 배정된 참여자가 없습니다."}
             </p>
           </div>
-          <Button size="sm" variant="outline" asChild>
-            <a href={assignLink(wave.id)}>대상 지정</a>
-          </Button>
+          {!archived ? (
+            <Button size="sm" variant="outline" asChild>
+              <a href={assignLink(wave.id)}>대상 지정</a>
+            </Button>
+          ) : null}
         </div>
       </section>
 
       {/* ② 발송 — 대상은 이 차수 배정자로 고정된다(소속 트리 없음). */}
       <section className="space-y-2">
         <h2 className="text-base font-semibold">발송</h2>
-        {closed ? (
+        {archived ? (
+          <p className="rounded-xl border bg-card p-4 text-sm text-muted-foreground shadow-sm">
+            보관된 차수입니다. 발송하려면 먼저 보관을 해제하세요.
+          </p>
+        ) : closed ? (
           <p className="rounded-xl border bg-card p-4 text-sm text-muted-foreground shadow-sm">
             마감된 차수입니다. 새 안내가 필요하면 보완 차수를 만들어 보내세요.
           </p>
@@ -650,7 +835,7 @@ function WaveDetail({
               type="date"
               value={deadline}
               onChange={(e) => setDeadline(e.target.value)}
-              disabled={closed}
+              disabled={closed || archived}
             />
           </div>
           <div className="space-y-1.5">
@@ -660,13 +845,13 @@ function WaveDetail({
               value={reminderText}
               onChange={(e) => setReminderText(e.target.value)}
               placeholder="7, 3, 1"
-              disabled={closed}
+              disabled={closed || archived}
             />
           </div>
           <div className="flex items-end">
             <Button
               onClick={() => scheduleMutation.mutate()}
-              disabled={closed || scheduleMutation.isPending}
+              disabled={closed || archived || scheduleMutation.isPending}
             >
               {scheduleMutation.isPending ? "저장 중..." : "일정 저장"}
             </Button>
@@ -683,7 +868,7 @@ function WaveDetail({
             variant="outline"
             className="mt-3"
             onClick={() => reminderMutation.mutate()}
-            disabled={reminderMutation.isPending}
+            disabled={archived || reminderMutation.isPending}
           >
             <RotateCw className="size-4" />
             {reminderMutation.isPending ? "발송 중..." : "독려 안내 발송"}

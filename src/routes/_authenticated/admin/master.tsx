@@ -59,7 +59,7 @@ import { SectionNav, CollapsibleSection, type SectionDef } from "@/components/Se
 import { SignalCard } from "@/components/SignalCard";
 import { EmptyState } from "@/components/EmptyState";
 import { usePersistedState } from "@/hooks/use-persisted-ui";
-import { OrgCanvas, type CanvasRollup } from "@/components/admin/OrgCanvas";
+import { OrgGrid, type OrgRollup } from "@/components/admin/OrgGrid";
 import { JobDiagnosisPanel } from "@/components/admin/JobDiagnosisPanel";
 import {
   ImpactCountBadge,
@@ -101,6 +101,7 @@ import {
   uploadOrgUnits,
   upsertJobCatalogRow,
   type CatalogDiff,
+  type CatalogRowNext,
   type DutyDraftChart,
   type DutyDraftRow,
   type EditResult,
@@ -286,19 +287,6 @@ function StatusLine({ kind }: { kind: keyof typeof STATUS_LINE }) {
   );
 }
 
-/** 좁은 화면에서는 캔버스 대신 트리를 쓴다 — 노드 카드는 손가락 조작에 맞지 않는다. */
-function useNarrowScreen() {
-  const [narrow, setNarrow] = useState(false);
-  useEffect(() => {
-    const query = window.matchMedia("(max-width: 767px)");
-    const apply = () => setNarrow(query.matches);
-    apply();
-    query.addEventListener("change", apply);
-    return () => query.removeEventListener("change", apply);
-  }, []);
-  return narrow;
-}
-
 /**
  * 탭 맨 위의 요약 스트립 (기획 A4) — 지금 무엇을 보고 있는지 먼저 알려 준다.
  * 오른쪽 `⋯` 에는 자주 쓰지 않는 조작을 모아 편집 영역이 화면의 주인공이 되게 한다 (P1).
@@ -377,11 +365,13 @@ function makeImpactGate(setPending: (pending: PendingConfirm) => void) {
     confirmLabel: string;
     destructive?: boolean;
     always?: boolean;
+    /** catalog_row_update 전용 — 저장하려는 새 직군·직렬·직무명. 필드별 변경 비교에 쓴다. */
+    next?: CatalogRowNext;
     run: () => void;
   }) {
     try {
       const impact = await previewImpact({
-        data: { kind: opts.kind, id: opts.id },
+        data: { kind: opts.kind, id: opts.id, ...(opts.next ? { next: opts.next } : {}) },
         headers: await authHeaders(),
       });
       if (impact.count === 0 && !opts.always) {
@@ -768,156 +758,15 @@ type OrgUnit = {
   level: string | null;
   parent_id: string | null;
   company_id: string;
+  sort: number;
   companies: { name: string } | null;
 };
-
-/** 인라인 편집 대상. rename=이름·레벨 수정, child=하위 추가, move=상위 이동. */
-type OrgAction = { kind: "rename" | "child" | "move"; unit: OrgUnit };
-
-function OrgNodeEditor({
-  action,
-  units,
-  busy,
-  impactBadge,
-  onCancel,
-  onSubmit,
-}: {
-  action: OrgAction;
-  units: OrgUnit[];
-  busy: boolean;
-  /** 저장 버튼 옆에 붙는 영향 인원 표시 — 규모를 알고 누르게 한다 (P11). */
-  impactBadge?: ReactNode;
-  onCancel: () => void;
-  onSubmit: (values: { name: string; level: string; parentId: string | null }) => void;
-}) {
-  const { kind, unit } = action;
-  const [name, setName] = useState(kind === "rename" ? unit.name : "");
-  const [level, setLevel] = useState(kind === "rename" ? (unit.level ?? "") : "");
-  const [parentId, setParentId] = useState(unit.parent_id ?? "__root__");
-
-  // 이동 후보는 같은 계열사 조직만. 순환 여부는 서버가 최종 검증한다.
-  const candidates = units.filter((u) => u.company_id === unit.company_id && u.id !== unit.id);
-  const canSubmit = kind === "move" ? true : name.trim() !== "";
-
-  return (
-    <div className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border bg-secondary/40 p-2">
-      {kind === "move" ? (
-        <Select value={parentId} onValueChange={setParentId}>
-          <SelectTrigger className="h-8 w-56" aria-label="상위 조직 선택">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__root__">— 최상위</SelectItem>
-            {candidates.map((u) => (
-              <SelectItem key={u.id} value={u.id}>
-                {u.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      ) : (
-        <>
-          <Input
-            className="h-8 w-44"
-            value={name}
-            autoFocus
-            placeholder={kind === "child" ? "하위 조직명" : "조직명"}
-            aria-label="조직명"
-            onChange={(e) => setName(e.target.value)}
-          />
-          <Input
-            className="h-8 w-28"
-            value={level}
-            placeholder="레벨(본부/팀)"
-            aria-label="조직 레벨"
-            onChange={(e) => setLevel(e.target.value)}
-          />
-        </>
-      )}
-      <Button
-        size="sm"
-        className="h-8"
-        disabled={busy || !canSubmit}
-        onClick={() =>
-          onSubmit({
-            name: name.trim(),
-            level: level.trim(),
-            parentId: parentId === "__root__" ? null : parentId,
-          })
-        }
-      >
-        {kind === "child" ? "추가" : "저장"}
-      </Button>
-      {impactBadge}
-      <Button size="sm" variant="ghost" className="h-8" onClick={onCancel}>
-        <X className="size-4" />
-        취소
-      </Button>
-    </div>
-  );
-}
-
-/**
- * 좁은 화면용 읽기 전용 조직 목록 (기획 6) — 캔버스가 유일한 편집 뷰가 되면서
- * 트리는 보기·선택만 남았다. 노드 카드는 손가락 조작에 맞지 않아 편집은 PC 화면에서 한다.
- */
-function OrgTree({
-  units,
-  selectedId,
-  onSelect,
-}: {
-  units: OrgUnit[];
-  selectedId: string | null;
-  onSelect: (unit: OrgUnit) => void;
-}) {
-  const byParent = new Map<string, OrgUnit[]>();
-  for (const unit of units) {
-    const key = unit.parent_id ?? "__root__";
-    const list = byParent.get(key);
-    if (list) list.push(unit);
-    else byParent.set(key, [unit]);
-  }
-
-  function render(parentKey: string, depth: number): ReactNode {
-    const children = byParent.get(parentKey);
-    if (!children) return null;
-    return (
-      <ul className={depth === 0 ? "space-y-1" : "mt-1 space-y-1 border-l pl-4"}>
-        {children.map((unit) => (
-          <li key={unit.id} id={`org-${unit.id}`} className="scroll-mt-24">
-            <button
-              type="button"
-              onClick={() => onSelect(unit)}
-              className={`rounded px-1 text-left text-sm hover:bg-secondary ${
-                unit.id === selectedId ? "bg-primary/10 font-semibold ring-1 ring-primary" : ""
-              }`}
-            >
-              {unit.name}
-              {unit.level && (
-                <span className="ml-2 text-xs text-muted-foreground">{unit.level}</span>
-              )}
-              {depth === 0 && unit.companies?.name && (
-                <span className="ml-2 text-xs text-primary">{unit.companies.name}</span>
-              )}
-            </button>
-            {render(unit.id, depth + 1)}
-          </li>
-        ))}
-      </ul>
-    );
-  }
-
-  if (units.length === 0) {
-    return <p className="text-sm text-muted-foreground">등록된 조직이 없습니다.</p>;
-  }
-  return <>{render("__root__", 0)}</>;
-}
 
 /** 대시보드(admin/index.tsx)와 같은 기준: 응답자 계정상태 제출/승인 = 제출 완료. */
 const ORG_DONE_STATUSES = ["제출", "승인"];
 
-/** 조직별 하위 합산 대상/제출 롤업 — 캔버스 노드의 제출률 링에 쓴다. */
-function buildCanvasRollup(overview: OrgOverview | undefined, units: OrgUnit[]): CanvasRollup | null {
+/** 조직별 하위 합산 대상/제출 집계 — 그리드의 인원 열에 쓴다. */
+function buildOrgRollup(overview: OrgOverview | undefined, units: OrgUnit[]): OrgRollup | null {
   if (!overview) return null;
   const ids = new Set(units.map((u) => u.id));
   const childIds = new Map<string, string[]>();
@@ -937,7 +786,7 @@ function buildCanvasRollup(overview: OrgOverview | undefined, units: OrgUnit[]):
     own.set(p.org_unit_id, acc);
   }
 
-  const rollup: CanvasRollup = new Map();
+  const rollup: OrgRollup = new Map();
   const compute = (id: string): { total: number; done: number } => {
     const base = own.get(id);
     const acc = { total: base?.total ?? 0, done: base?.done ?? 0 };
@@ -994,16 +843,17 @@ function orgMemberStats(
 function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
   const { companyId } = useCompanyScope();
   const queryClient = useQueryClient();
-  const [action, setAction] = useState<OrgAction | null>(null);
+  // 그리드에서 지금 손대고 있는 행 — 인스펙터가 이 조직의 영향 인원을 미리 센다.
+  const [editingUnit, setEditingUnit] = useState<OrgUnit | null>(null);
   const [newRoot, setNewRoot] = useState("");
+  // 전사 렌즈에서 최상위 조직을 만들 때 붙일 계열사.
+  const [rootCompany, setRootCompany] = useState("");
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const [selectedOrgId, setSelectedOrgId] = useState<string | null>(highlightOrgId);
   const [notifyOnSave, setNotifyOnSave] = usePersistedState("master-notify-on-save", true);
   const gate = makeImpactGate(setPending);
-  // 캔버스가 기본이자 유일한 편집 뷰다 (기획 6). 좁은 화면에서만 읽기 전용 트리로 대체한다.
-  const narrow = useNarrowScreen();
 
-  // 딥링크(?org=)로 들어오면 그 조직을 골라 두고 트리에서 위치를 잡는다.
+  // 딥링크(?org=)로 들어오면 그 조직을 골라 두고 그리드에서 위치를 잡는다.
   useEffect(() => {
     if (!highlightOrgId) return;
     setSelectedOrgId(highlightOrgId);
@@ -1013,10 +863,16 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
     return () => clearTimeout(timer);
   }, [highlightOrgId]);
 
-  // 제출률 링·선택 조직 요약에 쓰는 데이터 (dashboard.functions 재사용, 수정 없음).
+  // 인원 열·선택 조직 요약에 쓰는 데이터 (dashboard.functions 재사용, 수정 없음).
   const { data: overview } = useQuery({
     queryKey: ["org-overview"],
     queryFn: async () => getOrgOverview({ headers: await authHeaders() }),
+  });
+
+  // 전사 렌즈의 최상위 추가에서 대상 계열사를 고르는 데 쓴다.
+  const { data: companies } = useQuery({
+    queryKey: ["companies"],
+    queryFn: listActiveCompanies,
   });
 
   const { data: units } = useQuery({
@@ -1024,7 +880,7 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
     queryFn: async () => {
       let query = supabase
         .from("org_units")
-        .select("id, name, level, parent_id, company_id, companies(name)")
+        .select("id, name, level, parent_id, company_id, sort, companies(name)")
         .order("sort");
       if (companyId !== "all") query = query.eq("company_id", companyId);
       const { data, error } = await query;
@@ -1041,7 +897,7 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
         return;
       }
       toast.success(result.message);
-      setAction(null);
+      setEditingUnit(null);
       setNewRoot("");
       void queryClient.invalidateQueries({ queryKey: ["master-org-units"] });
       void queryClient.invalidateQueries({ queryKey: ["master-status"] });
@@ -1049,108 +905,76 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
     onError: (err) => toast.error(errorMessage(err)),
   });
 
-  // 지금 편집 중인 변경. 하위 추가(child)는 새로 만드는 것이라 영향받는 인원이 없다.
+  // 지금 손대고 있는 행. 이동·추가는 확인 다이얼로그와 저장 흐름 안에서 따로 센다.
   const impactTarget = useMemo<ImpactTarget | null>(() => {
-    if (!action || action.kind === "child") return null;
+    if (!editingUnit) return null;
     return {
-      kind: action.kind === "rename" ? "org_rename" : "org_move",
-      id: action.unit.id,
-      label: action.unit.name,
+      kind: "org_rename",
+      id: editingUnit.id,
+      label: editingUnit.name,
       field: "org_text",
-      note:
-        action.kind === "rename"
-          ? `소속 「${action.unit.name}」 의 이름이 바뀌었습니다`
-          : `소속 「${action.unit.name}」 의 상위 조직이 바뀌었습니다`,
+      note: `소속 「${editingUnit.name}」 의 이름이 바뀌었습니다`,
     };
-  }, [action]);
+  }, [editingUnit]);
 
   const { data: audience, isFetching: audienceLoading } = useImpactAudience(impactTarget);
 
-  function submitAction(values: { name: string; level: string; parentId: string | null }) {
-    if (!action) return;
-    const { kind, unit } = action;
-    // 저장 성공 시점의 대상·영향 인원을 그대로 쓴다 — 저장 뒤에는 소속 이름이 이미 바뀌어 있다.
-    const target = impactTarget;
-    const affected = audience;
+  /** 그리드 인라인 편집 저장 — 이름이 바뀔 때만 확인·고지를 거친다 (구분·정렬은 참여자 화면에 닿지 않는다). */
+  function handleRename(unit: OrgUnit, values: { name: string; level: string; sort: number }) {
+    const nameChanged = values.name !== unit.name;
     const run = () =>
       edit.mutate(async () => {
         const headers = await authHeaders();
-        if (kind === "rename") {
-          const result = await renameOrgUnit({
-            data: { id: unit.id, name: values.name, level: values.level },
-            headers,
-          });
-          if (result.ok && notifyOnSave && target) await scheduleImpactNotice(target, affected);
-          return result;
-        }
-        if (kind === "child") {
-          return createOrgUnit({
-            data: {
-              companyId: unit.company_id,
-              parentId: unit.id,
-              name: values.name,
-              level: values.level,
-            },
-            headers,
-          });
-        }
-        const result = await moveOrgUnit({
-          data: { id: unit.id, parentId: values.parentId },
+        const affected =
+          nameChanged && notifyOnSave
+            ? await inspectImpact({ data: { kind: "org_rename", id: unit.id }, headers })
+            : undefined;
+        const result = await renameOrgUnit({
+          data: { id: unit.id, name: values.name, level: values.level, sort: values.sort },
           headers,
         });
-        if (result.ok && notifyOnSave && target) await scheduleImpactNotice(target, affected);
+        if (result.ok && affected) {
+          await scheduleImpactNotice(
+            {
+              kind: "org_rename",
+              id: unit.id,
+              label: unit.name,
+              field: "org_text",
+              note: `소속 「${unit.name}」 의 이름이 바뀌었습니다`,
+            },
+            affected,
+          );
+        }
         return result;
       });
-    if (kind === "child") {
+    if (!nameChanged) {
       run();
       return;
     }
     void gate({
-      kind: kind === "rename" ? "org_rename" : "org_move",
+      kind: "org_rename",
       id: unit.id,
-      title: kind === "rename" ? `「${unit.name}」 이름 변경` : `「${unit.name}」 상위 이동`,
-      confirmLabel: kind === "rename" ? "변경" : "이동",
+      title: `「${unit.name}」 이름 변경`,
+      confirmLabel: "변경",
       run,
     });
   }
 
-  const canvasRollup = useMemo(() => buildCanvasRollup(overview, units ?? []), [overview, units]);
-
-  function handleDelete(unit: OrgUnit) {
-    void gate({
-      kind: "org_delete",
-      id: unit.id,
-      title: `「${unit.name}」 조직 삭제`,
-      confirmLabel: "삭제",
-      destructive: true,
-      always: true,
-      run: () =>
-        edit.mutate(async () =>
-          deleteOrgUnit({ data: { id: unit.id }, headers: await authHeaders() }),
-        ),
-    });
-  }
-
-  /** 캔버스에서 노드를 다른 노드에 드롭 = 상위 이동. 서버 moveOrgUnit 이 순환을 최종 검증한다. */
-  function handleDropMove(unit: OrgUnit, target: OrgUnit) {
-    if (unit.company_id !== target.company_id) {
-      toast.error("같은 계열사 안의 조직으로만 옮길 수 있습니다.");
-      return;
-    }
+  /** 들여쓰기·내어쓰기 = 상위 이동. 순환·경계 검증은 서버 moveOrgUnit 이 최종 담당한다. */
+  function handleMove(unit: OrgUnit, parentId: string | null, title: string) {
     void gate({
       kind: "org_move",
       id: unit.id,
-      title: `「${unit.name}」 을(를) 「${target.name}」 하위로 이동`,
+      title,
       confirmLabel: "이동",
       always: true,
       run: () =>
         edit.mutate(async () => {
           const headers = await authHeaders();
-          // 끌어 놓기로 옮길 때는 편집 패널을 거치지 않으므로 여기서 영향 인원을 직접 센다.
           const affected = notifyOnSave
             ? await inspectImpact({ data: { kind: "org_move", id: unit.id }, headers })
             : undefined;
-          const result = await moveOrgUnit({ data: { id: unit.id, parentId: target.id }, headers });
+          const result = await moveOrgUnit({ data: { id: unit.id, parentId }, headers });
           if (result.ok && affected) {
             await scheduleImpactNotice(
               {
@@ -1168,8 +992,37 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
     });
   }
 
-  // 전체 계열사 보기에서는 어느 회사에 붙일지 정할 수 없어 최상위 추가를 막는다.
-  const rootCompanyId = companyId === "all" ? "" : companyId;
+  /** 그리드의 새 행 저장. 성공 여부를 돌려줘 그리드가 초안 행을 닫을지 정한다. */
+  async function handleCreate(input: { companyId: string; parentId: string | null; name: string }) {
+    try {
+      const result = await edit.mutateAsync(async () =>
+        createOrgUnit({ data: { ...input, level: "" }, headers: await authHeaders() }),
+      );
+      return result.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  const rollup = useMemo(() => buildOrgRollup(overview, units ?? []), [overview, units]);
+
+  function handleDelete(unit: OrgUnit) {
+    void gate({
+      kind: "org_delete",
+      id: unit.id,
+      title: `「${unit.name}」 조직 삭제`,
+      confirmLabel: "삭제",
+      destructive: true,
+      always: true,
+      run: () =>
+        edit.mutate(async () =>
+          deleteOrgUnit({ data: { id: unit.id }, headers: await authHeaders() }),
+        ),
+    });
+  }
+
+  // 전체 계열사 보기에서는 버튼 옆 계열사 선택으로 대상 회사를 정한다.
+  const rootCompanyId = companyId === "all" ? rootCompany : companyId;
 
   const selectedUnit = (units ?? []).find((unit) => unit.id === selectedOrgId) ?? null;
   const selectedStats = orgMemberStats(overview, units ?? [], selectedOrgId);
@@ -1227,15 +1080,6 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
           }
           scope={selectedUnit.companies?.name ?? "하위 조직 포함"}
           actions={[
-            // 좁은 화면은 편집 뷰(캔버스)가 없어 이름 변경 편집기를 띄울 곳이 없다.
-            ...(!narrow
-              ? [
-                  {
-                    label: "이 조직 이름 변경",
-                    onClick: () => setAction({ kind: "rename", unit: selectedUnit }),
-                  },
-                ]
-              : []),
             {
               label: "참여자 관리에서 보기",
               href: "/admin/participants",
@@ -1250,49 +1094,61 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
         storageKey="master-org"
         id="org-edit"
         title="조직도 편집"
-        subtitle="각 조직의 ⋯ 버튼으로 이름 변경·하위 추가·상위 이동·삭제를 합니다."
+        subtitle="표에서 이름·구분·정렬을 그 자리에서 고치고, ⋯ 메뉴로 추가·이동·삭제를 합니다."
       >
         <div className="rounded-xl border bg-card p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm font-medium">조직도 {units ? `(${units.length})` : ""}</p>
-            {!narrow && (
-              <div className="flex items-center gap-2">
-                <Input
-                  className="h-8 w-40"
-                  value={newRoot}
-                  placeholder="최상위 조직명"
-                  aria-label="최상위 조직명"
-                  onChange={(e) => setNewRoot(e.target.value)}
-                />
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-8"
-                  disabled={edit.isPending || newRoot.trim() === "" || rootCompanyId === ""}
-                  onClick={() =>
-                    edit.mutate(async () =>
-                      createOrgUnit({
-                        data: {
-                          companyId: rootCompanyId,
-                          parentId: null,
-                          name: newRoot.trim(),
-                          level: "",
-                        },
-                        headers: await authHeaders(),
-                      }),
-                    )
-                  }
-                >
-                  <Plus className="size-4" />
-                  최상위 추가
-                </Button>
-              </div>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {companyId === "all" && (
+                <Select value={rootCompany} onValueChange={setRootCompany}>
+                  <SelectTrigger className="h-8 w-36" aria-label="최상위 조직을 만들 계열사">
+                    <SelectValue placeholder="계열사 선택" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(companies ?? []).map((c) => (
+                      <SelectItem key={c.id} value={c.id}>
+                        {c.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+              <Input
+                className="h-8 w-40"
+                value={newRoot}
+                placeholder="최상위 조직명"
+                aria-label="최상위 조직명"
+                onChange={(e) => setNewRoot(e.target.value)}
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8"
+                disabled={edit.isPending || newRoot.trim() === "" || rootCompanyId === ""}
+                onClick={() =>
+                  edit.mutate(async () =>
+                    createOrgUnit({
+                      data: {
+                        companyId: rootCompanyId,
+                        parentId: null,
+                        name: newRoot.trim(),
+                        level: "",
+                      },
+                      headers: await authHeaders(),
+                    }),
+                  )
+                }
+              >
+                <Plus className="size-4" />
+                최상위 조직 추가
+              </Button>
+            </div>
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
-            하위 조직이나 배정 인원이 있는 조직은 삭제되지 않습니다. 조직 이름을 누르면 그 조직의
-            인원 현황이 위에 나타납니다.
-            {companyId === "all" && " 최상위 추가는 계열사를 선택한 뒤 사용하세요."}
+            칸을 고치고 Enter 나 다른 곳을 누르면 저장되고, Esc 로 되돌립니다. 하위 조직이나 배정
+            인원이 있는 조직은 삭제되지 않습니다.
+            {companyId === "all" && " 최상위 조직 추가는 왼쪽에서 계열사를 먼저 고릅니다."}
           </p>
           {(units ?? []).length === 0 ? (
             <EmptyState
@@ -1301,46 +1157,32 @@ function OrgTab({ highlightOrgId }: { highlightOrgId: string | null }) {
               title="아직 등록된 조직이 없습니다"
               description="위 칸에 최상위 조직명을 넣어 하나 만들거나, 아래 「파일로 올리기」에서 조직도 파일을 올리세요."
             />
-          ) : narrow ? (
-            <div className="mt-3 space-y-2">
-              <p className="text-xs text-muted-foreground">
-                조직도 편집은 PC 화면에서 할 수 있습니다.
-              </p>
-              <OrgTree
-                units={units ?? []}
-                selectedId={selectedOrgId}
-                onSelect={(unit) => setSelectedOrgId(unit.id)}
-              />
-            </div>
           ) : (
             <div className="mt-3 space-y-2">
-              {action && (
-                <OrgNodeEditor
-                  key={`${action.kind}-${action.unit.id}`}
-                  action={action}
-                  units={units ?? []}
-                  busy={edit.isPending}
-                  impactBadge={
-                    <ImpactCountBadge audience={audience} loading={audienceLoading} />
-                  }
-                  onCancel={() => setAction(null)}
-                  onSubmit={submitAction}
-                />
+              {editingUnit && (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <span>「{editingUnit.name}」 편집 중</span>
+                  <ImpactCountBadge audience={audience} loading={audienceLoading} />
+                </div>
               )}
-              <OrgCanvas
+              <OrgGrid
                 units={units ?? []}
-                rollup={canvasRollup}
+                rollup={rollup}
                 busy={edit.isPending}
                 selectedId={selectedOrgId}
-                onAction={setAction}
-                onDelete={handleDelete}
-                onDropMove={handleDropMove}
+                groupByCompany={companyId === "all"}
                 onSelect={(unit) => setSelectedOrgId(unit.id)}
+                onEditStart={(unit) =>
+                  setEditingUnit((units ?? []).find((u) => u.id === unit.id) ?? null)
+                }
+                onRename={handleRename}
+                onMove={handleMove}
+                onCreate={handleCreate}
+                onDelete={handleDelete}
               />
               <p className="text-xs text-muted-foreground">
-                휠이나 오른쪽 위 버튼으로 확대·축소·화면 맞춤, 빈 곳을 끌어 이동합니다. 노드를 누르면
-                그 조직의 인원 현황이 위에 나타나고, 다른 노드 위에 끌어 놓으면 그 조직의 하위로
-                이동합니다. 링은 하위 조직을 합산한 제출률입니다.
+                조직명이 놓인 열이 그 조직의 레벨입니다. ⋯ 메뉴의 들여쓰기는 바로 위 조직의 하위로,
+                내어쓰기는 한 단계 위로 옮깁니다. 인원은 하위 조직을 합산한 수치입니다.
               </p>
             </div>
           )}
@@ -1395,6 +1237,7 @@ type JobRow = {
   job_series: string;
   job_name: string;
   definition: string | null;
+  company_ids: string[];
 };
 
 type JobEdit = {
@@ -1403,6 +1246,7 @@ type JobEdit = {
   job_series: string;
   job_name: string;
   definition: string;
+  companyIds: string[];
 };
 
 const EMPTY_JOB_EDIT: JobEdit = {
@@ -1411,6 +1255,7 @@ const EMPTY_JOB_EDIT: JobEdit = {
   job_series: "",
   job_name: "",
   definition: "",
+  companyIds: [],
 };
 
 function JobRowEditor({
@@ -1428,12 +1273,17 @@ function JobRowEditor({
   onSubmit: (values: JobEdit) => void;
 }) {
   const [values, setValues] = useState(initial);
+  const { data: companies } = useQuery({ queryKey: ["companies"], queryFn: listActiveCompanies });
   const filled =
     values.job_group.trim() !== "" &&
     values.job_series.trim() !== "" &&
     values.job_name.trim() !== "";
 
-  const field = (key: keyof Omit<JobEdit, "id">, label: string, className: string) => (
+  const field = (
+    key: keyof Omit<JobEdit, "id" | "companyIds">,
+    label: string,
+    className: string,
+  ) => (
     <Input
       className={`h-8 ${className}`}
       value={values[key]}
@@ -1449,6 +1299,30 @@ function JobRowEditor({
       {field("job_series", "직렬", "w-28")}
       {field("job_name", "직무", "w-36")}
       {field("definition", "정의 한 문장", "w-full sm:w-72")}
+      <div className="flex w-full flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="text-xs text-muted-foreground">적용 계열사</span>
+        {(companies ?? []).map((company) => (
+          <label key={company.id} className="flex cursor-pointer items-center gap-1 text-xs">
+            <Checkbox
+              checked={values.companyIds.includes(company.id)}
+              aria-label={`${company.name} 적용`}
+              onCheckedChange={(checked) =>
+                setValues((prev) => ({
+                  ...prev,
+                  companyIds:
+                    checked === true
+                      ? [...prev.companyIds, company.id]
+                      : prev.companyIds.filter((id) => id !== company.id),
+                }))
+              }
+            />
+            {company.name}
+          </label>
+        ))}
+        <span className="text-xs text-muted-foreground">
+          모두 비우면 전 계열사 공통으로 적용됩니다.
+        </span>
+      </div>
       <Button size="sm" className="h-8" disabled={busy || !filled} onClick={() => onSubmit(values)}>
         저장
       </Button>
@@ -1467,6 +1341,7 @@ function JobCatalogList({
   audienceLoading,
   notifyOnSave,
   onEditingChange,
+  onRenamed,
 }: {
   highlightJobId: string | null;
   audience: ReturnType<typeof useImpactAudience>["data"];
@@ -1474,12 +1349,17 @@ function JobCatalogList({
   notifyOnSave: boolean;
   /** 편집 중인 행을 위 탭으로 올려 인스펙터가 같은 대상을 보게 한다. */
   onEditingChange: (editing: JobEdit | null) => void;
+  /** 직군·직렬·직무명이 바뀐 저장이 끝나면 부른다 — 옛 이름 응답의 재연결 안내용. */
+  onRenamed: (next: CatalogRowNext, affectedCount: number) => void;
 }) {
   const queryClient = useQueryClient();
   const [editing, setEditingState] = useState<JobEdit | null>(null);
   const [openGroups, setOpenGroups] = useState<string[]>([]);
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const gate = makeImpactGate(setPending);
+  // 행에 적용 계열사 이름을 보여 주기 위한 이름표.
+  const { data: companies } = useQuery({ queryKey: ["companies"], queryFn: listActiveCompanies });
+  const companyName = new Map((companies ?? []).map((c) => [c.id, c.name]));
 
   const setEditing = (next: JobEdit | null) => {
     setEditingState(next);
@@ -1491,7 +1371,7 @@ function JobCatalogList({
     queryFn: async () => {
       const { data, error } = await supabase
         .from("job_catalog")
-        .select("id, job_group, job_series, job_name, definition")
+        .select("id, job_group, job_series, job_name, definition, company_ids")
         .order("job_group")
         .order("job_series")
         .order("job_name");
@@ -1530,31 +1410,53 @@ function JobCatalogList({
   }, [highlightJobId, rows]);
 
   function save(values: JobEdit) {
-    const affected = audience;
+    const next: CatalogRowNext = {
+      job_group: values.job_group.trim(),
+      job_series: values.job_series.trim(),
+      job_name: values.job_name.trim(),
+    };
+    const original = values.id ? (rows ?? []).find((r) => r.id === values.id) : undefined;
+    const classificationChanged =
+      original !== undefined &&
+      (original.job_group !== next.job_group ||
+        original.job_series !== next.job_series ||
+        original.job_name !== next.job_name);
     const run = () =>
       edit.mutate(async () => {
+        const headers = await authHeaders();
+        // 저장 전에 옛 표기 기준으로 영향 인원을 센다 — 저장 뒤에는 비교할 옛 값이 사라진다.
+        const affected =
+          values.id && classificationChanged && notifyOnSave
+            ? await inspectImpact({
+                data: { kind: "catalog_row_update", id: values.id, next },
+                headers,
+              })
+            : undefined;
         const result = await upsertJobCatalogRow({
           data: {
             id: values.id,
-            job_group: values.job_group.trim(),
-            job_series: values.job_series.trim(),
-            job_name: values.job_name.trim(),
+            ...next,
             definition: values.definition.trim(),
-            companyIds: [],
+            companyIds: values.companyIds,
           },
-          headers: await authHeaders(),
+          headers,
         });
-        if (result.ok && values.id && notifyOnSave) {
-          await scheduleImpactNotice(
-            {
-              kind: "catalog_row_update",
-              id: values.id,
-              label: values.job_name.trim(),
-              field: "job_name",
-              note: `직무 「${values.job_name.trim()}」 의 분류 정보가 바뀌었습니다`,
-            },
-            affected,
-          );
+        if (result.ok && values.id) {
+          if (affected) {
+            await scheduleImpactNotice(
+              {
+                kind: "catalog_row_update",
+                id: values.id,
+                label: next.job_name,
+                field: "job_name",
+                note: `직무 「${next.job_name}」 의 분류 정보가 바뀌었습니다`,
+              },
+              affected,
+            );
+          }
+          if (classificationChanged) {
+            onRenamed(next, affected?.total ?? audience?.total ?? 0);
+          }
         }
         return result;
       });
@@ -1565,7 +1467,8 @@ function JobCatalogList({
     void gate({
       kind: "catalog_row_update",
       id: values.id,
-      title: `「${values.job_name.trim()}」 직무 수정`,
+      next,
+      title: `「${next.job_name}」 직무 수정`,
       confirmLabel: "수정",
       run,
     });
@@ -1661,6 +1564,14 @@ function JobCatalogList({
                             <span className="flex-1 text-muted-foreground">
                               {row.definition ?? "정의 없음"}
                             </span>
+                            <span className="text-[10px] text-primary">
+                              {(row.company_ids ?? []).length > 0
+                                ? (row.company_ids ?? [])
+                                    .map((id) => companyName.get(id) ?? "")
+                                    .filter(Boolean)
+                                    .join(" · ")
+                                : "공통"}
+                            </span>
                             <Button
                               size="sm"
                               variant="ghost"
@@ -1672,6 +1583,7 @@ function JobCatalogList({
                                   job_series: row.job_series,
                                   job_name: row.job_name,
                                   definition: row.definition ?? "",
+                                  companyIds: row.company_ids ?? [],
                                 })
                               }
                             >
@@ -1715,6 +1627,98 @@ function JobCatalogList({
       )}
 
       <ImpactConfirmDialog pending={pending} onClose={() => setPending(null)} />
+    </div>
+  );
+}
+
+/**
+ * 직군·직렬·직무명 변경 직후의 재연결 안내 (W2). 옛 이름으로 제출된 응답을 새 이름에 맞추는
+ * 흐름을 그 자리에서 잇는다 — 기존 suggestResponseMapping / applyResponseMapping 을 해당 직무로
+ * 한정해 재사용하고, 전수 실행은 아래 「기존 응답 연결 제안」 구획에 그대로 남긴다.
+ */
+function JobRemapHint({
+  hint,
+  onDone,
+  onClose,
+}: {
+  hint: { next: CatalogRowNext; count: number };
+  /** 적용까지 끝났을 때 — 부모가 재조회하고 안내를 닫는다. */
+  onDone: () => void;
+  onClose: () => void;
+}) {
+  const [items, setItems] = useState<MappingSuggestion[] | null>(null);
+
+  const suggest = useMutation({
+    mutationFn: async () => suggestResponseMapping({ headers: await authHeaders() }),
+    onSuccess: (all) => {
+      // 이 직무로 제안된 것만 남긴다 — 전수 재정렬은 아래 구획의 몫이다.
+      const filtered = all.filter(
+        (s) =>
+          s.suggested.job_group === hint.next.job_group &&
+          s.suggested.job_series === hint.next.job_series &&
+          s.suggested.job_name === hint.next.job_name,
+      );
+      setItems(filtered);
+      if (filtered.length === 0) {
+        toast.info(
+          "이 직무로 맞출 응답 제안이 없습니다. 유사도가 낮으면 「기존 응답 연결 제안」에서 직접 확인하세요.",
+        );
+      }
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const apply = useMutation({
+    mutationFn: async () => {
+      const payload = (items ?? []).map((s) => ({ responseId: s.responseId, ...s.suggested }));
+      if (payload.length === 0) throw new Error("적용할 제안이 없습니다.");
+      return applyResponseMapping({ data: { items: payload }, headers: await authHeaders() });
+    },
+    onSuccess: (result) => {
+      toast.success(`${result.updated}건의 응답 직무를 새 이름에 맞췄습니다.`);
+      onDone();
+    },
+    onError: (err) => toast.error(errorMessage(err)),
+  });
+
+  const busy = suggest.isPending || apply.isPending;
+  const label = `${hint.next.job_group} / ${hint.next.job_series} / ${hint.next.job_name}`;
+
+  return (
+    <div className="space-y-2 rounded-xl border border-primary/40 bg-primary/5 p-3 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="flex-1">
+          기존 응답 {hint.count}건이 옛 이름을 갖고 있습니다 — 새 이름 「{label}」 에 맞출 수
+          있습니다.
+        </p>
+        {items === null && (
+          <Button size="sm" disabled={busy} onClick={() => suggest.mutate()}>
+            {suggest.isPending ? "확인 중..." : "응답 이름 맞추기"}
+          </Button>
+        )}
+        <Button size="sm" variant="ghost" aria-label="안내 닫기" onClick={onClose}>
+          <X className="size-4" />
+        </Button>
+      </div>
+      {items !== null && items.length > 0 && (
+        <>
+          <ul className="max-h-40 space-y-0.5 overflow-y-auto text-xs text-muted-foreground">
+            {items.slice(0, 8).map((s) => (
+              <li key={s.responseId}>
+                {s.participantName || "-"} ·{" "}
+                {[s.current.job_group, s.current.job_series, s.current.job_name]
+                  .filter(Boolean)
+                  .join(" / ") || "-"}{" "}
+                → {label}
+              </li>
+            ))}
+            {items.length > 8 && <li>외 {items.length - 8}건</li>}
+          </ul>
+          <Button size="sm" disabled={busy} onClick={() => apply.mutate()}>
+            {apply.isPending ? "적용 중..." : `제안 ${items.length}건 적용`}
+          </Button>
+        </>
+      )}
     </div>
   );
 }
@@ -2165,6 +2169,8 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
   const [suggestions, setSuggestions] = useState<MappingSuggestion[] | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editingJob, setEditingJob] = useState<JobEdit | null>(null);
+  // 직군·직렬·직무명이 바뀐 직후, 옛 이름 응답의 재연결을 권하는 안내.
+  const [remapHint, setRemapHint] = useState<{ next: CatalogRowNext; count: number } | null>(null);
   const [notifyOnSave, setNotifyOnSave] = usePersistedState("master-notify-on-save", true);
 
   // 요약 스트립용. 목록과 같은 키라 요청은 한 번만 나간다.
@@ -2173,7 +2179,7 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("job_catalog")
-        .select("id, job_group, job_series, job_name, definition")
+        .select("id, job_group, job_series, job_name, definition, company_ids")
         .order("job_group")
         .order("job_series")
         .order("job_name");
@@ -2284,6 +2290,17 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
 
       <SectionNav sections={sections} />
 
+      {remapHint && (
+        <JobRemapHint
+          hint={remapHint}
+          onDone={() => {
+            setRemapHint(null);
+            void queryClient.invalidateQueries({ queryKey: ["master-status"] });
+          }}
+          onClose={() => setRemapHint(null)}
+        />
+      )}
+
       <CollapsibleSection
         storageKey="master-job"
         id="job-list"
@@ -2296,6 +2313,9 @@ function JobTab({ highlightJobId }: { highlightJobId: string | null }) {
           audienceLoading={audienceLoading}
           notifyOnSave={notifyOnSave}
           onEditingChange={setEditingJob}
+          onRenamed={(next, count) => {
+            if (count > 0) setRemapHint({ next, count });
+          }}
         />
       </CollapsibleSection>
 

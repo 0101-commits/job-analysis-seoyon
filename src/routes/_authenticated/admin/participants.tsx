@@ -886,8 +886,9 @@ const PARTICIPANT_COLUMNS =
  * 모듈은 import.meta.glob 으로 찾는다 — 파일이 없으면 목록이 비어 차수 기능만 꺼지고
  * (버튼 비활성 + 안내), 있으면 그대로 잡힌다.
  *
- * 차수는 survey_waves.company_id 로 계열사에 묶여 있어 목록 조회도 계열사가 필수다.
- * 그래서 계열사 범위가 「전사」면 배정을 열지 않고 계열사를 먼저 고르라고 안내한다.
+ * 차수는 survey_waves.company_id 로 계열사에 묶여 있다. 계열사 범위가 「전사」면 전
+ * 계열사 차수를 받아 두고(v5), 선택된 참여자들의 계열사 것만 골라 보여 준다 — 여러
+ * 계열사에 걸쳐 고르면 배정 칸을 잠그고 한 계열사만 고르라고 안내한다.
  */
 type WaveOption = {
   id: string;
@@ -896,13 +897,15 @@ type WaveOption = {
   kind: string;
   deadline: string | null;
   status: string;
+  companyId: string;
   assignedCount: number;
   submittedCount: number;
 };
 
 type WaveModule = {
   listWaves?: (opts: {
-    data: { companyId: string };
+    /** null 이면 전 계열사 (v5 전사 모드). 보관된 차수는 기본으로 빠진다. */
+    data: { companyId: string | null };
     headers: Record<string, string>;
   }) => Promise<WaveOption[]>;
   assignWave?: (opts: {
@@ -930,11 +933,13 @@ function useWaves(companyId: string) {
   return useQuery({
     queryKey: ["survey-waves", companyId],
     queryFn: async (): Promise<WaveOption[] | null> => {
-      if (companyId === "all") return null;
       const mod = await loadWaveModule();
       if (!mod?.listWaves) return null;
       try {
-        return await mod.listWaves({ data: { companyId }, headers: await authHeaders() });
+        return await mod.listWaves({
+          data: { companyId: companyId === "all" ? null : companyId },
+          headers: await authHeaders(),
+        });
       } catch {
         return null;
       }
@@ -1588,6 +1593,20 @@ function RosterListTab({
     () => new Map((waves ?? []).map((w) => [w.id, `${w.seq}차 ${w.name}`])),
     [waves],
   );
+  // 전사 모드 차수 배정 (v5): 선택된 참여자들이 한 계열사일 때만 그 계열사의 차수를 보인다.
+  const selectedCompanyIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const p of data ?? []) if (selected.has(p.id)) s.add(p.company_id);
+    return s;
+  }, [data, selected]);
+  const mixedCompanies = companyId === "all" && selectedCompanyIds.size > 1;
+  const waveOptions = useMemo(() => {
+    if (!waves) return [];
+    if (companyId !== "all") return waves;
+    if (selectedCompanyIds.size !== 1) return [];
+    const only = [...selectedCompanyIds][0];
+    return waves.filter((w) => w.companyId === only);
+  }, [waves, companyId, selectedCompanyIds]);
 
   // 소속 렌즈는 이제 이 화면의 ?org= 자체가 원천이라(useOrgLens), 딥링크 값을 옮겨 싣는
   // 별도 동기화가 필요 없다 — search.org 와 selectedOrgId 는 항상 같은 URL 키를 가리킨다.
@@ -2184,11 +2203,7 @@ function RosterListTab({
                 차수 배정 중
               </span>
               <span className="min-w-0 flex-1">
-                {companyId === "all" ? (
-                  <span className="text-destructive">
-                    차수는 계열사별로 관리합니다. 위에서 계열사를 먼저 고르세요.
-                  </span>
-                ) : !waveAvailable ? (
+                {!waveAvailable ? (
                   <span className="text-destructive">
                     차수 목록을 불러오지 못했습니다. 잠시 뒤 다시 시도해 주세요.
                   </span>
@@ -2196,6 +2211,12 @@ function RosterListTab({
                   <>
                     <strong>{waveNameById.get(search.assignWave)}</strong>에 배정할 사람을 고르고,
                     아래 [차수 배정]을 누르세요. 지금 선택 {selectedIds.length}명.
+                    {mixedCompanies ? (
+                      <span className="text-destructive">
+                        {" "}
+                        여러 계열사가 섞여 있습니다 — 한 계열사의 참여자만 선택해 주세요.
+                      </span>
+                    ) : null}
                   </>
                 ) : (
                   <span className="text-destructive">
@@ -2317,24 +2338,26 @@ function RosterListTab({
               <Select
                 value={bulkWaveId || "__pick__"}
                 onValueChange={(v) => setBulkWaveId(v === "__pick__" ? "" : v)}
-                disabled={!waveAvailable}
+                disabled={!waveAvailable || mixedCompanies}
               >
                 <SelectTrigger
                   className="w-[190px]"
                   aria-label="일괄 배정할 조사 차수"
                   title={
-                    waveAvailable
-                      ? undefined
-                      : companyId === "all"
-                        ? "차수는 계열사별로 관리합니다. 위에서 계열사를 고르세요."
-                        : "조사 차수를 불러오지 못했습니다."
+                    !waveAvailable
+                      ? "조사 차수를 불러오지 못했습니다."
+                      : mixedCompanies
+                        ? "한 계열사의 참여자만 선택해 주세요."
+                        : undefined
                   }
                 >
-                  <SelectValue placeholder="차수 고를 수 없음" />
+                  <SelectValue
+                    placeholder={mixedCompanies ? "한 계열사만 선택하세요" : "차수 고를 수 없음"}
+                  />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__pick__">— 차수 선택</SelectItem>
-                  {(waves ?? []).map((w) => (
+                  {waveOptions.map((w) => (
                     // 마감된 차수에는 새로 배정할 수 없다(서버가 거부한다). 고르지 못하게 막는다.
                     <SelectItem key={w.id} value={w.id} disabled={w.status === "마감"}>
                       {w.seq}차 {w.name} · {w.status} · 배정 {w.assignedCount}명
@@ -2345,7 +2368,7 @@ function RosterListTab({
               <Button
                 variant="secondary"
                 size="sm"
-                disabled={busy || !bulkWaveId}
+                disabled={busy || !bulkWaveId || mixedCompanies}
                 onClick={() => waveAssign.mutate()}
               >
                 {waveAssign.isPending && <Loader2 className="size-4 animate-spin" />}

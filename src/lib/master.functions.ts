@@ -338,6 +338,8 @@ export const renameOrgUnit = createServerFn({ method: "POST" })
         id: z.string().uuid(),
         name: orgName,
         level: z.string().trim().max(50).default(""),
+        /** 그리드의 정렬 열 편집용. 안 주면 기존 값을 유지한다. */
+        sort: z.number().int().min(-100000).max(100000).optional(),
       })
       .parse(input),
   )
@@ -358,7 +360,11 @@ export const renameOrgUnit = createServerFn({ method: "POST" })
 
     const { error } = await supabaseAdmin
       .from("org_units")
-      .update({ name: data.name, level: data.level || null })
+      .update({
+        name: data.name,
+        level: data.level || null,
+        ...(data.sort === undefined ? {} : { sort: data.sort }),
+      })
       .eq("id", data.id);
     if (error) throw new Error(error.message);
 
@@ -367,7 +373,11 @@ export const renameOrgUnit = createServerFn({ method: "POST" })
       action: "조직명 변경",
       target_type: "org_units",
       target_id: data.id,
-      detail: { before: unit.name, after: data.name },
+      detail: {
+        before: unit.name,
+        after: data.name,
+        ...(data.sort === undefined ? {} : { sort: data.sort }),
+      },
     });
     return { ok: true, message: `「${unit.name}」 → 「${data.name}」 으로 바꿨습니다.` };
   });
@@ -1630,6 +1640,18 @@ const IMPACT_KINDS = [
 
 export type ImpactKind = (typeof IMPACT_KINDS)[number];
 
+/**
+ * catalog_row_update 전용 — 저장하려는 새 직군·직렬·직무명. 이것이 있어야 「무엇이 바뀌는지」를
+ * 필드별로 비교해 옛 표기를 가진 응답·예시를 셀 수 있다. 없으면 종전처럼 직무명 기준으로만 센다.
+ */
+const catalogNext = z.object({
+  job_group: z.string().trim().min(1).max(200),
+  job_series: z.string().trim().min(1).max(200),
+  job_name: z.string().trim().min(1).max(200),
+});
+
+export type CatalogRowNext = z.infer<typeof catalogNext>;
+
 /** count=0 이면 summary 도 빈 문자열이라 UI 가 요약을 생략한다 (catalog_restore 만 교체 요약을 항상 담는다). */
 export type ImpactPreview = { count: number; summary: string; samples: string[] };
 
@@ -1680,6 +1702,7 @@ export const previewImpact = createServerFn({ method: "POST" })
         kind: z.enum(IMPACT_KINDS),
         /** org/catalog 계열은 uuid, role_level_delete 는 역할단계 명칭 문자열. */
         id: z.string().trim().min(1).max(200),
+        next: catalogNext.optional(),
       })
       .parse(input),
   )
@@ -1720,10 +1743,74 @@ export const previewImpact = createServerFn({ method: "POST" })
     if (data.kind === "catalog_row_update" || data.kind === "catalog_row_delete") {
       const { data: row } = await supabaseAdmin
         .from("job_catalog")
-        .select("job_name")
+        .select("job_group, job_series, job_name")
         .eq("id", data.id)
         .maybeSingle();
       if (!row) return none;
+
+      // 새 값이 오면 직군·직렬·직무명 중 실제로 바뀌는 항목별로 옛 표기의 응답(직군은 예시도)을 센다.
+      if (data.kind === "catalog_row_update" && data.next) {
+        const changes = [
+          {
+            field: "job_group" as const,
+            label: "직군명",
+            before: row.job_group,
+            after: data.next.job_group,
+          },
+          {
+            field: "job_series" as const,
+            label: "직렬명",
+            before: row.job_series,
+            after: data.next.job_series,
+          },
+          {
+            field: "job_name" as const,
+            label: "직무명",
+            before: row.job_name,
+            after: data.next.job_name,
+          },
+        ].filter((c) => c.before !== c.after);
+        if (changes.length === 0) return none;
+
+        const parts: string[] = [];
+        let maxResponses = 0;
+        let exampleTotal = 0;
+        let samples: string[] = [];
+        for (const change of changes) {
+          const { data: hits, count } = await supabaseAdmin
+            .from("responses")
+            .select("participants(name, emp_no)", { count: "exact" })
+            .eq(change.field, change.before)
+            .limit(SAMPLE_LIMIT);
+          const n = count ?? 0;
+          let examples = 0;
+          if (change.field === "job_group") {
+            // 예시 서재는 직군명(job_group_key)으로 연결돼 있어 직군명이 바뀌면 함께 끊어진다.
+            const { count: exCount } = await loose
+              .from("example_library")
+              .select("id", { count: "exact", head: true })
+              .eq("job_group_key", change.before);
+            examples = exCount ?? 0;
+            exampleTotal += examples;
+          }
+          if (n === 0 && examples === 0) continue;
+          parts.push(
+            `${change.label}이 「${change.before}」 → 「${change.after}」 로 바뀌면 옛 표기의 응답 ${n}건` +
+              (change.field === "job_group" ? ` · 예시 ${examples}건` : "") +
+              "이 연결을 잃습니다.",
+          );
+          if (n > maxResponses) {
+            maxResponses = n;
+            samples = (hits ?? []).map((h) => personLabel(h.participants));
+          }
+        }
+        if (parts.length === 0) return none;
+        return {
+          count: maxResponses > 0 ? maxResponses : exampleTotal,
+          summary: parts.join(" "),
+          samples,
+        };
+      }
 
       const { data: hits, count } = await supabaseAdmin
         .from("responses")
@@ -1897,6 +1984,7 @@ export const inspectImpact = createServerFn({ method: "POST" })
       .object({
         kind: z.enum(IMPACT_KINDS),
         id: z.string().trim().min(1).max(200),
+        next: catalogNext.optional(),
       })
       .parse(input),
   )
@@ -1923,10 +2011,29 @@ export const inspectImpact = createServerFn({ method: "POST" })
     if (data.kind === "catalog_row_update" || data.kind === "catalog_row_delete") {
       const { data: row } = await supabaseAdmin
         .from("job_catalog")
-        .select("job_name")
+        .select("job_group, job_series, job_name")
         .eq("id", data.id)
         .maybeSingle();
       if (!row) return buildAudience("", []);
+      // 새 값이 오면 실제로 바뀌는 필드별로 옛 표기를 가진 응답의 작성자를 모아 접는다.
+      if (data.kind === "catalog_row_update" && data.next) {
+        const changed = (["job_group", "job_series", "job_name"] as const).filter(
+          (field) => row[field] !== data.next![field],
+        );
+        if (changed.length === 0) return buildAudience(row.job_name, []);
+        const rows: AudienceRow[] = [];
+        for (const field of changed) {
+          const { data: hit } = await loose
+            .from("responses")
+            .select(`participants(${PEOPLE_COLUMNS})`)
+            .eq(field, row[field])
+            .limit(AUDIENCE_LIMIT);
+          for (const r of (hit ?? []) as unknown as { participants: AudienceRow | null }[]) {
+            if (r.participants) rows.push(r.participants);
+          }
+        }
+        return buildAudience(row.job_name, rows);
+      }
       return buildAudience(row.job_name, await responseAudience(loose, [row.job_name]));
     }
 

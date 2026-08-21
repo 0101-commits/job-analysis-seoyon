@@ -10,8 +10,9 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
  * 다시 열 때마다 1차 집계가 섞였다. survey_waves 로 회차를 나누고 participants.wave_id /
  * responses.wave_id 로 각자 어느 회차 소속인지를 못박아 이 문제를 없앤다.
  *
- * `listWaves`·`assignWave` 는 다른 담당(참여자 명부 화면)이 이 이름·시그니처로 그대로
- * 부른다 — 바꾸지 않는다.
+ * `listWaves`·`assignWave` 는 다른 담당(참여자 명부 화면)이 이 이름으로 그대로 부른다.
+ * v5부터 `listWaves`/`waveStats` 의 companyId 는 null 을 받아 전 계열사를 한 번에 내고
+ * (전사 모드), 보관(archived_at) 축이 붙었다 — 보관 차수는 목록·발송·배정에서 빠진다.
  */
 
 const uuid = z.string().uuid();
@@ -36,6 +37,11 @@ export type Wave = {
   status: string;
   reminderDays: number[];
   note: string | null;
+  /** 차수가 속한 계열사 (v5 전사 모드). seq 는 계열사 안에서만 유일하다. */
+  companyId: string;
+  companyName: string;
+  /** 보관 시각. null 이면 운영 중. 보관된 차수는 발송·배정 대상에서 빠진다 (v5). */
+  archivedAt: string | null;
   assignedCount: number;
   submittedCount: number;
   /** 배정자의 계정 상태 분포 (v4 차수 허브 화면용). 예: { 미발송: 3, 작성중: 12 } */
@@ -44,40 +50,62 @@ export type Wave = {
   lastSentAt: string | null;
 };
 
-/** 참여자 명부 화면이 배정 대상을 고를 때 쓰는 목록 — 회차별 배정·제출 인원을 함께 낸다. */
+/**
+ * 참여자 명부 화면이 배정 대상을 고를 때 쓰는 목록 — 회차별 배정·제출 인원을 함께 낸다.
+ * companyId 가 null 이면 전 계열사를 한 번에 낸다 (v5 전사 모드). 기본은 보관 차수를
+ * 숨기고, includeArchived 를 켜면 보관 차수까지 낸다 (차수 관리 화면의 보관함 전용).
+ */
 export const listWaves = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => z.object({ companyId: uuid }).parse(input))
+  .inputValidator((input: unknown) =>
+    z
+      .object({ companyId: uuid.nullable(), includeArchived: z.boolean().optional() })
+      .parse(input),
+  )
   .handler(async ({ data, context }): Promise<Wave[]> => {
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-    const [{ data: waves, error: waveErr }, { data: people, error: peopleErr }, { data: batches }] =
-      await Promise.all([
-        supabaseAdmin
-          .from("survey_waves")
-          .select("id, seq, name, kind, deadline, status, reminder_days, note")
-          .eq("company_id", data.companyId)
-          .order("seq"),
-        supabaseAdmin
-          .from("participants")
-          .select("wave_id, account_status")
-          .eq("company_id", data.companyId)
-          .eq("role", "respondent")
-          .is("archived_at", null)
-          .not("wave_id", "is", null),
-        // 차수별 마지막 발송 시각 (v4). 최신순이라 차수마다 처음 만난 행이 마지막 발송이다.
-        supabaseAdmin
-          .from("mail_batches")
-          .select("wave_id, created_at")
-          .eq("company_id", data.companyId)
-          .not("wave_id", "is", null)
-          .order("created_at", { ascending: false })
-          .limit(500),
-      ]);
+    let waveQuery = supabaseAdmin
+      .from("survey_waves")
+      .select("id, seq, name, kind, deadline, status, reminder_days, note, company_id, archived_at")
+      .order("seq");
+    if (data.companyId) waveQuery = waveQuery.eq("company_id", data.companyId);
+    if (!data.includeArchived) waveQuery = waveQuery.is("archived_at", null);
+
+    let peopleQuery = supabaseAdmin
+      .from("participants")
+      .select("wave_id, account_status")
+      .eq("role", "respondent")
+      .is("archived_at", null)
+      .not("wave_id", "is", null);
+    if (data.companyId) peopleQuery = peopleQuery.eq("company_id", data.companyId);
+
+    // 차수별 마지막 발송 시각 (v4). 최신순이라 차수마다 처음 만난 행이 마지막 발송이다.
+    let batchQuery = supabaseAdmin
+      .from("mail_batches")
+      .select("wave_id, created_at")
+      .not("wave_id", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(500);
+    if (data.companyId) batchQuery = batchQuery.eq("company_id", data.companyId);
+
+    const [
+      { data: waves, error: waveErr },
+      { data: people, error: peopleErr },
+      { data: batches },
+      { data: companies, error: coErr },
+    ] = await Promise.all([
+      waveQuery,
+      peopleQuery,
+      batchQuery,
+      supabaseAdmin.from("companies").select("id, name"),
+    ]);
     if (waveErr) throw new Error(waveErr.message);
     if (peopleErr) throw new Error(peopleErr.message);
+    if (coErr) throw new Error(coErr.message);
+    const companyName = new Map((companies ?? []).map((c) => [c.id, c.name]));
 
     const tally = new Map<
       string,
@@ -107,6 +135,9 @@ export const listWaves = createServerFn({ method: "GET" })
       status: w.status,
       reminderDays: w.reminder_days ?? [],
       note: w.note,
+      companyId: w.company_id,
+      companyName: companyName.get(w.company_id) ?? "",
+      archivedAt: w.archived_at,
       assignedCount: tally.get(w.id)?.assigned ?? 0,
       submittedCount: tally.get(w.id)?.submitted ?? 0,
       statusCounts: tally.get(w.id)?.byStatus ?? {},
@@ -114,19 +145,22 @@ export const listWaves = createServerFn({ method: "GET" })
     }));
   });
 
-/** 계열사 전체의 차수 요약 — 차수 관리 화면 머리말에 쓴다. */
+/** 차수 요약 — 차수 관리 화면 머리말에 쓴다. companyId 가 null 이면 전 계열사 합계. */
 export const waveStats = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => z.object({ companyId: uuid }).parse(input))
+  .inputValidator((input: unknown) => z.object({ companyId: uuid.nullable() }).parse(input))
   .handler(async ({ data, context }) => {
     const { requireAdmin } = await import("@/lib/guard.server");
     await requireAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-    const { data: waves, error } = await supabaseAdmin
+    // 보관된 차수는 요약에서도 뺀다 — 화면 머리말은 운영 중인 차수의 현황이다.
+    let query = supabaseAdmin
       .from("survey_waves")
       .select("status, deadline")
-      .eq("company_id", data.companyId);
+      .is("archived_at", null);
+    if (data.companyId) query = query.eq("company_id", data.companyId);
+    const { data: waves, error } = await query;
     if (error) throw new Error(error.message);
 
     const rows = waves ?? [];
@@ -303,12 +337,15 @@ export const assignWave = createServerFn({ method: "POST" })
 
     const { data: targetWave, error: waveErr } = await supabaseAdmin
       .from("survey_waves")
-      .select("id, company_id, status")
+      .select("id, company_id, status, archived_at")
       .eq("id", data.waveId)
       .maybeSingle();
     if (waveErr) throw new Error(waveErr.message);
     if (!targetWave) throw new Error("차수를 찾을 수 없습니다.");
     if (targetWave.status === "마감") throw new Error("마감된 차수에는 새로 배정할 수 없습니다.");
+    if (targetWave.archived_at) {
+      throw new Error("보관된 차수에는 배정할 수 없습니다. 먼저 보관을 해제해 주세요.");
+    }
 
     const { data: parts, error: partErr } = await supabaseAdmin
       .from("participants")
@@ -369,6 +406,129 @@ export const assignWave = createServerFn({ method: "POST" })
     return { updated: data.participantIds.length, protectedResponses };
   });
 
+/**
+ * 차수 보관 (v5). 삭제와 달리 되돌릴 수 있다 — 목록·발송·배정 대상에서만 빠지고
+ * 데이터는 그대로 남는다. 진행 중 차수도 보관할 수 있다(확인은 UI 몫).
+ */
+export const archiveWave = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: uuid }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { error } = await supabaseAdmin
+      .from("survey_waves")
+      .update({ archived_at: new Date().toISOString() })
+      .eq("id", data.id);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "조사 차수 보관",
+      target_type: "survey_waves",
+      target_id: data.id,
+    });
+    return { ok: true };
+  });
+
+export const unarchiveWave = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: uuid }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { error } = await supabaseAdmin
+      .from("survey_waves")
+      .update({ archived_at: null })
+      .eq("id", data.id);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "조사 차수 보관 해제",
+      target_type: "survey_waves",
+      target_id: data.id,
+    });
+    return { ok: true };
+  });
+
+/**
+ * 삭제 전 영향 집계 (v5). FK 가 전부 ON DELETE SET NULL 이라 데이터 자체는 남지만,
+ * 이 차수에 귀속됐던 이력(누가 배정됐고 어떤 발송·제출의 기준이었는지)은 사라진다 —
+ * 그 규모를 확인 다이얼로그가 보여 주기 위한 조회다.
+ */
+export const waveDeleteImpact = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: uuid }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const [parts, resps, batches] = await Promise.all([
+      supabaseAdmin
+        .from("participants")
+        .select("id", { count: "exact", head: true })
+        .eq("wave_id", data.id),
+      supabaseAdmin
+        .from("responses")
+        .select("id", { count: "exact", head: true })
+        .eq("wave_id", data.id),
+      supabaseAdmin
+        .from("mail_batches")
+        .select("id", { count: "exact", head: true })
+        .eq("wave_id", data.id),
+    ]);
+    if (parts.error) throw new Error(parts.error.message);
+    if (resps.error) throw new Error(resps.error.message);
+    if (batches.error) throw new Error(batches.error.message);
+
+    return {
+      participants: parts.count ?? 0,
+      responses: resps.count ?? 0,
+      mailBatches: batches.count ?? 0,
+    };
+  });
+
+/**
+ * 차수 완전 삭제 (v5). 보관된 차수만 지울 수 있다 — 목록에서 바로 지우는 실수를 막는
+ * 2단계 장치(보관 → 삭제)를 서버에서도 지킨다. FK 는 SET NULL 이라 참여자·응답·발송
+ * 데이터는 남지만 차수 귀속이 풀린다.
+ */
+export const deleteWave = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: uuid }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { requireAdmin, writeAudit } = await import("@/lib/guard.server");
+    await requireAdmin(context.supabase, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: existing, error: findErr } = await supabaseAdmin
+      .from("survey_waves")
+      .select("name, seq, company_id, archived_at")
+      .eq("id", data.id)
+      .maybeSingle();
+    if (findErr) throw new Error(findErr.message);
+    if (!existing) throw new Error("차수를 찾을 수 없습니다.");
+    if (!existing.archived_at) throw new Error("보관된 차수만 삭제할 수 있습니다.");
+
+    const { error } = await supabaseAdmin.from("survey_waves").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+
+    await writeAudit(supabaseAdmin, {
+      actor_id: context.userId,
+      action: "조사 차수 삭제",
+      target_type: "survey_waves",
+      target_id: data.id,
+      detail: { name: existing.name, seq: existing.seq, companyId: existing.company_id },
+    });
+    return { ok: true };
+  });
+
 /* ─────────────────── 다른 담당 함수가 참고할 헬퍼 ─────────────────── */
 
 export type WaveDeadline = {
@@ -396,6 +556,8 @@ export async function listWaveDeadlinesForReminders(
     .from("survey_waves")
     .select("id, company_id, name, kind, deadline, reminder_days")
     .neq("status", "마감")
+    // 보관된 차수는 발송 대상에서 빠진다 (v5)
+    .is("archived_at", null)
     .not("deadline", "is", null);
   if (error) throw new Error(error.message);
   return (

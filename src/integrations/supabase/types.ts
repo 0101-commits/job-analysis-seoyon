@@ -379,6 +379,7 @@ export type Database = {
       }
       survey_waves: {
         Row: {
+          archived_at: string | null
           company_id: string
           created_at: string
           deadline: string | null
@@ -392,6 +393,7 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          archived_at?: string | null
           company_id: string
           created_at?: string
           deadline?: string | null
@@ -405,6 +407,7 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          archived_at?: string | null
           company_id?: string
           created_at?: string
           deadline?: string | null

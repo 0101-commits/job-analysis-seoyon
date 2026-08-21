@@ -2,7 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { AlertTriangle, Check, Download, Eye, Plus, Save, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  Eye,
+  Plus,
+  Save,
+  X,
+} from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -56,6 +66,7 @@ import {
   type OpsKey,
   type OpsValues,
 } from "@/lib/settings.functions";
+import { inspectImpact } from "@/lib/master.functions";
 
 export const Route = createFileRoute("/_authenticated/admin/settings")({
   /** `?co=` `?org=` — 계열사·소속 렌즈 (기획 v2 P2). 다른 화면과 값을 주고받을 때 필요하다. */
@@ -72,6 +83,9 @@ export const Route = createFileRoute("/_authenticated/admin/settings")({
 });
 
 type ReminderTarget = (typeof REMINDER_TARGETS)[number];
+
+/** 역할단계 등록 상한 — 서버(settings.functions.ts roleLevelsSchema)의 max(12)와 같은 값. */
+const MAX_ROLE_LEVELS = 12;
 
 /** 고객 질의 대응용 보안 현황. 정적 콘텐츠(DB 조회 없음). */
 const SECURITY_ROWS: { title: string; state: "적용" | "옵션" | "실명 구조"; desc: string }[] = [
@@ -379,6 +393,12 @@ function SettingsPage() {
   const [rule, setRule] = useState("");
   const [levels, setLevels] = useState<string[]>([]);
   const [levelInput, setLevelInput] = useState("");
+  /** X 클릭 후 영향 인원을 세는 동안의 대상 — 그 칩의 삭제 버튼만 잠근다. */
+  const [levelChecking, setLevelChecking] = useState<string | null>(null);
+  /** 영향 인원이 있어 확인이 필요한 삭제 요청. null 이면 다이얼로그 닫힘. */
+  const [levelDeleteAsk, setLevelDeleteAsk] = useState<{ name: string; count: number } | null>(
+    null,
+  );
   const [domains, setDomains] = useState<string[]>([]);
   const [domainInput, setDomainInput] = useState("");
   const [drafts, setDrafts] = useState<Record<string, SurveyDraft>>({});
@@ -601,12 +621,56 @@ function SettingsPage() {
   function addLevel() {
     const value = levelInput.trim();
     if (!value) return;
+    if (levels.length >= MAX_ROLE_LEVELS) {
+      toast.error(`역할단계는 최대 ${MAX_ROLE_LEVELS}개까지 등록할 수 있습니다.`);
+      return;
+    }
     if (levels.includes(value)) {
       toast.error("이미 있는 역할단계입니다.");
       return;
     }
     setLevels((prev) => [...prev, value]);
     setLevelInput("");
+  }
+
+  /** 배열 순서가 곧 참여자 선택지·비교 화면의 표시 순서다. 로컬 swap, 반영은 저장 버튼. */
+  function moveLevel(index: number, delta: -1 | 1) {
+    setLevels((prev) => {
+      const to = index + delta;
+      if (to < 0 || to >= prev.length) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(index, 1);
+      if (moved === undefined) return prev;
+      next.splice(to, 0, moved);
+      return next;
+    });
+  }
+
+  /**
+   * X 클릭 → 이 역할단계를 쓰는 참여자가 있는지 서버에서 먼저 센다 (기획 W3 삭제 가드).
+   * 0명이면 바로 목록에서 빼고, 있으면 확인 다이얼로그를 띄운다. 실제 반영은 저장 버튼.
+   */
+  async function requestLevelDelete(name: string) {
+    setLevelChecking(name);
+    try {
+      const audience = await inspectImpact({
+        data: { kind: "role_level_delete", id: name },
+        headers: await authHeaders(),
+      });
+      if (audience.total === 0) {
+        setLevels((prev) => prev.filter((v) => v !== name));
+      } else {
+        setLevelDeleteAsk({ name, count: audience.total });
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof Error
+          ? `삭제 영향을 확인하지 못했습니다: ${err.message}`
+          : "삭제 영향을 확인하지 못했습니다.",
+      );
+    } finally {
+      setLevelChecking(null);
+    }
   }
 
   function addDomain() {
@@ -1264,7 +1328,8 @@ function SettingsPage() {
           <TabsContent value="levels" className="mt-4 space-y-4">
             <TabIntro>
               이 탭에서는 <strong>참여자가 자기 역할단계를 고를 때 나오는 선택지</strong>를
-              정합니다. 직급 체계와 별개로 실제 수행 범위를 나타내는 이름을 씁니다.
+              정합니다. 직급 체계와 별개로 실제 수행 범위를 나타내는 이름을 씁니다. 위에서 아래
+              순서가 참여자 선택지와 비교 화면의 정렬 순서입니다.
             </TabIntro>
 
             <CollapsibleSection
@@ -1279,18 +1344,38 @@ function SettingsPage() {
               }
             >
               <section className="space-y-4 rounded-xl border bg-card p-4 shadow-sm sm:p-6">
-                <div className="flex flex-wrap gap-2">
-                  {levels.map((lv) => (
+                <div className="flex flex-col items-start gap-2">
+                  {levels.map((lv, i) => (
                     <span
                       key={lv}
                       className="inline-flex items-center gap-1.5 rounded-full bg-secondary px-3 py-1.5 text-sm"
                     >
+                      <span className="tabular-nums text-xs text-muted-foreground">{i + 1}.</span>
                       {lv}
                       <button
                         type="button"
+                        aria-label={`${lv} 위로`}
+                        disabled={i === 0}
+                        className="text-muted-foreground hover:text-foreground disabled:opacity-30"
+                        onClick={() => moveLevel(i, -1)}
+                      >
+                        <ChevronUp className="size-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`${lv} 아래로`}
+                        disabled={i === levels.length - 1}
+                        className="text-muted-foreground hover:text-foreground disabled:opacity-30"
+                        onClick={() => moveLevel(i, 1)}
+                      >
+                        <ChevronDown className="size-3.5" />
+                      </button>
+                      <button
+                        type="button"
                         aria-label={`${lv} 삭제`}
-                        className="text-muted-foreground hover:text-destructive"
-                        onClick={() => setLevels((prev) => prev.filter((v) => v !== lv))}
+                        disabled={levelChecking !== null}
+                        className="text-muted-foreground hover:text-destructive disabled:opacity-30"
+                        onClick={() => void requestLevelDelete(lv)}
                       >
                         <X className="size-3.5" />
                       </button>
@@ -1303,7 +1388,7 @@ function SettingsPage() {
                   )}
                 </div>
 
-                <div className="flex gap-2">
+                <div className="flex items-center gap-2">
                   <Input
                     id="level-input"
                     aria-label="역할단계 추가"
@@ -1317,7 +1402,15 @@ function SettingsPage() {
                     }}
                     placeholder="예: 책임"
                   />
-                  <Button type="button" variant="outline" onClick={addLevel}>
+                  <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                    {levels.length}/{MAX_ROLE_LEVELS}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={levels.length >= MAX_ROLE_LEVELS}
+                    onClick={addLevel}
+                  >
                     <Plus className="size-4" />
                     추가
                   </Button>
@@ -1340,6 +1433,40 @@ function SettingsPage() {
                 />
               </section>
             </CollapsibleSection>
+
+            {/* 삭제 가드 — 영향 인원이 있을 때만 뜨는 확인 다이얼로그 (W3) */}
+            <AlertDialog
+              open={levelDeleteAsk !== null}
+              onOpenChange={(open) => {
+                if (!open) setLevelDeleteAsk(null);
+              }}
+            >
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>
+                    「{levelDeleteAsk?.name}」 역할단계를 삭제할까요?
+                  </AlertDialogTitle>
+                  <AlertDialogDescription>
+                    이 역할단계를 쓰는 참여자 {levelDeleteAsk?.count}명이 &lsquo;현행에 없는
+                    값&rsquo; 신호로 잡히게 됩니다. 목록에서 뺀 뒤 저장 버튼을 눌러야 실제로
+                    반영됩니다.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>취소</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                    onClick={() => {
+                      const name = levelDeleteAsk?.name;
+                      if (name) setLevels((prev) => prev.filter((v) => v !== name));
+                      setLevelDeleteAsk(null);
+                    }}
+                  >
+                    삭제
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </TabsContent>
 
           {/* 5. 독려 규칙 (기획 F4) */}
