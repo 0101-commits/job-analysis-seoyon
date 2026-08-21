@@ -1,4 +1,12 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -753,8 +761,6 @@ function ResponseWorkspace({
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectStep, setRejectStep] = useState("4");
   const [rejectComment, setRejectComment] = useState("");
-  /** 단축키(A)는 렌더마다 다시 정해지는 승인 동작을 참조로 본다. */
-  const approveRef = useRef<() => void>(() => {});
 
   const { data, isLoading } = useQuery({
     queryKey: ["review-detail", responseId],
@@ -839,6 +845,25 @@ function ResponseWorkspace({
   });
 
   /**
+   * 승인 실행 — 버튼과 단축키가 같은 경로를 쓴다.
+   *
+   * early return 앞에 두어야 단축키 훅이 조건 없이 이걸 참조할 수 있다. 그래서 데이터가
+   * 아직 없을 때는 스스로 아무 일도 하지 않는다.
+   */
+  const runApprove = useCallback(() => {
+    if (!data) return;
+    const status = data.response.status;
+    if (status === "approved" || status === "draft" || approve.isPending) return;
+    // 1인 응답 직무는 인터뷰 「완료」 기록이 있어야 승인된다.
+    const hasInterview = data.interviews.some((iv) => iv.status === "완료");
+    if (data.jobCount <= 1 && !hasInterview) {
+      setApproveOpen(true);
+      return;
+    }
+    approve.mutate(undefined);
+  }, [data, approve]);
+
+  /**
    * 판단 화면 단축키 (기획 v2 P4 선행).
    *
    * 수백 건을 처리하는 화면이라 손이 마우스에 묶이면 안 된다. 단축키를 모르는 사용자도
@@ -852,7 +877,10 @@ function ResponseWorkspace({
       const tag = el?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable)
         return;
-      if (document.querySelector('[role="dialog"]')) return;
+      // 대화상자가 열려 있으면 그쪽 조작이 우선이다. 단 도구 층은 판단 화면의 일부이므로
+      // 층이 열린 채로도 승인·반려·층 닫기가 손에서 이어져야 한다.
+      const dialog = document.querySelector('[role="dialog"]');
+      if (dialog && dialog.id !== "tool-layer") return;
       // 정정 팝오버가 열려 있으면 그쪽 조작이 우선이다 (Esc 는 팝오버가 먼저 먹는다).
       if (document.querySelector("[data-radix-popper-content-wrapper]")) return;
       const key = e.key.toLowerCase();
@@ -882,12 +910,12 @@ function ResponseWorkspace({
       }
       if (key === "a") {
         e.preventDefault();
-        approveRef.current();
+        runApprove();
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [tool, view, prevSnap, onToolChange, onViewChange, onClose]);
+  }, [tool, view, prevSnap, runApprove, onToolChange, onViewChange, onClose]);
 
   if (isLoading || !data) {
     return <p className="text-sm text-muted-foreground">불러오는 중...</p>;
@@ -943,20 +971,6 @@ function ResponseWorkspace({
   if (data.aiDraft.any) {
     gates.push({ label: `AI 초안 ${aiDraftCount}건 미확정`, onFocus: () => onToolChange("ai") });
   }
-
-  // 콜로저 안에서는 data 의 좁히기가 유지되지 않으므로 한 번 붙잡아 둔다.
-  const jobCount = data.jobCount;
-
-  function runApprove() {
-    if (r.status === "approved" || r.status === "draft" || approve.isPending) return;
-    // 1인 응답 직무는 인터뷰 「완료」 기록이 있어야 승인된다.
-    if (jobCount <= 1 && !interviewDone) {
-      setApproveOpen(true);
-      return;
-    }
-    approve.mutate(undefined);
-  }
-  approveRef.current = runApprove;
 
   return (
     <CorrectionCtx.Provider value={{ responseId, picked, close: () => setPicked(null) }}>
@@ -1645,6 +1659,7 @@ function ResponseWorkspace({
         )}
 
         <ActionBar
+          className="-mx-4 sm:-mx-6"
           primary={
             <Button
               disabled={approve.isPending || r.status === "approved" || r.status === "draft"}

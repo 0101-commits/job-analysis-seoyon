@@ -193,7 +193,10 @@ function ReviewPage() {
 
   return (
     <div className="space-y-5">
-      {!focused && (
+      {focused ? (
+        // 판단 중에는 제목줄이 폭을 먹지 않게 감추지만, 화면에 제목 자체가 없으면 안 된다.
+        <h1 className="sr-only">응답 검토 — 한 건 판단</h1>
+      ) : (
         <div>
           <h1 className="text-xl font-bold sm:text-2xl">응답 검토</h1>
           <p className="mt-1 text-sm text-muted-foreground">

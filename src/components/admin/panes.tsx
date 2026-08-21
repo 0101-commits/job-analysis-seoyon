@@ -138,6 +138,8 @@ export function ToolLayer({
   return (
     <Sheet open={open} onOpenChange={onOpenChange} modal={false}>
       <SheetContent
+        // 판단 화면 단축키가 이 층을 외부 대화상자로 오인하지 않도록 표식을 남긴다.
+        id="tool-layer"
         side="right"
         // 이 층 안 스크롤만 예외적으로 허용한다 — 원문은 스크롤이 분기되지 않는다.
         className="w-full overflow-y-auto sm:w-[var(--layer-w)] sm:max-w-[var(--layer-w)]"
